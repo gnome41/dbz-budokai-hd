@@ -23,6 +23,134 @@ extern "C" bool g_abort_called = false;
 /* Trampoline TLS variable for cross-fragment branches */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
 
+/* --------------------------------------------------------------------------
+ * Thread runtime
+ * --------------------------------------------------------------------------
+ * Guest stacks for additional threads are allocated below the main-thread
+ * stack region (0xD0000000).  Each thread gets THREAD_STACK_SIZE bytes,
+ * committed on demand from the 4 GB reserved region.
+ *
+ *   thread 1: top = 0xCFFF0000  (stack 0xCFF00000–0xCFFF0000)
+ *   thread 2: top = 0xCEFF0000  (stack 0xCEF00000–0xCEFF0000)
+ *   …
+ */
+#define THREAD_STACK_SIZE  0x00100000u   /* 1 MB per thread */
+#define THREAD_STACK_BIAS  0x00010000u   /* guard/align offset from top */
+
+static CRITICAL_SECTION g_thread_cs;
+static bool             g_thread_cs_init = false;
+static uint32_t         g_thread_stack_cursor = 0xCFFF0000u; /* next top */
+static volatile uint32_t g_thread_id_next = 1;
+
+/* Table of live thread handles so the main thread can join them */
+#define MAX_THREADS 64
+static HANDLE   g_thread_handles[MAX_THREADS];
+static uint32_t g_thread_ids   [MAX_THREADS];
+static int      g_thread_count = 0;
+
+/* Per-thread creation parameters (heap-allocated, freed by the thread) */
+struct PpuThreadParam {
+    uint32_t entry_addr;   /* resolved guest function address (post-OPD) */
+    uint32_t toc;          /* TOC value for this thread */
+    uint64_t arg;          /* r3 passed to the thread entry */
+    uint32_t stack_top;    /* guest address of the initial sp */
+    uint32_t thread_id;    /* our synthetic thread ID */
+};
+
+/* Forward declarations for address resolvers defined in the generated code */
+extern "C" void (*ppu_resolve_addr (uint64_t addr))(ppu_context*);
+extern "C" void (*ppu_resolve_extra(uint64_t addr))(ppu_context*);
+
+static DWORD WINAPI ppu_thread_proc(LPVOID param) {
+    PpuThreadParam* tp = (PpuThreadParam*)param;
+
+    ppu_context ctx = {};
+    ctx.gpr[1] = tp->stack_top;
+    ctx.gpr[2] = tp->toc;
+    ctx.gpr[3] = tp->arg;
+
+    uint32_t tid   = tp->thread_id;
+    uint32_t entry = tp->entry_addr;
+    free(tp);
+
+    fprintf(stderr, "[THREAD %u] starting at 0x%08X sp=0x%08X\n", tid, entry, (uint32_t)ctx.gpr[1]);
+
+    auto fn = ppu_resolve_addr(entry);
+    if (!fn) fn = ppu_resolve_extra(entry);
+    if (fn) {
+        fn(&ctx);
+        /* Drain any pending trampoline left by the last call */
+        while (g_trampoline_fn) {
+            void(*tf)(void*) = g_trampoline_fn;
+            g_trampoline_fn = nullptr;
+            tf((void*)&ctx);
+        }
+    } else {
+        fprintf(stderr, "[THREAD %u] UNRESOLVED entry 0x%08X — thread stubbed\n", tid, entry);
+    }
+
+    fprintf(stderr, "[THREAD %u] exited (r3=0x%llX)\n", tid, (unsigned long long)ctx.gpr[3]);
+    return 0;
+}
+
+static uint32_t alloc_thread_stack() {
+    EnterCriticalSection(&g_thread_cs);
+    uint32_t top = g_thread_stack_cursor;
+    g_thread_stack_cursor -= THREAD_STACK_SIZE;
+    LeaveCriticalSection(&g_thread_cs);
+
+    /* Commit the pages for this stack */
+    uint32_t base = top - THREAD_STACK_SIZE;
+    if (!VirtualAlloc(vm_base + base, THREAD_STACK_SIZE, MEM_COMMIT, PAGE_READWRITE)) {
+        fprintf(stderr, "[THREAD] ERROR: failed to commit stack at guest 0x%08X\n", base);
+        return 0;
+    }
+    /* Return sp pointing just below the very top (standard ABI back-chain slot) */
+    return top - THREAD_STACK_BIAS;
+}
+
+static void thread_table_add(uint32_t tid, HANDLE h) {
+    EnterCriticalSection(&g_thread_cs);
+    if (g_thread_count < MAX_THREADS) {
+        g_thread_handles[g_thread_count] = h;
+        g_thread_ids   [g_thread_count] = tid;
+        ++g_thread_count;
+    }
+    LeaveCriticalSection(&g_thread_cs);
+}
+
+static HANDLE thread_table_find(uint32_t tid) {
+    EnterCriticalSection(&g_thread_cs);
+    HANDLE h = NULL;
+    for (int i = 0; i < g_thread_count; i++) {
+        if (g_thread_ids[i] == tid) { h = g_thread_handles[i]; break; }
+    }
+    LeaveCriticalSection(&g_thread_cs);
+    return h;
+}
+
+/* Called from main() before vm_init so the critical section is ready */
+extern "C" void thread_runtime_init() {
+    InitializeCriticalSection(&g_thread_cs);
+    g_thread_cs_init = true;
+}
+
+/* Wait for all created game threads to finish (called from main after _start returns) */
+extern "C" void thread_runtime_join_all() {
+    if (!g_thread_cs_init) return;
+    EnterCriticalSection(&g_thread_cs);
+    int n = g_thread_count;
+    HANDLE handles[MAX_THREADS];
+    for (int i = 0; i < n; i++) handles[i] = g_thread_handles[i];
+    LeaveCriticalSection(&g_thread_cs);
+
+    if (n > 0) {
+        fprintf(stderr, "[RUNTIME] waiting for %d game thread(s)...\n", n);
+        WaitForMultipleObjects(n, handles, TRUE, INFINITE);
+        fprintf(stderr, "[RUNTIME] all game threads finished\n");
+    }
+}
+
 /* Memory access — big-endian byte-swap, addr truncated to 32-bit */
 extern "C" uint8_t vm_read8(uint64_t addr) {
     return vm_base[(uint32_t)addr];
@@ -59,31 +187,222 @@ extern "C" void vm_write64(uint64_t addr, uint64_t val) {
     vm_write32(addr + 4, (uint32_t)(val));
 }
 
-/* LV2 syscall dispatcher stub */
+/* LV2 syscall dispatcher */
 extern "C" void lv2_syscall(ppu_context* ctx) {
     uint32_t sysnum = (uint32_t)ctx->gpr[11];
 
     switch (sysnum) {
 
-    /* sys_tty_write — print the game's debug/stdout output */
+    /* ---- Threading -------------------------------------------------------- */
+
+    /* sys_ppu_thread_create (44)
+       r3: out sys_ppu_thread_t*   r4: OPD ptr (code, toc)
+       r5: arg (→ r3 in new thread) r6: priority  r7: stack_size
+       r8: flags (1=joinable)       r9: name ptr */
+    case 44: {
+        uint32_t id_out   = (uint32_t)ctx->gpr[3];
+        uint32_t opd_ptr  = (uint32_t)ctx->gpr[4];
+        uint64_t arg      = ctx->gpr[5];
+        uint32_t prio     = (uint32_t)ctx->gpr[6];
+        uint32_t stk_sz   = (uint32_t)ctx->gpr[7];
+        uint32_t flags    = (uint32_t)ctx->gpr[8];
+        uint32_t name_ptr = (uint32_t)ctx->gpr[9];
+
+        /* Decode OPD: [code_ptr u32, toc_ptr u32] */
+        uint32_t code_addr = vm_read32(opd_ptr);
+        uint32_t toc       = vm_read32(opd_ptr + 4);
+
+        char name_buf[64] = "<unnamed>";
+        if (name_ptr > 0x10000u && name_ptr < 0x10010000u)
+            strncpy(name_buf, (const char*)(vm_base + name_ptr), 63);
+
+        fprintf(stderr,
+            "[LV2] sys_ppu_thread_create name=\"%s\" opd=0x%08X code=0x%08X toc=0x%08X"
+            " arg=0x%llX stk=0x%X prio=%d flags=0x%X\n",
+            name_buf, opd_ptr, code_addr, toc,
+            (unsigned long long)arg, stk_sz, (int)prio, flags);
+
+        /* Allocate a guest stack for this thread */
+        uint32_t stack_top = alloc_thread_stack();
+        if (!stack_top) {
+            fprintf(stderr, "[LV2] sys_ppu_thread_create: stack alloc failed\n");
+            ctx->gpr[3] = (uint64_t)(int64_t)-1LL; /* CELL_ENOMEM */
+            break;
+        }
+
+        /* Build thread params */
+        PpuThreadParam* tp = (PpuThreadParam*)malloc(sizeof(PpuThreadParam));
+        tp->entry_addr = code_addr;
+        tp->toc        = toc;
+        tp->arg        = arg;
+        tp->stack_top  = stack_top;
+        tp->thread_id  = InterlockedIncrement((volatile LONG*)&g_thread_id_next) - 1;
+
+        /* Write synthetic thread ID back to guest */
+        if (id_out) vm_write32(id_out, tp->thread_id);
+
+        HANDLE h = CreateThread(NULL, 0, ppu_thread_proc, tp, 0, NULL);
+        if (!h) {
+            fprintf(stderr, "[LV2] sys_ppu_thread_create: CreateThread failed (%lu)\n",
+                    GetLastError());
+            free(tp);
+            ctx->gpr[3] = (uint64_t)(int64_t)-1LL;
+            break;
+        }
+        thread_table_add(tp->thread_id, h);
+
+        ctx->gpr[3] = 0; /* CELL_OK */
+        break;
+    }
+
+    /* sys_ppu_thread_exit (41): r3 = exit value */
+    case 41:
+        fprintf(stderr, "[LV2] sys_ppu_thread_exit (code=0x%llX)\n",
+                (unsigned long long)ctx->gpr[3]);
+        ExitThread((DWORD)ctx->gpr[3]);
+        break; /* unreachable */
+
+    /* sys_ppu_thread_yield (45) */
+    case 45:
+        SwitchToThread();
+        ctx->gpr[3] = 0;
+        break;
+
+    /* sys_ppu_thread_join (43): r3 = sys_ppu_thread_t, r4 = out exit_status* */
+    case 43: {
+        uint32_t tid    = (uint32_t)ctx->gpr[3];
+        uint32_t out_st = (uint32_t)ctx->gpr[4];
+        HANDLE h = thread_table_find(tid);
+        if (h) {
+            WaitForSingleObject(h, INFINITE);
+            DWORD exit_code = 0;
+            GetExitCodeThread(h, &exit_code);
+            if (out_st) vm_write32(out_st, exit_code);
+        } else {
+            fprintf(stderr, "[LV2] sys_ppu_thread_join: unknown tid %u\n", tid);
+        }
+        ctx->gpr[3] = 0;
+        break;
+    }
+
+    /* sys_ppu_thread_get_id (48): returns current thread's synthetic ID.
+       We don't track per-thread IDs yet — return a placeholder. */
+    case 48:
+        ctx->gpr[3] = 0xDEAD0001ull;
+        break;
+
+    /* ---- Mutexes ---------------------------------------------------------- */
+
+    /* sys_mutex_create (90): r3=out mutex_id*, r4=attr_ptr → stub, return 0 */
+    case 90: {
+        static volatile uint32_t g_mutex_id = 0x1000;
+        uint32_t id_out = (uint32_t)ctx->gpr[3];
+        uint32_t mid = InterlockedIncrement((volatile LONG*)&g_mutex_id);
+        if (id_out) vm_write32(id_out, mid);
+        fprintf(stderr, "[LV2] sys_mutex_create → id=0x%X\n", mid);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    case 91:  /* sys_mutex_destroy */
+        ctx->gpr[3] = 0; break;
+    case 92:  /* sys_mutex_lock   */
+        ctx->gpr[3] = 0; break;
+    case 93:  /* sys_mutex_trylock */
+        ctx->gpr[3] = 0; break;
+    case 94:  /* sys_mutex_unlock */
+        ctx->gpr[3] = 0; break;
+
+    /* ---- Condition variables ---------------------------------------------- */
+    case 95:  /* sys_cond_create  */
+        ctx->gpr[3] = 0; break;
+    case 96:  /* sys_cond_destroy */
+        ctx->gpr[3] = 0; break;
+    case 97:  /* sys_cond_wait    */
+        SwitchToThread();
+        ctx->gpr[3] = 0; break;
+    case 98:  /* sys_cond_signal  */
+        ctx->gpr[3] = 0; break;
+    case 99:  /* sys_cond_signal_all */
+        ctx->gpr[3] = 0; break;
+
+    /* ---- Lightweight mutexes (lwmutex) ------------------------------------ */
+    case 612: /* sys_lwmutex_create  */
+        ctx->gpr[3] = 0; break;
+    case 613: /* sys_lwmutex_destroy */
+        ctx->gpr[3] = 0; break;
+    case 614: /* sys_lwmutex_lock    */
+        ctx->gpr[3] = 0; break;
+    case 615: /* sys_lwmutex_trylock */
+        ctx->gpr[3] = 0; break;
+    case 616: /* sys_lwmutex_unlock  */
+        ctx->gpr[3] = 0; break;
+
+    /* ---- Semaphores -------------------------------------------------------- */
+    case 84:  /* sys_semaphore_create  */
+        ctx->gpr[3] = 0; break;
+    case 85:  /* sys_semaphore_destroy */
+        ctx->gpr[3] = 0; break;
+    case 86:  /* sys_semaphore_wait    */
+        SwitchToThread();
+        ctx->gpr[3] = 0; break;
+    case 87:  /* sys_semaphore_trywait */
+        ctx->gpr[3] = 0; break;
+    case 88:  /* sys_semaphore_post    */
+        ctx->gpr[3] = 0; break;
+
+    /* ---- Event queues ----------------------------------------------------- */
+    case 125: /* sys_event_queue_create  */
+        ctx->gpr[3] = 0; break;
+    case 126: /* sys_event_queue_destroy */
+        ctx->gpr[3] = 0; break;
+    case 127: /* sys_event_queue_receive */
+        SwitchToThread();
+        ctx->gpr[3] = 0; break;
+    case 128: /* sys_event_queue_tryreceive */
+        ctx->gpr[3] = 0; break;
+    case 130: /* sys_event_port_create   */
+        ctx->gpr[3] = 0; break;
+    case 131: /* sys_event_port_destroy  */
+        ctx->gpr[3] = 0; break;
+    case 132: /* sys_event_port_connect_local */
+        ctx->gpr[3] = 0; break;
+    case 134: /* sys_event_port_send     */
+        ctx->gpr[3] = 0; break;
+
+    /* ---- Time -------------------------------------------------------------- */
+    case 141: /* sys_time_get_system_time: returns µs since boot */
+        ctx->gpr[3] = (uint64_t)GetTickCount64() * 1000ull;
+        break;
+    case 145: /* sys_time_get_timebase_frequency: PS3 timebase = 79.8 MHz */
+        ctx->gpr[3] = 79800000ull;
+        break;
+
+    /* ---- Memory ----------------------------------------------------------- */
+    case 348: /* sys_memory_allocate: r3=size r4=align r5=out_ptr* */
+    case 349: /* sys_memory_allocate_from_container */
+        fprintf(stderr, "[LV2] sys_memory_allocate sz=0x%llX align=0x%llX\n",
+                (unsigned long long)ctx->gpr[3],
+                (unsigned long long)ctx->gpr[4]);
+        ctx->gpr[3] = (uint64_t)(int64_t)-1LL; /* CELL_ENOMEM — caller must handle */
+        break;
+    case 350: /* sys_memory_free */
+        ctx->gpr[3] = 0; break;
+
+    /* ---- TTY output ------------------------------------------------------- */
     case 403: {
-        uint32_t fd  = (uint32_t)ctx->gpr[3];   /* 0=stderr 1=stdout */
+        uint32_t fd  = (uint32_t)ctx->gpr[3];
         uint32_t buf = (uint32_t)ctx->gpr[4];
         uint32_t len = (uint32_t)ctx->gpr[5];
-        if (len > 0 && len < 0x10000 && buf >= 0x10000) {
+        if (len > 0 && len < 0x10000u && buf >= 0x10000u) {
             const char* s = (const char*)(vm_base + buf);
             fprintf(fd == 1 ? stdout : stderr, "[TTY%u] %.*s", fd, (int)len, s);
         }
-        /* out param: bytes written — write len into gpr[4] slot if r6 is a ptr */
         if (ctx->gpr[6]) vm_write32(ctx->gpr[6], len);
         ctx->gpr[3] = 0;
         break;
     }
 
-    /* sys_988: watchdog/trace family (sys_game_watchdog_* or similar).
-       r3=4 is specifically emitted by the abort() handler (func_000D91E4)
-       to flag that the process is aborting — set g_abort_called so that
-       the next sys_process_exit (func_000F217C) triggers a clean longjmp. */
+    /* ---- Watchdog / abort ------------------------------------------------- */
     case 988:
         fprintf(stderr, "[LV2] sys_988 (r3=0x%llX r4=0x%llX r5=0x%llX)\n",
                 (unsigned long long)ctx->gpr[3],
@@ -91,18 +410,13 @@ extern "C" void lv2_syscall(ppu_context* ctx) {
                 (unsigned long long)ctx->gpr[5]);
         if (ctx->gpr[3] == 4) {
             g_abort_called = true;
-            /* func_000D91E4 saves original LR at sp+0xD0 before calling sys_988.
-               sp has been decremented by 0xC0 by func_000D91E4's prologue,
-               so the back-chain (original sp) is at sp+0, and the saved LR is at sp+0xD0.
-               Walk the back-chain to dump the call stack. */
             uint32_t sp = (uint32_t)ctx->gpr[1];
             uint32_t saved_lr = vm_read32(sp + 0xD0);
             fprintf(stderr, "[ABORT] func_000D91E4 caller LR=0x%08X\n", saved_lr);
-            /* Walk 4 more frames for context */
-            uint32_t frame = vm_read32(sp);  /* back-chain to caller frame */
-            for (int i = 0; i < 4 && frame > 0x10000 && frame < 0x10000000; i++) {
-                uint32_t frame_lr = vm_read32(frame + 0x10); /* LR saved at frame+0x10 in PS3 ABI */
-                fprintf(stderr, "[ABORT] frame[%d] sp=0x%08X lr@sp+0x10=0x%08X\n", i, frame, frame_lr);
+            uint32_t frame = vm_read32(sp);
+            for (int i = 0; i < 4 && frame > 0x10000u && frame < 0x10000000u; i++) {
+                uint32_t frame_lr = vm_read32(frame + 0x10);
+                fprintf(stderr, "[ABORT] frame[%d] sp=0x%08X lr=0x%08X\n", i, frame, frame_lr);
                 uint32_t next = vm_read32(frame);
                 if (next == frame || next == 0) break;
                 frame = next;
@@ -112,19 +426,18 @@ extern "C" void lv2_syscall(ppu_context* ctx) {
         break;
 
     default:
-        fprintf(stderr, "[LV2] syscall %u (r3=0x%llX r4=0x%llX r5=0x%llX)\n",
+        fprintf(stderr, "[LV2] syscall %u (r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)\n",
                 sysnum,
                 (unsigned long long)ctx->gpr[3],
                 (unsigned long long)ctx->gpr[4],
-                (unsigned long long)ctx->gpr[5]);
+                (unsigned long long)ctx->gpr[5],
+                (unsigned long long)ctx->gpr[6]);
         ctx->gpr[3] = 0;
         break;
     }
 }
 
 /* Indirect call dispatcher — resolves guest address in CTR to recompiled host fn */
-extern "C" void (*ppu_resolve_addr(uint64_t addr))(ppu_context*);
-extern "C" void (*ppu_resolve_extra(uint64_t addr))(ppu_context*);
 
 /* Bitmask of guest addresses already printed (simple bloom via modulo) */
 static bool g_icall_trace_enabled = true;
