@@ -129,10 +129,69 @@ static HANDLE thread_table_find(uint32_t tid) {
     return h;
 }
 
+/* --------------------------------------------------------------------------
+ * SDK thread trampoline
+ * --------------------------------------------------------------------------
+ * The ps3recomp SDK's sys_ppu_thread_create (in runtime/syscalls/sys_ppu_thread.c)
+ * calls g_ppu_thread_entry_trampoline(ctx) to dispatch into recompiled code.
+ * ctx->cia holds the guest entry address as passed by the game.
+ *
+ * On PS3, a function pointer is an OPD address: [code_ptr u32, toc_ptr u32].
+ * The game passes the OPD address as r4 to sys_ppu_thread_create; the SDK
+ * stores it verbatim in ctx->cia.  We try resolving it as a direct code
+ * address first (catches any callers that already pass code), then fall back
+ * to dereferencing as an OPD.
+ * -------------------------------------------------------------------------- */
+
+/* Forward declared by the SDK header — defined in sys_ppu_thread.c */
+extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
+
+static void ppu_sdk_thread_trampoline(ppu_context* ctx) {
+    uint32_t candidate = (uint32_t)ctx->cia;
+
+    /* Try as direct code address first */
+    auto fn = ppu_resolve_addr(candidate);
+    if (!fn) fn = ppu_resolve_extra(candidate);
+
+    if (!fn) {
+        /* Dereference as OPD: [code u32 @ candidate, toc u32 @ candidate+4] */
+        uint32_t code_addr = vm_read32(candidate);
+        uint32_t toc       = vm_read32(candidate + 4);
+        fprintf(stderr, "[THREAD %llu] OPD@0x%08X → code=0x%08X toc=0x%08X\n",
+                (unsigned long long)ctx->thread_id, candidate, code_addr, toc);
+        if (toc) ctx->gpr[2] = toc;
+        fn = ppu_resolve_addr(code_addr);
+        if (!fn) fn = ppu_resolve_extra(code_addr);
+        if (fn) candidate = code_addr;
+    }
+
+    if (fn) {
+        fprintf(stderr, "[THREAD %llu] dispatching to 0x%08X\n",
+                (unsigned long long)ctx->thread_id, candidate);
+        fn(ctx);
+        /* Drain any pending trampoline left by the last call */
+        while (g_trampoline_fn) {
+            void(*tf)(void*) = g_trampoline_fn;
+            g_trampoline_fn  = nullptr;
+            tf((void*)ctx);
+        }
+    } else {
+        fprintf(stderr, "[THREAD %llu] UNRESOLVED entry 0x%08X — thread stubbed\n",
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia);
+    }
+
+    fprintf(stderr, "[THREAD %llu] exited (r3=0x%llX)\n",
+            (unsigned long long)ctx->thread_id, (unsigned long long)ctx->gpr[3]);
+}
+
 /* Called from main() before vm_init so the critical section is ready */
 extern "C" void thread_runtime_init() {
     InitializeCriticalSection(&g_thread_cs);
     g_thread_cs_init = true;
+
+    /* Wire the SDK thread trampoline so SDK-created threads dispatch into
+       recompiled PPU code instead of silently no-op'ing */
+    g_ppu_thread_entry_trampoline = ppu_sdk_thread_trampoline;
 }
 
 /* Wait for all created game threads to finish (called from main after _start returns) */
