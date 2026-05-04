@@ -2,7 +2,7 @@
 
 A work-in-progress static recompilation of **Dragon Ball Z: Budokai HD Collection** (`EBOOT.elf`, PS3 / BLES01658) to a native Windows x64 executable.
 
-Built on top of the **[ps3recomp](https://github.com/gnome41/ps3recomp) SDK** — a PS3 PowerPC → C++ static recompilation framework.
+Built on top of the **[ps3recomp](https://github.com/sp00nznet/ps3recomp) SDK** — a PS3 PowerPC → C++ static recompilation framework.
 
 > **This is a fork / game port built on ps3recomp.**  
 > See the SDK repo for the recompiler pipeline, HLE library implementations, and runtime core.
@@ -43,7 +43,7 @@ Built on top of the **[ps3recomp](https://github.com/gnome41/ps3recomp) SDK** �
 
 ```
 RecompLauncher/
-└── ps3recomp/          ← SDK repo (https://github.com/gnome41/ps3recomp)
+└── ps3recomp/          ← SDK repo (https://github.com/sp00nznet/ps3recomp)
     ├── dbz-budokai-hd/ ← this repo (cloned here)
     └── game/
         └── EBOOT.elf   ← your decrypted ELF (not included)

@@ -15,6 +15,9 @@ extern "C" uint8_t* vm_base;
 jmp_buf g_process_exit_jmpbuf;
 int     g_process_exit_code = -1;
 
+extern "C" void thread_runtime_init();
+extern "C" void thread_runtime_join_all();
+
 static bool vm_init() {
 #ifdef _WIN32
     vm_base = (uint8_t*)VirtualAlloc(NULL, 0x100000000ULL, MEM_RESERVE, PAGE_NOACCESS);
@@ -110,6 +113,7 @@ int main(int argc, char* argv[]) {
     const char* elf_path = (argc > 1) ? argv[1] : "EBOOT.ELF";
     printf("=== ps3recomp: dbz-budokai-hd ===\n");
 
+    thread_runtime_init();
     if (!vm_init()) return 1;
     printf("Guest memory initialized\n");
 
@@ -187,7 +191,8 @@ int main(int argc, char* argv[]) {
     func_0003B328(&ctx);
 #endif
 
-    printf("Entry point returned. Exiting.\n");
+    printf("Entry point returned. Waiting for game threads...\n");
+    thread_runtime_join_all();
     vm_shutdown();
     return 0;
 }

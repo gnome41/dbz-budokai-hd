@@ -38,10 +38,31 @@ The ELF must be a decrypted PS3 ELF64 at `E:\Games\RecompLauncher\ps3recomp\game
 
 ### LV2 Syscalls (`runtime_glue.cpp: lv2_syscall`)
 Dispatches on `ctx->gpr[11]`. Currently handled:
-- `403` — `sys_tty_write`: prints game debug output
-- `988` — watchdog; `r3==4` sets `g_abort_called` and dumps call stack
+
+| Syscall | Name | Notes |
+|---|---|---|
+| 41 | `sys_ppu_thread_exit` | calls `ExitThread` |
+| 43 | `sys_ppu_thread_join` | `WaitForSingleObject` on the Windows thread handle |
+| 44 | `sys_ppu_thread_create` | allocates guest stack, creates a real Windows thread running `ppu_thread_proc` |
+| 45 | `sys_ppu_thread_yield` | `SwitchToThread()` |
+| 48 | `sys_ppu_thread_get_id` | returns placeholder |
+| 84–88 | semaphores | stubbed (returns 0 / yield) |
+| 90–94 | mutexes | stubbed |
+| 95–99 | condition variables | stubbed |
+| 125–134 | event queues/ports | stubbed |
+| 141 | `sys_time_get_system_time` | `GetTickCount64() * 1000` |
+| 145 | `sys_time_get_timebase_frequency` | returns 79 800 000 |
+| 403 | `sys_tty_write` | prints game debug output |
+| 612–616 | lwmutex | stubbed |
+| 988 | watchdog | `r3==4` sets `g_abort_called`, dumps call stack |
 
 All others log and return 0. Add new cases directly to `lv2_syscall`.
+
+### Thread Runtime (`runtime_glue.cpp`)
+`thread_runtime_init()` initialises the critical section — call before `vm_init()` in `main.cpp`.  
+`thread_runtime_join_all()` waits for all game threads — call after `func_0003B328` returns.
+
+Each game thread gets a 1 MB guest stack committed on demand (bump-allocated downward from `0xCFFF0000`). The thread entry OPD is decoded (code ptr + TOC at `opd_ptr` / `opd_ptr+4`) and the resolved host function is called with a fresh `ppu_context`. `g_trampoline_fn` is `__declspec(thread)` so each Windows thread has its own trampoline slot.
 
 ### Indirect Calls
 `ps3_indirect_call` resolves `ctx->ctr` via `ppu_resolve_addr` (generated table) then `ppu_resolve_extra` (hand-lifted). Unknown addresses log once and stub with `gpr[3] = 0`.
