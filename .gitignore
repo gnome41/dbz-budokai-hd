@@ -1,0 +1,35 @@
+# Build output
+build/
+*.exe
+*.ilk
+*.pdb
+*.obj
+*.lib
+*.exp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+*.ninja
+
+# Copyrighted game data — never commit
+*.elf
+*.ELF
+*.BIN
+*.bin
+EBOOT*
+game/
+
+# Debug / temp
+stderr.txt
+*.log
+
+# Editor / OS
+.vs/
+*.user
+*.suo
+*.sln
+.DS_Store
+Thumbs.db
