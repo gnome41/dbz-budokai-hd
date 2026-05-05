@@ -79,12 +79,13 @@ These manual fixups are applied before calling `_start`:
 - Pool-manager sentinel self-links at `0x27BBD4`, `0x27BC3C`, `0x27BCA4`
 - Game-context stub at `0x700000`: bits 0-1 of `struct+0` set (**not** bit 7), `struct+0x44` pointed at zero-initialized scratch at `0x700100`
 
-### Why bit 7 must NOT be set in the game-context stub
-`func_000D0694` inspects bit 7 of `struct+0`:
-- bit 7 = 0 → routes to `func_000D0700` (initializes internal linked-list fields, safe for our stub)
-- bit 7 = 1 → routes to the **slab-free** path (`func_000D90FC` → `func_000D5FD0`), which aborts because `0x700000` is not a real slab block
+### Why bit 7 MUST be set in the game-context stub
+`func_000CE57C` (the game's real init) calls `func_000D0664` **before** `func_000CE5C4` (gate check). `D0664` routes through `func_000D0694` which inspects bit 7 of `struct+0`:
 
-The gate check (`func_000CE5C4`) only needs bits 0-1, and it runs **before** `func_000D0700` zeroes `struct+0`, so clearing those bits in `D0700` is harmless.
+- **bit7 = 0** → routes to `func_000D0700`, which writes `r0` (= 0, the bit-7 mask) back into `struct+0`, **zeroing bits 0-1 before CE5C4 runs** → gate always fails → game never initializes.
+- **bit7 = 1** → routes to the slab-free path (`func_000D90FC` → `func_000D9108`). Our slab guard in `D9108` skips the free when `slab+0x10 == 0` (pool uninitialized). `struct+0` is never touched, bits 0-1 survive, and `CE5C4` passes.
+
+So `struct+0` must be `0x0083` (bits 0-1 for gate + bit 7 for slab-free path).
 
 ### Slab-free guard in `func_000D9108` (`ppu_recomp.cpp`)
 The slab allocator at `0x2E45F0` (accessed via `TOC[-0x603C]`) is in BSS and its constructor was missed by the lifter. Any slab-free attempt while `slab+0x10 == 0` (pool start uninitialized) hits a block-header abort in `func_000D5FD0`. A guard in `func_000D9108` detects this condition and silently skips the free, logging `[SLAB-SKIP]` to stderr.

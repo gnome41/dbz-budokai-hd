@@ -136,16 +136,21 @@ int main(int argc, char* argv[]) {
     vm_write32(0x27BCA4u, 0x0027BCA4u);  /* struct @ 0x27BC60, chain @ +0x44 */
 
     /* Game context stub at 0x700000 (returned by func_0003AAC4):
-       - bits 0-1 of struct+0 must be non-zero: func_000CE5C4 gate check
-       - bit 7 (0x80) must NOT be set: that would route func_000D0694 to
-         the slab-free path, which aborts because 0x700000 is not a real
-         slab block.  With bit7=0, D0694 routes to func_000D0700, which
-         initializes internal linked-list fields and returns without freeing.
-         (struct+0 is then zeroed by D0700, but the gate check has already
-         passed by the time D0700 runs, so clearing bits 0-1 is harmless.)
-       - struct+0x44 must be self-referential: func_000CE628 reads it as
-         a linked-list head and passes it to func_000D58C4 */
-    vm_write16(0x700000u, 0x0003u);  /* bits 0-1 only; bit 7 deliberately clear */
+       - bits 0-1 of struct+0 must be non-zero: func_000CE5C4 gate check reads
+         them via ppc_rlwinm(struct+0, 0, 30, 31); if zero it returns -1 and
+         the game never initializes.
+       - bit 7 (0x80) MUST be set: func_000D0664 (called before CE5C4) routes
+         through func_000D0694 which inspects bit 7.
+           bit7=0 → D0694 calls func_000D0700, which writes r0 (=0, the bit-7
+                    mask) back into struct+0, ZEROING bits 0-1 before CE5C4
+                    runs — gate always fails.
+           bit7=1 → D0694 takes the slab-free path (func_000D90FC→D9108),
+                    which our slab guard in D9108 silently skips when the slab
+                    pool is uninitialized (slab+0x10==0). struct+0 is never
+                    touched, bits 0-1 survive, and CE5C4 passes.
+       - struct+0x44 must point to a zero-initialized scratch block (0x700100):
+         func_000CE628 reads it as a linked-list head and passes it to D58C4. */
+    vm_write16(0x700000u, 0x0083u);  /* bits 0-1 set (gate) | bit 7 set (slab-free path) */
     /* struct+0x44 is a pointer to a ref-counted resource object.
        Point it to a clean zero-initialized scratch block at 0x700100.
        func_000D58C4/D5880/D596C treat [ptr+0] as refcount, [ptr+0x10] as
