@@ -1,0 +1,3 @@
+[1/2] Building CXX object CMakeFiles\dbz-budokai-hd.dir\recompiled\ppu_recomp.cpp.obj
+[2/2] Linking CXX executable dbz-budokai-hd.exe
+BUILD_EXIT=0

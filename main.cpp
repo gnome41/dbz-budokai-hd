@@ -135,27 +135,11 @@ int main(int argc, char* argv[]) {
     vm_write32(0x27BC3Cu, 0x0027BC3Cu);  /* struct @ 0x27BBF8, chain @ +0x44 */
     vm_write32(0x27BCA4u, 0x0027BCA4u);  /* struct @ 0x27BC60, chain @ +0x44 */
 
-    /* Game context stub at 0x700000 (returned by func_0003AAC4):
-       - bits 0-1 of struct+0 must be non-zero: func_000CE5C4 gate check reads
-         them via ppc_rlwinm(struct+0, 0, 30, 31); if zero it returns -1 and
-         the game never initializes.
-       - bit 7 (0x80) MUST be set: func_000D0664 (called before CE5C4) routes
-         through func_000D0694 which inspects bit 7.
-           bit7=0 → D0694 calls func_000D0700, which writes r0 (=0, the bit-7
-                    mask) back into struct+0, ZEROING bits 0-1 before CE5C4
-                    runs — gate always fails.
-           bit7=1 → D0694 takes the slab-free path (func_000D90FC→D9108),
-                    which our slab guard in D9108 silently skips when the slab
-                    pool is uninitialized (slab+0x10==0). struct+0 is never
-                    touched, bits 0-1 survive, and CE5C4 passes.
-       - struct+0x44 must point to a zero-initialized scratch block (0x700100):
-         func_000CE628 reads it as a linked-list head and passes it to D58C4. */
-    vm_write16(0x700000u, 0x0083u);  /* bits 0-1 set (gate) | bit 7 set (slab-free path) */
-    /* struct+0x44 is a pointer to a ref-counted resource object.
-       Point it to a clean zero-initialized scratch block at 0x700100.
-       func_000D58C4/D5880/D596C treat [ptr+0] as refcount, [ptr+0x10] as
-       mutex data — all stubs, so zeros in that area are safe. */
-    vm_write32(0x700044u, 0x00700100u);
+    /* func_0003AAC4 is now a real trampoline that calls func_0003AAC8 (the actual
+       game initializer / thread launcher).  The synthetic game-context stub at
+       0x700000 is no longer needed as func_0003AAC4's return value.  We keep
+       the scratch block at 0x700100 zeroed in case any surviving code path
+       still reads through it, but the main initialization is now real. */
 
     ppu_context ctx = {};
     ctx.gpr[1]  = 0xD0000000u + 0x10000000u - 0x200u;  /* stack top */
