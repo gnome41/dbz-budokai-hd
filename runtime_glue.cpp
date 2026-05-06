@@ -484,6 +484,29 @@ extern "C" void lv2_syscall(ppu_context* ctx) {
         ctx->gpr[3] = 0;
         break;
 
+    /* ---- Unknown SPU/SPURS/event syscalls triggered by init chain ---------- */
+
+    /* sys_0x323 (803): triggered by func_000CE77C (bit13=1 path → D54B0) when
+       struct+8 < struct+0x10; purpose unknown, likely SPURS/event-port setup.
+       Return CELL_OK so callers continue. */
+    case 0x323:
+        fprintf(stderr, "[LV2] sys_0x323 (r3=0x%llX r4=0x%llX r5=0x%llX)\n",
+                (unsigned long long)ctx->gpr[3],
+                (unsigned long long)ctx->gpr[4],
+                (unsigned long long)ctx->gpr[5]);
+        ctx->gpr[3] = 0;
+        break;
+
+    /* sys_0x324 (804): triggered by func_000D5450 (D544C) when struct+4 >= 2;
+       purpose unknown.  Return CELL_OK so callers continue. */
+    case 0x324:
+        fprintf(stderr, "[LV2] sys_0x324 (r3=0x%llX r4=0x%llX r5=0x%llX)\n",
+                (unsigned long long)ctx->gpr[3],
+                (unsigned long long)ctx->gpr[4],
+                (unsigned long long)ctx->gpr[5]);
+        ctx->gpr[3] = 0;
+        break;
+
     default:
         fprintf(stderr, "[LV2] syscall %u (r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX)\n",
                 sysnum,
