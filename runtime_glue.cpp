@@ -210,16 +210,24 @@ extern "C" void thread_runtime_join_all() {
     }
 }
 
-/* Memory access — big-endian byte-swap, addr truncated to 32-bit */
+/* Memory access — big-endian byte-swap, addr truncated to 32-bit.
+ *
+ * Guest addresses 0x0000-0xFFFF are valid on real PS3 (PPU local storage).
+ * We commit that range in vm_init() (main.cpp).  Log accesses below 0x1000
+ * for visibility but always perform the actual read/write — do NOT skip. */
 extern "C" uint8_t vm_read8(uint64_t addr) {
-    return vm_base[(uint32_t)addr];
+    uint32_t a = (uint32_t)addr;
+    if (a < 0x1000) { fprintf(stderr, "[LOW-READ8]  guest addr=0x%08X\n", a); fflush(stderr); }
+    return vm_base[a];
 }
 extern "C" uint16_t vm_read16(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
+    if (a < 0x1000) { fprintf(stderr, "[LOW-READ16] guest addr=0x%08X\n", a); fflush(stderr); }
     return (uint16_t)(((uint16_t)vm_base[a] << 8) | vm_base[a + 1]);
 }
 extern "C" uint32_t vm_read32(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
+    if (a < 0x1000) { fprintf(stderr, "[LOW-READ32] guest addr=0x%08X\n", a); fflush(stderr); }
     return ((uint32_t)vm_base[a]     << 24) | ((uint32_t)vm_base[a + 1] << 16) |
            ((uint32_t)vm_base[a + 2] <<  8) |  (uint32_t)vm_base[a + 3];
 }
@@ -227,15 +235,29 @@ extern "C" uint64_t vm_read64(uint64_t addr) {
     return ((uint64_t)vm_read32(addr) << 32) | vm_read32(addr + 4);
 }
 extern "C" void vm_write8(uint64_t addr, uint8_t val) {
-    vm_base[(uint32_t)addr] = val;
+    uint32_t a = (uint32_t)addr;
+    if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE8]  guest addr=0x%08X val=0x%02X\n", a, val); fflush(stderr); }
+    vm_base[a] = val;
 }
 extern "C" void vm_write16(uint64_t addr, uint16_t val) {
     uint32_t a = (uint32_t)addr;
+    if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE16] guest addr=0x%08X val=0x%04X\n", a, (unsigned)val); fflush(stderr); }
     vm_base[a]     = (uint8_t)(val >> 8);
     vm_base[a + 1] = (uint8_t)(val);
 }
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
     uint32_t a = (uint32_t)addr;
+    if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE32] guest addr=0x%08X val=0x%08X\n", a, val); fflush(stderr); }
+    /* The SPURS init code (func_000CE77C) zeros [0x27F81C] (workload list head)
+       as part of its own initialization.  Since we have no real SPU runtime,
+       we intercept that zero-write and keep our synthetic dispatch chain in place.
+       Any non-zero write is allowed through so the real chain can be updated if
+       the game ever enqueues a real workload (unlikely without SPU emulation). */
+    if (a == 0x27F81Cu) {
+        fprintf(stderr, "[MONITOR] vm_write32(0x27F81C) = 0x%08X%s\n",
+                val, (val == 0) ? " → redirected to 0x70A000" : ""); fflush(stderr);
+        if (val == 0) val = 0x0070A000u;  /* preserve synthetic workload chain */
+    }
     vm_base[a]     = (uint8_t)(val >> 24);
     vm_base[a + 1] = (uint8_t)(val >> 16);
     vm_base[a + 2] = (uint8_t)(val >>  8);

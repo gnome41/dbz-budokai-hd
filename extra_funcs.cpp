@@ -890,9 +890,9 @@ static const extra_entry extra_table[] = {
     { 0x00014538ULL, func_00014538 },
     { 0x000E770CULL, func_000E770C },
     { 0x000E775CULL, func_000E775C },
-    { 0x00027110ULL, func_00027114 },   /* OPD → actual code at +4 */
-    { 0x00033A50ULL, func_00033A58 },   /* OPD → actual code at +8 (was empty stub) */
-    { 0x0003937CULL, func_00039380 },   /* OPD → actual code at +4 */
+    { 0x00027110ULL, func_00027110 },   /* full prologue+body with stdu -0x90 */
+    { 0x00033A50ULL, func_00033A54 },   /* skip unknown bl; enter at stdu -0x70 */
+    { 0x0003937CULL, func_0003937C },   /* full prologue+body with stdu -0x80 */
     { 0x0003B124ULL, func_0003B124 },
     { 0x000C5C8CULL, func_000C5C8C },
     { 0x000CB5C0ULL, func_000CB5C0 },
