@@ -23,6 +23,15 @@ static bool vm_init() {
     vm_base = (uint8_t*)VirtualAlloc(NULL, 0x100000000ULL, MEM_RESERVE, PAGE_NOACCESS);
     if (!vm_base) { fprintf(stderr, "ERROR: VirtualAlloc reserve failed\n"); return false; }
 
+    /* Low PS3 memory: 0x00000000-0x0000FFFF (PPU local storage area).
+       On real PS3 this region is valid; many games write global structs here.
+       func_000CE77C initializes a game-context struct at guest address 0.
+       Without this commit the runtime null-guard would silently drop those
+       writes and the initialization chain would see stale zeros. */
+    if (!VirtualAlloc(vm_base + 0x00000000u, 0x10000u, MEM_COMMIT, PAGE_READWRITE)) {
+        fprintf(stderr, "ERROR: Failed to commit low memory region\n");
+        VirtualFree(vm_base, 0, MEM_RELEASE); return false;
+    }
     /* Main RAM: 0x10000 .. 0x10010000 (256 MB, covers code + data + BSS) */
     if (!VirtualAlloc(vm_base + 0x00010000u, 0x10000000u, MEM_COMMIT, PAGE_READWRITE)) {
         fprintf(stderr, "ERROR: Failed to commit main RAM\n");
@@ -31,6 +40,14 @@ static bool vm_init() {
     /* Stack: 0xD0000000 .. 0xE0000000 */
     if (!VirtualAlloc(vm_base + 0xD0000000u, 0x10000000u, MEM_COMMIT, PAGE_READWRITE)) {
         fprintf(stderr, "ERROR: Failed to commit stack region\n");
+        VirtualFree(vm_base, 0, MEM_RELEASE); return false;
+    }
+    /* PS3 LV2/TLS high area: 0xFFFF0000 .. 0xFFFFFFFF (64 KB).
+       LV2 maps thread-local storage and kernel-shared structs here.
+       func_0003AAC8 cleanup path writes through a pointer that resolves
+       to guest 0xFFFF9004 — without this commit we get an AV. */
+    if (!VirtualAlloc(vm_base + 0xFFFF0000u, 0x10000u, MEM_COMMIT, PAGE_READWRITE)) {
+        fprintf(stderr, "ERROR: Failed to commit LV2/TLS high region\n");
         VirtualFree(vm_base, 0, MEM_RELEASE); return false;
     }
 #else
@@ -134,6 +151,83 @@ int main(int argc, char* argv[]) {
     vm_write32(0x27BBD4u, 0x0027BBD4u);  /* struct @ 0x27BB90, chain @ +0x44 */
     vm_write32(0x27BC3Cu, 0x0027BC3Cu);  /* struct @ 0x27BBF8, chain @ +0x44 */
     vm_write32(0x27BCA4u, 0x0027BCA4u);  /* struct @ 0x27BC60, chain @ +0x44 */
+
+    /* Fake SPURS manager context at 0x700000.
+       func_0003AAC4 returns this address (overriding func_0003AAC8's 0).
+
+       ctx+0x0 field layout (16-bit halfword):
+         bits 0-1  (gate)        must be non-zero → func_000CE5C4 passes the gate
+         bit  7    (slab path)   0x80 → slab-free path in CE77C
+         bit  13   (real-init)   0x2000 → CE77C takes the real SPURS init path
+                                 instead of the CE8B8 "no work" no-op path
+
+       func_000D5450 (D544C): reads ctx+0x4 halfword; must be >= 2 to trigger
+       the syscall 0x324 init path instead of immediate-return-0.
+
+       func_000CE77C (bit13=1 path): checks "ctx+8 < ctx+0x10"; ctx+8 = 0 (BSS),
+       so ctx+0x10 must be non-zero for the D54B0 syscall-0x323 loop to fire. */
+    vm_write16(0x700000u, 0x2083u);   /* bits 0-1 (gate) | bit 7 (slab) | bit 13 (real-init) */
+    vm_write16(0x700004u, 2u);        /* D544C: struct+4 >= 2 → syscall 0x324 path */
+    vm_write32(0x700010u, 0x700043u); /* CE77C: struct+0x10 sentinel > struct+8(0) */
+
+    /* func_000CE628 reads [ctx+0x44] → passes to func_000D1E64 as a sub-object
+       pointer.  func_000D1E64 then calls func_000D58C4 with it.  Point it at a
+       zeroed page area: func_000D58C4([ptr+0x0]=0) immediately takes the safe
+       loc_000D5914 early-return path. */
+    vm_write32(0x700044u, 0x700100u);
+
+    /* func_000379BC is the SPURS workload state machine (driven by [0x28B050]).
+       State 0 and state 1 (func_00037534) both spin on guest address 0x0
+       waiting for a SPURS SPU structure that never arrives.  Start at state 2
+       so the dispatcher jumps straight to loc_00037A84 → func_00035198 →
+       state 3.  Each subsequent SPURS loop pass advances the state machine;
+       when it reaches state 0xF (15) the patched loc_00038194 code writes
+       state=21 and [0x27F830]=1 to exit the dispatch loop cleanly. */
+    vm_write32(0x28B050u, 21u);  /* skip SPURS state machine (never runs): jump straight to exit state */
+
+    /* SPURS workload dispatch chain.
+       loc_0003AE74 in func_0003AAC8 reads [gpr[30]+0x28] = [0x27F81C] as a
+       SPURS workload struct pointer, then dereferences a vtable chain to call
+       the workload function (func_000379BC).  With [0x27F81C]=0 all reads fall
+       to guest addresses 0x0/0x8 → infinite LOW-READ32 spin.
+
+       NOTE: the bump-slab fallback allocator (func at ~line 523438 in ppu_recomp.cpp)
+       starts its pool at 0x701000.  Any synthetic data placed there will be
+       overwritten the first time an uninitialised slab fires, corrupting the
+       chain.  Use 0x70A000 instead (well above any observed bump allocation).
+
+       Build a minimal synthetic dispatch chain at 0x70A000:
+         A = [0x27F81C]      → 0x70A000  (workload struct)
+         B = [A + 0x00]      → 0x70A010  (vtable-like ptr)
+         C = [B + 0x08]      → 0x70A020  (OPD entry)
+         code = [C + 0x00]   → 0x000379BC
+         TOC  = [C + 0x04]   → 0x0016A0F8  */
+    vm_write32(0x27F81Cu, 0x70A000u);   /* A  = workload struct ptr */
+    vm_write32(0x70A000u, 0x70A010u);   /* B  = [A+0x00] */
+    vm_write32(0x70A018u, 0x70A020u);   /* C  = [B+0x08] (OPD slot) */
+    vm_write32(0x70A020u, 0x000379BCu); /* code pointer */
+    vm_write32(0x70A024u, 0x0016A0F8u); /* TOC */
+
+    /* func_000355D4 / func_000355FC gate (states 13 and 14).
+       These functions read [gpr[30]+0x20]=[0x27F814] → ptr P,
+       then [P+0x148] → ptr Q, then [Q+0xC].  func_000355D4 returns 1 if
+       [Q+0xC]==1, func_000355FC returns 1 if [Q+0xC]>=2.  With BSS=0 both
+       return 0 → states 13 and 14 stall forever.
+       Build a synthetic struct chain at 0x70B000 with [Q+0xC]=2. */
+    vm_write32(0x27F814u, 0x70B000u);   /* P  = [0x27F814] */
+    vm_write32(0x70B148u, 0x70B200u);   /* Q  = [P+0x148] */
+    vm_write32(0x70B20Cu, 2u);          /* [Q+0xC] = 2 → both funcs return 1 */
+
+    /* State 7 (loc_00037D3C) pre-checks [0x289B90+0x5D0]=[0x28A160] before
+       creating Thread 2.  On a real PS3 Thread 1 writes this flag once started.
+       Pre-set so state 7 proceeds on its very first pass. */
+    vm_write8(0x28A160u, 1u);
+
+    /* loc_0003B088 in func_0003AAC8 spins on vm_read8(0x290000 - 0x4F70) =
+       vm_read8(0x28B090) waiting for SPURS shutdown confirmation (normally set
+       by SPU tasks, which we don't run).  Pre-set to 1 so the spin exits on
+       the first check. */
+    vm_write8(0x28B090u, 1u);
 
     /* func_0003AAC4 is now a real trampoline that calls func_0003AAC8 (the actual
        game initializer / thread launcher).  The synthetic game-context stub at
