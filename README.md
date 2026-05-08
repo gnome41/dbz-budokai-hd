@@ -21,7 +21,9 @@ Built on top of the **[ps3recomp](https://github.com/sp00nznet/ps3recomp) SDK** 
 | `recompiled/ppu_recomp.h` | **Auto-generated** — declares `ppu_context`, memory helpers, all `func_XXXXXXXX` prototypes |
 | `config.toml` | Lifter configuration: input ELF, output dir, HLE/LLE module choices |
 | `CMakeLists.txt` | Build system (Ninja + MSVC) |
+| `CMakeLists.txt` | Build system (Ninja + MSVC) |
 | `build_run.bat` | Configure + build via Ninja |
+| `force_rebuild.bat` | Force-recompile changed `.cpp` files then link (faster than full cmake rebuild) |
 | `run.bat` | Run `build\dbz-budokai-hd.exe ..\game\EBOOT.elf` |
 
 ## What's not here (and why)
@@ -67,9 +69,10 @@ run.bat          # run against ..\game\EBOOT.elf
 |---|---|
 | ELF load + guest memory setup | ✅ Working |
 | Static C++ constructors (via indirect CTR) | ✅ Working |
-| Game-context initialization sequence | ✅ Working |
-| `_start` completes without abort | ✅ Working |
-| Game thread execution | 🔲 Next milestone |
+| SPURS / game-context initialization sequence | ✅ Working |
+| `_start` + `func_0003AAC8` complete without abort | ✅ Working |
+| `sys_ppu_thread_create` fires; threads run and join | ✅ Working |
+| Game thread execution (rendering / gameplay loop) | 🔲 Next milestone |
 | Graphics (RSX / cellGcm) | 🔲 Stubbed |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
@@ -77,8 +80,18 @@ run.bat          # run against ..\game\EBOOT.elf
 ### Key patches applied
 
 - **Pool-manager sentinel self-links** at `0x27BBD4`, `0x27BC3C`, `0x27BCA4` — the BSS-zeroed ELF doesn't run the C++ constructor that sets these up.
-- **Game-context stub** at `0x700000` — `func_0003AAC4` is stubbed to return this synthetic page. `struct+0 = 0x0003` (bits 0-1 for gate check; bit 7 deliberately clear so `func_000D0694` takes the initializer path, not the slab-free path).
-- **Slab-free guard** in `func_000D9108` — skips freeing when the slab allocator at `0x2E45F0` is still uninitialized (its constructor was missed by the lifter), preventing a block-header abort.
+- **SPURS context stub** at `0x700000` — `func_0003AAC4` returns this synthetic page. Fields:
+  - `struct+0 = 0x2083`: bits 0-1 (gate), bit 7 (slab path), bit 13 (CE77C real-init path)
+  - `struct+4 = 2`: satisfies `func_000D5450`'s `>= 2` check for the syscall `0x324` path
+  - `struct+0x10 = 0x700043`: sentinel so `func_000CE77C`'s `struct+8 < struct+0x10` comparison passes
+  - `struct+0x44 → 0x700100`: sub-object pointer for `func_000D58C4` early-return path
+- **SPURS workload dispatch chain** at `0x70A000` — `[0x27F81C]` is the SPURS workload list head. The SPURS init code zeros it; `vm_write32` intercepts that zero-write and redirects it back to `0x70A000`. A synthetic vtable → OPD chain at `0x70A000` lets `loc_0003AE74` dereference safely without a LOW-READ spin.
+- **SPURS state bypass** — `[0x28B050]` pre-set to `21` (the exit state). The SPURS workload state machine (`func_000379BC`) never actually runs because the lifter compiled the `bctrl` in the dispatch loop to `func_00000030` statically. Pre-setting state 21 makes the dispatch loop exit cleanly via `loc_0003AED0` on its first pass.
+- **States 13/14 struct chain** at `0x70B000` — `[0x27F814] → 0x70B000`, `[0x70B148] → 0x70B200`, `[0x70B20C] = 2` so both `func_000355D4` and `func_000355FC` return 1.
+- **Pre-set flags**: `[0x28A160] = 1` (Thread 2 ready signal), `[0x28B090] = 1` (SPURS shutdown confirmation).
+- **Slab-free guard** in `extra_funcs.cpp` — skips freeing when the slab allocator at `0x2E45F0` is still uninitialized (its constructor was missed by the lifter), preventing a block-header abort.
+- **LV2/TLS high region** `0xFFFF0000–0xFFFFFFFF` committed — the `func_0003AAC8` cleanup path writes to guest `0xFFFF9004` (PS3 LV2-mapped TLS area); without this the host throws an access violation.
+- **`bcctrl` → `func_00000030` direct calls** — the lifter emitted trampoline stubs for several `bctrl` instructions targeting address `0x30` (the LV2 syscall gate). These were replaced with direct `func_00000030(ctx)` calls to avoid incorrect early-return behaviour.
 
 ---
 
