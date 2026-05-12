@@ -42,6 +42,19 @@ static bool vm_init() {
         fprintf(stderr, "ERROR: Failed to commit stack region\n");
         VirtualFree(vm_base, 0, MEM_RELEASE); return false;
     }
+    /* Caller-frame headroom above initial stack pointer.
+       func_000379BC (SPURS state machine) saves LR at gpr[1]+0xF0 BEFORE
+       decrementing gpr[1].  With initial SP=0xDFFFFE00, the first call to
+       func_000379BC from loc_0003AE74 (gpr[1]=0xDFFFFF10 after nested frames)
+       writes to 0xDFFFFF10+0xF0=0xE0000000 — one byte past the committed
+       stack region — causing an ACCESS VIOLATION.
+       One 4 KB page is enough now that the func_000379BC SP-leak bug
+       is patched; the headroom only needs to cover the PPC caller-frame
+       linkage area written above SP before the prologue decrements it. */
+    if (!VirtualAlloc(vm_base + 0xE0000000u, 0x1000u, MEM_COMMIT, PAGE_READWRITE)) {
+        fprintf(stderr, "ERROR: Failed to commit stack headroom\n");
+        VirtualFree(vm_base, 0, MEM_RELEASE); return false;
+    }
     /* PS3 LV2/TLS high area: 0xFFFF0000 .. 0xFFFFFFFF (64 KB).
        LV2 maps thread-local storage and kernel-shared structs here.
        func_0003AAC8 cleanup path writes through a pointer that resolves
@@ -183,7 +196,7 @@ int main(int argc, char* argv[]) {
        state 3.  Each subsequent SPURS loop pass advances the state machine;
        when it reaches state 0xF (15) the patched loc_00038194 code writes
        state=21 and [0x27F830]=1 to exit the dispatch loop cleanly. */
-    vm_write32(0x28B050u, 21u);  /* skip SPURS state machine (never runs): jump straight to exit state */
+    vm_write32(0x28B050u, 2u);   /* start SPURS state machine at state 2 (skips SPU-wait states 0-1) */
 
     /* SPURS workload dispatch chain.
        loc_0003AE74 in func_0003AAC8 reads [gpr[30]+0x28] = [0x27F81C] as a
@@ -216,12 +229,18 @@ int main(int argc, char* argv[]) {
        Build a synthetic struct chain at 0x70B000 with [Q+0xC]=2. */
     vm_write32(0x27F814u, 0x70B000u);   /* P  = [0x27F814] */
     vm_write32(0x70B148u, 0x70B200u);   /* Q  = [P+0x148] */
-    vm_write32(0x70B20Cu, 2u);          /* [Q+0xC] = 2 → both funcs return 1 */
+    vm_write32(0x70B20Cu, 1u);          /* [Q+0xC] = 1 → func_000355D4 returns 1 (checks ==1) */
 
-    /* State 7 (loc_00037D3C) pre-checks [0x289B90+0x5D0]=[0x28A160] before
-       creating Thread 2.  On a real PS3 Thread 1 writes this flag once started.
-       Pre-set so state 7 proceeds on its very first pass. */
-    vm_write8(0x28A160u, 1u);
+    /* State 7 (loc_00037D3C): reads [0x289B90+0x5D0]=[0x28A160].
+       Code: "if ([0x28A160] != 0) return" — so 0 means PROCEED, 1 means SPIN.
+       BSS default is 0, which is correct.  The earlier pre-patch of 1 was wrong
+       (caused state 7 to spin forever).  Do NOT set [0x28A160] here; state 7
+       will write it to 1 itself after creating Thread 2. */
+
+    /* State 12 (loc_00037F38): calls func_00027090 which reads [0x27F831].
+       If non-zero, advances to state 13.  On a real PS3 an SPU task sets this.
+       Pre-set to 1 so state 12 advances on its first pass. */
+    vm_write8(0x27F831u, 1u);
 
     /* loc_0003B088 in func_0003AAC8 spins on vm_read8(0x290000 - 0x4F70) =
        vm_read8(0x28B090) waiting for SPURS shutdown confirmation (normally set
