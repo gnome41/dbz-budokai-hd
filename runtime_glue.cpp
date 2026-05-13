@@ -7,6 +7,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbghelp.h>
 #endif
 
 #include "recompiled/ppu_recomp.h"
@@ -217,17 +218,51 @@ extern "C" void thread_runtime_join_all() {
  * for visibility but always perform the actual read/write — do NOT skip. */
 extern "C" uint8_t vm_read8(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
-    if (a < 0x1000) { fprintf(stderr, "[LOW-READ8]  guest addr=0x%08X\n", a); fflush(stderr); }
-    return vm_base[a];
+    uint8_t v = vm_base[a];
+    if (a < 0x1000) { fprintf(stderr, "[LOW-READ8]  guest addr=0x%08X val=0x%02X\n", a, v); fflush(stderr); }
+    return v;
 }
 extern "C" uint16_t vm_read16(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
-    if (a < 0x1000) { fprintf(stderr, "[LOW-READ16] guest addr=0x%08X\n", a); fflush(stderr); }
-    return (uint16_t)(((uint16_t)vm_base[a] << 8) | vm_base[a + 1]);
+    uint16_t v = (uint16_t)(((uint16_t)vm_base[a] << 8) | vm_base[a + 1]);
+    if (a < 0x1000) { fprintf(stderr, "[LOW-READ16] guest addr=0x%08X val=0x%04X\n", a, v); fflush(stderr); }
+    return v;
 }
 extern "C" uint32_t vm_read32(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
-    if (a < 0x1000) { fprintf(stderr, "[LOW-READ32] guest addr=0x%08X\n", a); fflush(stderr); }
+    if (a < 0x1000) {
+        static volatile int s_read4_done = 0;
+        if (a == 4 && !s_read4_done) {
+            s_read4_done = 1;
+            /* Use DbgHelp to resolve host function names from the PDB */
+            HANDLE hProc = GetCurrentProcess();
+            SymInitialize(hProc, nullptr, TRUE);
+            void* stack[32] = {};
+            USHORT frames = CaptureStackBackTrace(0, 32, stack, nullptr);
+            char symBuf[sizeof(SYMBOL_INFO) + 256] = {};
+            SYMBOL_INFO* sym = (SYMBOL_INFO*)symBuf;
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            fprintf(stderr, "[LOW-READ32-TRACE] first read of addr=0x4 (%u frames):\n", frames);
+            for (USHORT i = 0; i < frames; i++) {
+                DWORD64 disp = 0;
+                if (SymFromAddr(hProc, (DWORD64)stack[i], &disp, sym))
+                    fprintf(stderr, "  [%u] %s+0x%llX\n", i, sym->Name, (unsigned long long)disp);
+                else
+                    fprintf(stderr, "  [%u] %p (no symbol)\n", i, stack[i]);
+            }
+            fflush(stderr);
+        }
+        static uint32_t s_low32_count[0x1000] = {};
+        uint32_t v32 = ((uint32_t)vm_base[a] << 24) | ((uint32_t)vm_base[a+1] << 16) |
+                       ((uint32_t)vm_base[a+2] <<  8) |  (uint32_t)vm_base[a+3];
+        if (++s_low32_count[a] <= 5)
+            fprintf(stderr, "[LOW-READ32] guest addr=0x%08X val=0x%08X (count=%u)\n", a, v32, s_low32_count[a]);
+        else if (s_low32_count[a] == 6)
+            fprintf(stderr, "[LOW-READ32] addr=0x%08X further repeats suppressed\n", a);
+        fflush(stderr);
+        return v32;
+    }
     return ((uint32_t)vm_base[a]     << 24) | ((uint32_t)vm_base[a + 1] << 16) |
            ((uint32_t)vm_base[a + 2] <<  8) |  (uint32_t)vm_base[a + 3];
 }
@@ -257,6 +292,11 @@ extern "C" void vm_write32(uint64_t addr, uint32_t val) {
         fprintf(stderr, "[MONITOR] vm_write32(0x27F81C) = 0x%08X%s\n",
                 val, (val == 0) ? " → redirected to 0x70A000" : ""); fflush(stderr);
         if (val == 0) val = 0x0070A000u;  /* preserve synthetic workload chain */
+    }
+    if (a == 0x27F814u) {
+        fprintf(stderr, "[MONITOR] vm_write32(0x27F814) = 0x%08X%s\n",
+                val, (val == 0) ? " → redirected to 0x70B000" : ""); fflush(stderr);
+        if (val == 0) val = 0x0070B000u;  /* preserve states 11/13/14 struct chain */
     }
     vm_base[a]     = (uint8_t)(val >> 24);
     vm_base[a + 1] = (uint8_t)(val >> 16);
