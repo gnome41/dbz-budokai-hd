@@ -84,12 +84,16 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 | SPURS / game-context initialization sequence | ✅ Working |
 | `_start` + `func_0003AAC8` complete without abort | ✅ Working |
 | SPURS workload state machine runs to completion (states 2 → 21) | ✅ Working |
-| `sys_ppu_thread_create` fires; first game thread (`sdu_yah_size_check`) starts | ✅ Working |
-| Thread 1 executes lifted body (instead of UNRESOLVED stub) | 🟡 Wrapper added; build verification pending |
-| Subsequent game threads (Thread 2, 3, …) | 🔲 Next milestone |
+| `sys_ppu_thread_create` fires; all 4 startup threads run their lifted bodies | ✅ Working |
+| C runtime startup wrapper (`func_0003B244` → `func_000F205C`) | ✅ Stubbed-clean |
+| C++ destructor walker (`func_000F0A78` → `func_0003B4FC` → `func_0003B500`) | ✅ Working |
+| Process exits cleanly with no AV / no abort | ✅ Working |
+| **Real LV2 sync primitives** (sem/mutex/lwmutex/event-queue actually block) | 🔲 Next milestone — worker threads currently exit immediately because stubbed waits return success |
 | Graphics (RSX / cellGcm) | 🔲 Stubbed |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
+
+Current end-state of a run (`run_stderr.txt`): SPURS init → SPURS workload state machine runs to 21 → 4 worker threads spawn (`sdu_yah_size_check ×2`, `sdu_yah_all_list_delete`, `Terminate Thread`), each runs its lifted body and exits → C++ destructor walker runs → main returns → `[RUNTIME] all game threads finished`.
 
 ### Key patches applied
 
@@ -104,18 +108,24 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 - **State 6 spin-wait skip** — on a real PS3, SPU tasks externally write `state=7` to break state 6's spin. Without SPU emulation we force `gpr[4]=7` in `loc_00037BF4`.
 - **State 15 completion** — manual writes in `loc_00038194` set `[0x28B050]=21` (SPURS done) and `[0x27F830]=1` to break the outer dispatch loop.
 - **States 13/14 struct chain** at `0x70B000` — `[0x27F814] → 0x70B000`, `[0x70B148] → 0x70B200`, `[0x70B20C] = 1` (`func_000355D4` is an equality check `==1`, not `>=2`).
-- **Pre-set state-machine flags**: `[0x28B050]=2` (start at state 2), `[0x27F831]=1` (state 12's read).
+- **`[0x27F814]` zero-write redirect** — `vm_write32` intercepts zero-writes to `0x27F814` (SPURS shutdown clears it) and redirects them to `0x70B000`, mirroring the existing `[0x27F81C] → 0x70A000` redirect. Keeps the states-13/14 struct chain alive across SPURS shutdown.
+- **Pre-set state-machine flag**: `[0x28B050]=2` (start at state 2). `[0x27F831]` is intentionally left at BSS=0 — pre-setting it to 1 causes states 10/12 to spin (they call `func_00027090` which expects 0 = "condition clear").
 - **Slab-free guard** in `extra_funcs.cpp` — skips freeing when the slab allocator at `0x2E45F0` is still uninitialized (its constructor was missed by the lifter), preventing a block-header abort.
 - **LV2/TLS high region** `0xFFFF0000–0xFFFFFFFF` committed — the `func_0003AAC8` cleanup path writes to guest `0xFFFF9004` (PS3 LV2-mapped TLS area); without this the host throws an access violation.
 - **Caller-frame headroom** at `0xE0000000` — one 4 KB page committed above the stack. PPC ABI saves LR into the *caller's* frame at `SP+0xF0` *before* the prologue decrements SP; with initial `SP=0xDFFFFE00` the first save lands at `0xE0000000`, which would AV without this page.
 - **`bcctrl` → `func_00000030` direct calls** — the lifter emitted trampoline stubs for several `bctrl` instructions targeting address `0x30` (the LV2 syscall gate). These were replaced with direct `func_00000030(ctx)` calls to avoid incorrect early-return behaviour.
+- **`func_000F205C` HLE stub** (`extra_funcs.cpp`) — sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244`. Stubbed to `gpr[3] = 0`; the destructor walker still runs via the natural `func_000CE57C → func_000CE1E8 → func_000F0A78 → func_0003B4FC → func_0003B500` chain.
+- **Two-step entry call** in `main.cpp` — the ELF prologue at `0x3B220` calls `func_0003B328` then falls through into `func_0003B244`. We replicate this explicitly: `func_0003B328(&ctx)` → `DRAIN_TRAMPOLINE` → `func_0003B244(&ctx)` → `DRAIN_TRAMPOLINE`.
 
 ### Lifter bugs fixed by hand
 
-The lifter sometimes drops the `stwu r1, -N(r1)` prologue while keeping the matching epilogue's `gpr[1] += N`. Each call then leaks +N bytes of stack growth, and a tight loop eventually overruns the committed stack region.
+**Dropped `stwu r1, -N(r1)` prologues (SP runaway).** Some functions kept their epilogue's `gpr[1] += N` but lost the matching prologue subtract — each call leaks +N bytes of SP growth.
 
 - **`func_000379BC`** (`recompiled/ppu_recomp.cpp`) — epilogue `+= 0xE0`, prologue patched in place to add the missing `vm_write64(gpr[1]-0xE0, gpr[1]); gpr[1] -= 0xE0;`.
-- **`func_000EFD18` / `func_000EFD1C`** (`extra_funcs.cpp`) — the OPD entry for the `sdu_yah_size_check` thread points to `0x000EFD18` (4 bytes before the lifted `func_000EFD1C`), exactly where the missing `stwu r1, -0xB0(r1)` would have lived. Added a `func_000EFD18` wrapper that does the missing `stwu` then calls `func_000EFD1C`, registered at `0x000EFD18` in the extra-function table.
+- **`func_000EFD18` / `func_000EFD1C`** (`extra_funcs.cpp`) — OPD for `sdu_yah_size_check` points to `0x000EFD18`, 4 bytes before the lifted `func_000EFD1C`, exactly where the missing `stwu r1, -0xB0(r1)` would live. Wrapper at `func_000EFD18` does the `stwu` then calls `func_000EFD1C`.
+- **`func_000EFACC` / `func_000EFAD0`** (`extra_funcs.cpp`) — same pattern. OPD for `sdu_yah_all_list_delete` is `0x000EFACC` but the lifter emitted `func_000EFAD0`; missing prologue is `stwu r1, -0xC0(r1)`. Wrapper added and registered in `extra_table`.
+
+**Dropped `addc rD, rA, rB` instructions (~770 sites).** The lifter emitted `/* TODO: addc ... */` placeholders for the carry-producing add, silently leaving rD unmodified. This was breaking pointer arithmetic in the heap/list code that runs during C++ static-ctor init. All sites were filled with a uniform `(uint64_t)(uint32_t)rA + (uint64_t)(uint32_t)rB` expression that writes the 32-bit sum to rD and updates `XER[CA]`.
 
 See `CLAUDE.md` for the diagnostic recipe used to find these.
 
