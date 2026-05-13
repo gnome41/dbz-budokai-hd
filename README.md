@@ -21,7 +21,6 @@ Built on top of the **[ps3recomp](https://github.com/sp00nznet/ps3recomp) SDK** 
 | `recompiled/ppu_recomp.h` | **Auto-generated** — declares `ppu_context`, memory helpers, all `func_XXXXXXXX` prototypes |
 | `config.toml` | Lifter configuration: input ELF, output dir, HLE/LLE module choices |
 | `CMakeLists.txt` | Build system (Ninja + MSVC) |
-| `CMakeLists.txt` | Build system (Ninja + MSVC) |
 | `build_run.bat` | Configure + build via Ninja |
 | `force_rebuild.bat` | Force-recompile changed `.cpp` files then link (faster than full cmake rebuild) |
 | `run.bat` | Run `build\dbz-budokai-hd.exe ..\game\EBOOT.elf` |
@@ -53,13 +52,26 @@ RecompLauncher/
 
 ## Build & Run
 
-From a **VS 2022 Developer Command Prompt**:
+`build_run.bat` currently configures cmake without an explicit `-DPS3RECOMP_DIR`, which defaults to `../../` from the project dir → `E:\Games\RecompLauncher` (wrong; the SDK is at `E:\Games\RecompLauncher\ps3recomp`). Configure fails, then `force_rebuild.bat`'s final link step also fails because there's no `build.ninja`.
 
-```bat
-cd dbz-budokai-hd
-build_run.bat    # configure + build (echoes BUILD_EXIT=0 on success)
-run.bat          # run against ..\game\EBOOT.elf
+**Working invocation (PowerShell):**
+
+```powershell
+cd E:\Games\RecompLauncher\ps3recomp\dbz-budokai-hd
+
+# One-time configure (or after deleting build\):
+cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 && cmake -B build -G Ninja -S . -DPS3RECOMP_DIR=E:/Games/RecompLauncher/ps3recomp'
+
+# Subsequent rebuilds:
+cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 && cmake --build build'
+
+# Run:
+.\build\dbz-budokai-hd.exe ..\game\EBOOT.elf
 ```
+
+`vcvars64.bat` MUST be sourced inside the same `cmd` session as the `cmake` call (PowerShell's `&` does not propagate child env vars back to the parent). Don't try to run MSVC from Git Bash — it mangles `/flag` arguments as paths.
+
+If the cmake configure cache is broken (missing `build.ninja`), delete `build\CMakeCache.txt` and `build\CMakeFiles\` and reconfigure.
 
 ---
 
@@ -71,8 +83,10 @@ run.bat          # run against ..\game\EBOOT.elf
 | Static C++ constructors (via indirect CTR) | ✅ Working |
 | SPURS / game-context initialization sequence | ✅ Working |
 | `_start` + `func_0003AAC8` complete without abort | ✅ Working |
-| `sys_ppu_thread_create` fires; threads run and join | ✅ Working |
-| Game thread execution (rendering / gameplay loop) | 🔲 Next milestone |
+| SPURS workload state machine runs to completion (states 2 → 21) | ✅ Working |
+| `sys_ppu_thread_create` fires; first game thread (`sdu_yah_size_check`) starts | ✅ Working |
+| Thread 1 executes lifted body (instead of UNRESOLVED stub) | 🟡 Wrapper added; build verification pending |
+| Subsequent game threads (Thread 2, 3, …) | 🔲 Next milestone |
 | Graphics (RSX / cellGcm) | 🔲 Stubbed |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
@@ -86,12 +100,24 @@ run.bat          # run against ..\game\EBOOT.elf
   - `struct+0x10 = 0x700043`: sentinel so `func_000CE77C`'s `struct+8 < struct+0x10` comparison passes
   - `struct+0x44 → 0x700100`: sub-object pointer for `func_000D58C4` early-return path
 - **SPURS workload dispatch chain** at `0x70A000` — `[0x27F81C]` is the SPURS workload list head. The SPURS init code zeros it; `vm_write32` intercepts that zero-write and redirects it back to `0x70A000`. A synthetic vtable → OPD chain at `0x70A000` lets `loc_0003AE74` dereference safely without a LOW-READ spin.
-- **SPURS state bypass** — `[0x28B050]` pre-set to `21` (the exit state). The SPURS workload state machine (`func_000379BC`) never actually runs because the lifter compiled the `bctrl` in the dispatch loop to `func_00000030` statically. Pre-setting state 21 makes the dispatch loop exit cleanly via `loc_0003AED0` on its first pass.
-- **States 13/14 struct chain** at `0x70B000` — `[0x27F814] → 0x70B000`, `[0x70B148] → 0x70B200`, `[0x70B20C] = 2` so both `func_000355D4` and `func_000355FC` return 1.
-- **Pre-set flags**: `[0x28A160] = 1` (Thread 2 ready signal), `[0x28B090] = 1` (SPURS shutdown confirmation).
+- **SPURS state machine wired up** — patched the `bctrl` in `loc_0003AE74` (originally lifted as a static call to `func_00000030`) to invoke `func_000379BC` directly. The state machine now advances `[0x28B050]` through `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21` instead of being bypassed.
+- **State 6 spin-wait skip** — on a real PS3, SPU tasks externally write `state=7` to break state 6's spin. Without SPU emulation we force `gpr[4]=7` in `loc_00037BF4`.
+- **State 15 completion** — manual writes in `loc_00038194` set `[0x28B050]=21` (SPURS done) and `[0x27F830]=1` to break the outer dispatch loop.
+- **States 13/14 struct chain** at `0x70B000` — `[0x27F814] → 0x70B000`, `[0x70B148] → 0x70B200`, `[0x70B20C] = 1` (`func_000355D4` is an equality check `==1`, not `>=2`).
+- **Pre-set state-machine flags**: `[0x28B050]=2` (start at state 2), `[0x27F831]=1` (state 12's read).
 - **Slab-free guard** in `extra_funcs.cpp` — skips freeing when the slab allocator at `0x2E45F0` is still uninitialized (its constructor was missed by the lifter), preventing a block-header abort.
 - **LV2/TLS high region** `0xFFFF0000–0xFFFFFFFF` committed — the `func_0003AAC8` cleanup path writes to guest `0xFFFF9004` (PS3 LV2-mapped TLS area); without this the host throws an access violation.
+- **Caller-frame headroom** at `0xE0000000` — one 4 KB page committed above the stack. PPC ABI saves LR into the *caller's* frame at `SP+0xF0` *before* the prologue decrements SP; with initial `SP=0xDFFFFE00` the first save lands at `0xE0000000`, which would AV without this page.
 - **`bcctrl` → `func_00000030` direct calls** — the lifter emitted trampoline stubs for several `bctrl` instructions targeting address `0x30` (the LV2 syscall gate). These were replaced with direct `func_00000030(ctx)` calls to avoid incorrect early-return behaviour.
+
+### Lifter bugs fixed by hand
+
+The lifter sometimes drops the `stwu r1, -N(r1)` prologue while keeping the matching epilogue's `gpr[1] += N`. Each call then leaks +N bytes of stack growth, and a tight loop eventually overruns the committed stack region.
+
+- **`func_000379BC`** (`recompiled/ppu_recomp.cpp`) — epilogue `+= 0xE0`, prologue patched in place to add the missing `vm_write64(gpr[1]-0xE0, gpr[1]); gpr[1] -= 0xE0;`.
+- **`func_000EFD18` / `func_000EFD1C`** (`extra_funcs.cpp`) — the OPD entry for the `sdu_yah_size_check` thread points to `0x000EFD18` (4 bytes before the lifted `func_000EFD1C`), exactly where the missing `stwu r1, -0xB0(r1)` would have lived. Added a `func_000EFD18` wrapper that does the missing `stwu` then calls `func_000EFD1C`, registered at `0x000EFD18` in the extra-function table.
+
+See `CLAUDE.md` for the diagnostic recipe used to find these.
 
 ---
 
