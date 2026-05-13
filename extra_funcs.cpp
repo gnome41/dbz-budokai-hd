@@ -873,6 +873,19 @@ loc_00027110_done:
         return;
 }
 
+/* ---- Wrapper for thread entry func_000EFD18 ----------------------------
+ * The OPD entry for "sdu_yah_size_check" points to 0x000EFD18, but the
+ * lifter only emitted func_000EFD1C (4 bytes later) and dropped the
+ * `stwu r1, -0xB0(r1)` prologue at 0x000EFD18 — same lifter bug as
+ * func_000379BC.  This wrapper performs the missing stwu and then calls
+ * the body.  func_000EFD1C's epilogue does `gpr[1] += 0xB0`, restoring SP. */
+void func_000EFD1C(ppu_context* ctx);
+void func_000EFD18(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0xB0, ctx->gpr[1]);  /* back-chain */
+    ctx->gpr[1] -= 0xB0;
+    func_000EFD1C(ctx);
+}
+
 /* ---- Secondary function table ------------------------------------------ */
 
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
@@ -897,6 +910,7 @@ static const extra_entry extra_table[] = {
     { 0x000C5C8CULL, func_000C5C8C },
     { 0x000CB5C0ULL, func_000CB5C0 },
     { 0x000E9208ULL, func_000E9208 },
+    { 0x000EFD18ULL, func_000EFD18 },   /* sdu_yah_size_check thread entry: missing stwu wrapper */
     { 0, nullptr },
 };
 
