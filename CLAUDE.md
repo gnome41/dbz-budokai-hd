@@ -38,7 +38,7 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 
 | File | Purpose |
 |---|---|
-| `main.cpp` | Reserves 4 GB guest VA, loads ELF segments, patches pool-manager sentinels + game-context stub, calls `func_0003B328` (`_start`) |
+| `main.cpp` | Reserves 4 GB guest VA, loads ELF segments, patches pool-manager sentinels + game-context stub, calls `func_0003B328` (`_start`) then `func_0003B244` (two-step entry); defines `DRAIN_TRAMPOLINE` macro |
 | `runtime_glue.cpp` | `vm_base` + `vm_read*/vm_write*` (big-endian, 32-bit truncated addresses); `lv2_syscall` dispatcher; `ps3_indirect_call` for CTR indirect branches |
 | `extra_funcs.cpp` | Hand-lifted PPU functions missed by the lifter (ctors/dtors reached only via indirect calls); same `void func_XXXXXXXX(ppu_context*)` signature |
 | `stubs.cpp` | Reference template for NID overrides/module hooks — not compiled; kept as documentation |
@@ -57,7 +57,7 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
   - `0xE0000000–0xE0000FFF` — **caller-frame headroom** (1 page above SP top). PPC ABI saves LR into the *caller's* frame at `SP+0xF0` *before* the prologue decrements SP; with initial `SP=0xDFFFFE00` the very first save lands at `0xE0000000` which would AV without this commit.
   - `0xFFFF0000–0xFFFFFFFF` — PS3 LV2/TLS high area (thread-local storage, kernel-shared structs)
 - Always use `vm_read*/vm_write*` helpers — never raw pointer casts (big-endian byte-swap required).
-- `vm_write32` intercepts zero-writes to `0x27F81C` (the SPURS workload list head) and redirects them to `0x70A000` to preserve the synthetic dispatch chain — see below.
+- `vm_write32` intercepts zero-writes to `0x27F81C` (SPURS workload list head → `0x70A000`) and `0x27F814` (states-13/14 struct head → `0x70B000`) to preserve synthetic dispatch chains — see below.
 
 ### LV2 Syscalls (`runtime_glue.cpp: lv2_syscall`)
 Dispatches on `ctx->gpr[11]`. Currently handled:
@@ -77,13 +77,13 @@ Dispatches on `ctx->gpr[11]`. Currently handled:
 | 145 | `sys_time_get_timebase_frequency` | returns 79 800 000 |
 | 403 | `sys_tty_write` | prints game debug output |
 | 612–616 | lwmutex | stubbed |
-| 988 | watchdog | `r3==4` sets `g_abort_called`, dumps call stack |
+| 988 | watchdog | `r3==1` is a heartbeat (logged, ignored); `r3==4` sets `g_abort_called`, dumps call stack |
 
 All others log and return 0. Add new cases directly to `lv2_syscall`.
 
 ### Thread Runtime (`runtime_glue.cpp`)
 `thread_runtime_init()` initialises the critical section — call before `vm_init()` in `main.cpp`.  
-`thread_runtime_join_all()` waits for all game threads — call after `func_0003B328` returns.
+`thread_runtime_join_all()` waits for all game threads — call after both entry calls (`func_0003B328` + `func_0003B244`) return.
 
 Each game thread gets a 1 MB guest stack committed on demand (bump-allocated downward from `0xCFFF0000`). The thread entry OPD is decoded (code ptr + TOC at `opd_ptr` / `opd_ptr+4`) and the resolved host function is called with a fresh `ppu_context`. `g_trampoline_fn` is `__declspec(thread)` so each Windows thread has its own trampoline slot.
 
@@ -98,25 +98,28 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 ## Current Status (last verified working state)
 
-**The program reaches first thread creation and no longer crashes.** Latest run output:
-```
-[LV2] sys_ppu_thread_create name="sdu_yah_size_check" opd=0x00161398 code=0x000EFD18 toc=0x0016A0F8 arg=0x289590 stk=0x4000 prio=1002 flags=0x0
-[THREAD 1] starting at 0x000EFD18 sp=0xCFFE0000
-[THREAD 1] UNRESOLVED entry 0x000EFD18 — thread stubbed   ← was the state at last verified build
-[THREAD 1] exited (r3=0x289590)
-<main thread then idles silently>
-```
+**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state of `run_stderr.txt`:
 
-After committing the `func_000EFD18` wrapper, the "UNRESOLVED" line should disappear and Thread 1 should actually execute the lifted body. **This still needs to be verified by a successful build + run** — the build attempt that introduced the wrapper kept hitting tool-permission issues mid-session. To verify:
+1. SPURS init runs (`func_0003B328`/`func_0003AAC4`/`func_0003AAC8`).
+2. SPURS workload state machine advances `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21`.
+3. Four startup threads spawn and run their lifted bodies to clean exit:
+   - Thread 1: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289590`)
+   - Thread 2: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289B90`)
+   - Thread 3: `sdu_yah_all_list_delete` @ `0x000EFACC`
+   - Thread 4: `Terminate Thread` @ `0x00039E20`
+4. C runtime wrapper (`func_0003B244` → `func_000F205C` HLE stub) returns.
+5. C++ destructor walker runs (`func_000F0A78` → `func_0003B4FC` → `func_0003B500` walks the dtor list at `[0x279B0C]`, firing 8 indirect dtor calls).
+6. `func_0003B328` returns; `main()` then explicitly calls `func_0003B244` a second time (re-entrancy harmless).
+7. `[RUNTIME] all game threads finished` — program exits cleanly.
 
-1. Build per the PowerShell incantation above.
-2. Run for 20s. Confirm: no "UNRESOLVED entry" line, no AV, and check whether more threads get created or stderr reveals what the main thread is waiting on.
-3. If main thread is still silent after Thread 1 exits cleanly, instrument: temporarily add a periodic log in `runtime_glue.cpp`'s `vm_read32` for a hot guest address, or look at what `ppu_thread_proc` returns and whether `thread_runtime_join_all` is waiting on something that never finishes.
+**Why the game doesn't actually run gameplay:** the four startup threads exit immediately because every sync-primitive syscall (`sys_event_queue_receive`, `sys_semaphore_wait`, lwmutex/lwcond, etc.) is stubbed as `return 0`. On real hardware these threads would block waiting for SPU-task or kernel events; here they fall through and return.
 
-Outstanding questions for the next iteration:
-- Does Thread 1's body actually run real code now, or does it hit another lifter bug?
-- After Thread 1 exits, what is the main thread doing? (No `[ICALL]`, no syscall, no `[LOW-READ]` is being logged for the silent ~20s.) Most likely culprits: (a) another tight loop in recompiled code that doesn't trigger any monitoring hooks, or (b) blocked in a host wait (e.g. `WaitForSingleObject` inside an LV2 syscall stub).
-- Threads expected next per prior trace: Thread 2 (OPD `0x161380`) and Thread 3 (also `0x161380` family).
+The three conditional tail-calls in `_start` (`func_0003B328` at ~lines 62743/62747/62751) that *could* divert into `func_0003B4F0`/`func_0003B4E4` gate on BSS sentinels `[0x28B248]`/`[0x28B24C]`/`[0x28B250]` — none of which the C++ ctors populate. So control always falls through to the SPURS-then-exit path. **There is no traditional `main()` call in this ELF's entry chain** — the actual game must drive itself from inside one of the worker threads once their wait-loops are no longer no-ops.
+
+**Outstanding questions for the next iteration:**
+- Implement real LV2 sync primitives (Windows `CreateSemaphore` / `WaitForSingleObject` backing the stubs) so worker threads actually block on events.
+- Then: which thread produces game output? Is there an SPU event-handler thread we need to fake (since SPU emulation isn't running)?
+- All 26 sysPrxForUser NIDs imported by this ELF are absent from `tools/nid_database.py` — they're either decorated symbols, internal helpers, or from a different SDK rev. Identifying them would let us add proper HLEs for the missing functions instead of zero-stubs.
 
 ## Game-Specific Patches (in `main.cpp`)
 
@@ -158,12 +161,15 @@ Synthetic chain layout:
 
 **Why `0x70A000` not `0x701000`:** the bump-slab allocator starts its pool at `0x701000`; data placed there gets overwritten on first use.
 
+### `[0x27F814]` zero-write redirect
+`func_000355D4` / `func_000355FC` (SPURS states 13/14) read `[0x27F814]` as the head of a struct chain. During SPURS shutdown the init code also zeros `[0x27F814]`. `vm_write32` intercepts that zero-write and redirects it to `0x70B000`, mirroring the `[0x27F81C] → 0x70A000` redirect. Keeps the states-13/14 struct chain alive across SPURS shutdown.
+
 ### SPURS state machine — now actually dispatched (`func_000379BC`)
 `func_000379BC` is the SPURS workload state machine. The lifter originally compiled the `bctrl` in `loc_0003AE74` (inside `func_0003AAC8`) as a static call to `func_00000030` (the LV2 syscall stub at address `0x30`) — CTR was set to `0x379BC` but ignored. We patched that call site in `recompiled/ppu_recomp.cpp` (~line 62327) to call `func_000379BC(ctx); DRAIN_TRAMPOLINE(ctx);` directly so the state machine actually runs and advances `[0x28B050]` through states `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21`.
 
 ### SPURS state machine pre-patches (`main.cpp`)
 - `[0x28B050] = 2` — start the state machine at state 2 (NOT bypass to 21 — that was the old approach)
-- `[0x27F831] = 1` — state 12 calls `func_00027090` which reads this byte
+- `[0x27F831]` — intentionally left at BSS=0. State 12 calls `func_00027090` which reads this byte; pre-setting it to 1 causes states 10/12 to spin (the function expects 0 = "condition clear").
 - `[0x70B20C] = 1` — `func_000355D4` (states 13+14) does an equality check `==1`, NOT `>=2`
 
 ### State 6 spin-wait skip (`recompiled/ppu_recomp.cpp` ~line 58874, `loc_00037BF4`)
@@ -182,12 +188,25 @@ vm_write8(0x27F830u, 1u);              /* signal func_00027084 to exit loop */
 ### `bcctrl` → direct `func_00000030` calls (`ppu_recomp.cpp`)
 Several `bctrl` instructions that target address `0x30` (the LV2 syscall gate) were lifted as trampoline-return stubs (`g_trampoline_fn = func_00000030; return`). These cause the calling function to return early instead of continuing. They were patched to `func_00000030(ctx); DRAIN_TRAMPOLINE(ctx);` so execution continues correctly after the call.
 
+### `func_000F205C` HLE stub (`extra_funcs.cpp`)
+sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244` with `r3=0`. On a real PS3 this is a libc helper (TLS / atexit / argv setup). Stubbed to `gpr[3] = 0`. The destructor walker still runs via the natural `func_000CE57C → func_000CE1E8 → func_000F0A78 → func_0003B4FC → func_0003B500` chain — we do not need to drive it from here.
+
+### Two-step entry call (`main.cpp`)
+`func_0003B328` (`_start`) runs SPURS init + global ctors, then falls through into `func_0003B244` (C runtime / `main()` / `sys_process_exit`). We replicate this explicitly:
+```cpp
+func_0003B328(&ctx);    /* SPURS / global-ctor init phase */
+DRAIN_TRAMPOLINE(&ctx);
+func_0003B244(&ctx);    /* C++ runtime → main() → sys_process_exit */
+DRAIN_TRAMPOLINE(&ctx);
+```
+
 ### Lifter bug: dropped `stwu` prologues (SP runaway)
 Some functions have an epilogue that does `gpr[1] += 0xN` but a prologue with no matching `gpr[1] -= 0xN` — the lifter dropped the `stwu r1, -N(r1)` instruction. Each call leaks +N bytes of SP growth; tight loops eventually overrun the committed stack region.
 
 Confirmed instances:
 - `func_000379BC` (epilogue `+= 0xE0`) — patched in `recompiled/ppu_recomp.cpp` line 58707 with the missing `vm_write64(gpr[1]-0xE0, gpr[1]); gpr[1] -= 0xE0;`.
 - `func_000EFD1C` (epilogue `+= 0xB0`) — the OPD entry for the `sdu_yah_size_check` thread points to `0x000EFD18` (4 bytes before `func_000EFD1C`), exactly where the missing `stwu r1, -0xB0(r1)` would live. Workaround in `extra_funcs.cpp`: a small `func_000EFD18` wrapper that does the missing `stwu` then calls `func_000EFD1C`. Registered in `extra_table` at `0x000EFD18`.
+- `func_000EFAD0` (epilogue `+= 0xC0`) — same pattern. The OPD entry for `sdu_yah_all_list_delete` is `0x000EFACC` (4 bytes before `func_000EFAD0`). Wrapper `func_000EFACC` in `extra_funcs.cpp` does `stwu r1, -0xC0(r1)` then calls `func_000EFAD0`. Registered in `extra_table` at `0x000EFACC`.
 
 **When you see SP runaway / AV at `0xE000XXXX` or higher**, suspect another instance of this bug. Diagnostic recipe:
 1. Note the AV's `gpr[1]` and the address it tried to access.
@@ -199,7 +218,8 @@ Confirmed instances:
 When `[ICALL]` logs an unresolved CTR address:
 1. Declare in `recompiled/ppu_recomp.h`: `void func_XXXXXXXX(ppu_context* ctx);`
 2. Implement in `extra_funcs.cpp` — lift the PPC instructions by hand, include `DRAIN_TRAMPOLINE(ctx)` after calls
-3. `ppu_resolve_extra` picks it up automatically via the address table
+3. Add `{ 0x000XXXXXULL, func_000XXXXX }` to the `extra_table[]` array in `extra_funcs.cpp`
+4. `ppu_resolve_extra` picks it up automatically via the address table
 
 ## ps3recomp SDK
 
