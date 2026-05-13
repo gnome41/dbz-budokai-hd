@@ -1,6 +1,7 @@
 /* Extra lifted functions — functions the lifter missed on the first pass
    because they're only reached via indirect CTR calls (C++ ctors/dtors). */
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 
@@ -886,6 +887,27 @@ void func_000EFD18(ppu_context* ctx) {
     func_000EFD1C(ctx);
 }
 
+/* ---- Wrapper for thread entry func_000EFACC ----------------------------
+ * OPD for "sdu_yah_all_list_delete" has code=0x000EFACC, but the lifter
+ * emitted func_000EFAD0 (4 bytes later) and dropped the stdu r1,-0xC0(r1)
+ * prologue at 0xEFACC.  func_000EFAD0's epilogue does gpr[1] += 0xC0. */
+void func_000EFAD0(ppu_context* ctx);
+void func_000EFACC(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0xC0, ctx->gpr[1]);  /* back-chain */
+    ctx->gpr[1] -= 0xC0;
+    func_000EFAD0(ctx);
+}
+
+/* ---- HLE: sysPrxForUser NID 0xA2C7BA64 (called by func_0003B244, r3=0) ----
+ * Called from the C runtime startup wrapper.  In a real PS3 build this would
+ * be a libc helper (TLS/atexit/argv setup).  Stub: return 0.  The natural
+ * call flow through func_000CE57C still runs the .init_array / .fini_array
+ * walkers (func_000CE1E8) and the destructor list (func_000F0A78 →
+ * func_0003B4FC → func_0003B500), so we do not need to drive those here. */
+void func_000F205C(ppu_context* ctx) {
+    ctx->gpr[3] = 0;
+}
+
 /* ---- Secondary function table ------------------------------------------ */
 
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
@@ -911,6 +933,7 @@ static const extra_entry extra_table[] = {
     { 0x000CB5C0ULL, func_000CB5C0 },
     { 0x000E9208ULL, func_000E9208 },
     { 0x000EFD18ULL, func_000EFD18 },   /* sdu_yah_size_check thread entry: missing stwu wrapper */
+    { 0x000EFACCULL, func_000EFACC },   /* sdu_yah_all_list_delete thread entry: missing stdu wrapper */
     { 0, nullptr },
 };
 

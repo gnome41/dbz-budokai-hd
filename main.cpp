@@ -17,6 +17,15 @@ int     g_process_exit_code = -1;
 
 extern "C" void thread_runtime_init();
 extern "C" void thread_runtime_join_all();
+extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
+
+#define DRAIN_TRAMPOLINE(ctx) do { \
+    while (g_trampoline_fn) { \
+        void(*_tf)(void*) = g_trampoline_fn; \
+        g_trampoline_fn = nullptr; \
+        _tf((void*)(ctx)); \
+    } \
+} while(0)
 
 static bool vm_init() {
 #ifdef _WIN32
@@ -237,10 +246,10 @@ int main(int argc, char* argv[]) {
        (caused state 7 to spin forever).  Do NOT set [0x28A160] here; state 7
        will write it to 1 itself after creating Thread 2. */
 
-    /* State 12 (loc_00037F38): calls func_00027090 which reads [0x27F831].
-       If non-zero, advances to state 13.  On a real PS3 an SPU task sets this.
-       Pre-set to 1 so state 12 advances on its first pass. */
-    vm_write8(0x27F831u, 1u);
+    /* [0x27F831] — func_00027090 reads this byte.  States 10 and 12 both call
+       func_00027090 and both need it to return 0 (meaning "condition clear") to
+       proceed.  If this byte is 1, those states spin forever.  BSS default is 0,
+       which is correct for all states — do NOT pre-set this. */
 
     /* loc_0003B088 in func_0003AAC8 spins on vm_read8(0x290000 - 0x4F70) =
        vm_read8(0x28B090) waiting for SPURS shutdown confirmation (normally set
@@ -263,8 +272,15 @@ int main(int argc, char* argv[]) {
     ctx.gpr[6]  = 0;             /* envp count = 0 */
 
     printf("Entering recompiled entry point...\n");
-    /* OPD at e_entry 0x161400: code=0x3B220, 8-instr prolog loads TOC then bl 0x3B328.
-       TOC pre-loaded above; call the lifted body directly. */
+    /* Entry prolog at 0x3B220 (8 instructions):
+       - loads TOC from OPD[0x161404]  (pre-loaded into ctx.gpr[2] above)
+       - allocates root stack frame
+       - calls func_0003B328 (SPURS / C++ global-init phase)
+       - falls through (nop at 0x3B240) into func_0003B244
+       func_0003B244 sets r3=0, then calls func_000F205C (the PS3 C++ runtime
+       startup: runs .init_array constructors, calls main(), then
+       sys_process_exit which longjmps out).
+       We replicate this two-step sequence explicitly. */
 #ifdef _WIN32
     /* setjmp target for sys_process_exit — longjmp(g_process_exit_jmpbuf,1) unwinds here. */
     if (setjmp(g_process_exit_jmpbuf) != 0) {
@@ -276,7 +292,10 @@ int main(int argc, char* argv[]) {
 
     EXCEPTION_POINTERS* g_ep = nullptr;
     __try {
-        func_0003B328(&ctx);
+        func_0003B328(&ctx);   /* SPURS / global-ctor init phase */
+        DRAIN_TRAMPOLINE(&ctx);
+        func_0003B244(&ctx);   /* C++ runtime → main() → sys_process_exit */
+        DRAIN_TRAMPOLINE(&ctx);
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
                     ? (g_ep = GetExceptionInformation(), EXCEPTION_EXECUTE_HANDLER)
                     : EXCEPTION_CONTINUE_SEARCH) {
