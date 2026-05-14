@@ -898,6 +898,47 @@ void func_000EFACC(ppu_context* ctx) {
     func_000EFAD0(ctx);
 }
 
+/* ---- SDU worker stubs (spawned by func_000F10FC / func_000F16DC) ----------
+ * These functions live in the ELF at their respective addresses but were not
+ * lifted by the pipeline (only reached as thread OPD entries).  Implemented
+ * as diagnostic stubs that log their arguments and return 0. */
+
+void func_000EFE30(ppu_context* ctx) {
+    /* sdu_yah_size_check worker A (OPD 0x1613A0 → code 0x000EFE30).
+     * Runs in a separate PPU thread; processes size-check data for one YAH slot. */
+    fprintf(stderr, "[SDU-WORKER] func_000EFE30 entry r3=%08X r4=%08X\n",
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
+void func_000EFEA4(ppu_context* ctx) {
+    /* sdu_yah_size_check worker B (OPD 0x1613A8 → code 0x000EFEA4).
+     * Second worker variant for the same size-check subsystem. */
+    fprintf(stderr, "[SDU-WORKER] func_000EFEA4 entry r3=%08X r4=%08X\n",
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
+void func_000EFBE8(ppu_context* ctx) {
+    /* sdu_yah_all_list_delete worker A (OPD 0x161388 → code 0x000EFBE8).
+     * Runs in a separate PPU thread; processes all-list-delete data. */
+    fprintf(stderr, "[SDU-WORKER] func_000EFBE8 entry r3=%08X r4=%08X\n",
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
+void func_000EFD0C(ppu_context* ctx) {
+    /* sdu_yah_all_list_delete worker B (OPD 0x161390 → code 0x000EFD0C).
+     * Second worker variant for the all-list-delete subsystem. */
+    fprintf(stderr, "[SDU-WORKER] func_000EFD0C entry r3=%08X r4=%08X\n",
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
 /* ---- HLE: sysPrxForUser NID 0xA2C7BA64 (called by func_0003B244, r3=0) ----
  * Called from the C runtime startup wrapper.  In a real PS3 build this would
  * be a libc helper (TLS/atexit/argv setup).  Stub: return 0.  The natural
@@ -934,6 +975,10 @@ static const extra_entry extra_table[] = {
     { 0x000E9208ULL, func_000E9208 },
     { 0x000EFD18ULL, func_000EFD18 },   /* sdu_yah_size_check thread entry: missing stwu wrapper */
     { 0x000EFACCULL, func_000EFACC },   /* sdu_yah_all_list_delete thread entry: missing stdu wrapper */
+    { 0x000EFE30ULL, func_000EFE30 },   /* sdu_yah_size_check worker A (spawned by func_000F10FC) */
+    { 0x000EFEA4ULL, func_000EFEA4 },   /* sdu_yah_size_check worker B */
+    { 0x000EFBE8ULL, func_000EFBE8 },   /* sdu_yah_all_list_delete worker A */
+    { 0x000EFD0CULL, func_000EFD0C },   /* sdu_yah_all_list_delete worker B */
     { 0, nullptr },
 };
 

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <unordered_map>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +24,9 @@ extern "C" bool g_abort_called = false;
 
 /* Trampoline TLS variable for cross-fragment branches */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
+
+/* Per-PPU-thread synthetic ID (set at thread-proc entry, 0 = main thread) */
+extern "C" __declspec(thread) uint32_t g_ppu_current_thread_id = 0;
 
 /* --------------------------------------------------------------------------
  * Thread runtime
@@ -74,6 +78,7 @@ static DWORD WINAPI ppu_thread_proc(LPVOID param) {
     uint32_t entry = tp->entry_addr;
     free(tp);
 
+    g_ppu_current_thread_id = tid;
     fprintf(stderr, "[THREAD %u] starting at 0x%08X sp=0x%08X\n", tid, entry, (uint32_t)ctx.gpr[1]);
 
     auto fn = ppu_resolve_addr(entry);
@@ -185,10 +190,105 @@ static void ppu_sdk_thread_trampoline(ppu_context* ctx) {
             (unsigned long long)ctx->thread_id, (unsigned long long)ctx->gpr[3]);
 }
 
+/* ==========================================================================
+ * LV2 kernel-object pool — semaphores, mutexes, condvars, event queues/ports
+ * ==========================================================================
+ *
+ * Every LV2 object is identified by a uint32_t ID (1..MAX_LV2_OBJ-1).
+ * ID 0 is invalid.  The pool is a fixed array; IDs are re-used after free.
+ *
+ * lwmutex and lwcond operate on guest-memory structs (not IDs), so they use
+ * separate maps keyed by guest address.
+ */
+
+#define MAX_LV2_OBJ  512
+#define EVQ_CAP      128
+
+enum Lv2Kind { LV2_FREE=0, LV2_SEM, LV2_MUTEX, LV2_COND, LV2_EVQ, LV2_EVPORT };
+
+struct Lv2Event { uint64_t source, data1, data2, data3; };
+
+struct Lv2Evq {
+    CRITICAL_SECTION cs;
+    HANDLE           avail;            /* counting semaphore: count = queued entries */
+    Lv2Event         buf[EVQ_CAP];
+    int              head, tail, cnt;
+};
+
+struct Lv2Obj {
+    Lv2Kind kind;
+    union {
+        HANDLE sem;                    /* LV2_SEM  */
+        struct {                       /* LV2_MUTEX */
+            CRITICAL_SECTION cs;
+        } mutex;
+        struct {                       /* LV2_COND */
+            CONDITION_VARIABLE cv;
+            uint32_t           mutex_id;
+        } cond;
+        Lv2Evq* evq;                   /* LV2_EVQ   */
+        struct {                       /* LV2_EVPORT */
+            uint32_t queue_id;
+            uint64_t name;
+        } port;
+    };
+};
+
+static CRITICAL_SECTION g_pool_cs;
+static Lv2Obj           g_pool[MAX_LV2_OBJ];
+static uint32_t         g_pool_cursor = 1;
+
+/* lwmutex / lwcond maps: guest struct address → Windows primitive */
+static std::unordered_map<uint32_t, CRITICAL_SECTION*>*   g_lwmutex_map  = nullptr;
+static std::unordered_map<uint32_t, CONDITION_VARIABLE*>* g_lwcond_map   = nullptr;
+static CRITICAL_SECTION                                    g_lw_map_cs;
+
+static void lv2_pool_init() {
+    InitializeCriticalSection(&g_pool_cs);
+    InitializeCriticalSection(&g_lw_map_cs);
+    memset(g_pool, 0, sizeof(g_pool));
+    g_lwmutex_map = new std::unordered_map<uint32_t, CRITICAL_SECTION*>();
+    g_lwcond_map  = new std::unordered_map<uint32_t, CONDITION_VARIABLE*>();
+}
+
+static uint32_t pool_alloc(Lv2Kind kind) {
+    EnterCriticalSection(&g_pool_cs);
+    for (uint32_t i = 0; i < MAX_LV2_OBJ - 1; i++) {
+        uint32_t id = (g_pool_cursor - 1 + i) % (MAX_LV2_OBJ - 1) + 1;
+        if (g_pool[id].kind == LV2_FREE) {
+            memset(&g_pool[id], 0, sizeof(Lv2Obj));
+            g_pool[id].kind = kind;
+            g_pool_cursor = id % (MAX_LV2_OBJ - 1) + 1;
+            LeaveCriticalSection(&g_pool_cs);
+            return id;
+        }
+    }
+    LeaveCriticalSection(&g_pool_cs);
+    fprintf(stderr, "[LV2] POOL FULL kind=%d\n", (int)kind);
+    return 0;
+}
+
+static Lv2Obj* pool_get(uint32_t id, Lv2Kind kind) {
+    if (id == 0 || id >= MAX_LV2_OBJ) return nullptr;
+    Lv2Obj* o = &g_pool[id];
+    return (o->kind == kind) ? o : nullptr;
+}
+
+static void pool_free(uint32_t id) {
+    if (id == 0 || id >= MAX_LV2_OBJ) return;
+    EnterCriticalSection(&g_pool_cs);
+    g_pool[id].kind = LV2_FREE;
+    LeaveCriticalSection(&g_pool_cs);
+}
+
 /* Called from main() before vm_init so the critical section is ready */
 extern "C" void thread_runtime_init() {
     InitializeCriticalSection(&g_thread_cs);
     g_thread_cs_init = true;
+    lv2_pool_init();
+
+    /* Main thread gets a well-known pseudo-ID */
+    g_ppu_current_thread_id = 0xFFFF0000u;
 
     /* Wire the SDK thread trampoline so SDK-created threads dispatch into
        recompiled PPU code instead of silently no-op'ing */
@@ -406,89 +506,415 @@ extern "C" void lv2_syscall(ppu_context* ctx) {
         break;
     }
 
-    /* sys_ppu_thread_get_id (48): returns current thread's synthetic ID.
-       We don't track per-thread IDs yet — return a placeholder. */
+    /* sys_ppu_thread_get_id (48) */
     case 48:
-        ctx->gpr[3] = 0xDEAD0001ull;
+        ctx->gpr[3] = g_ppu_current_thread_id ? g_ppu_current_thread_id : 0xFFFF0000u;
         break;
 
-    /* ---- Mutexes ---------------------------------------------------------- */
+    /* ---- Semaphores -------------------------------------------------------- */
 
-    /* sys_mutex_create (90): r3=out mutex_id*, r4=attr_ptr → stub, return 0 */
-    case 90: {
-        static volatile uint32_t g_mutex_id = 0x1000;
-        uint32_t id_out = (uint32_t)ctx->gpr[3];
-        uint32_t mid = InterlockedIncrement((volatile LONG*)&g_mutex_id);
-        if (id_out) vm_write32(id_out, mid);
-        fprintf(stderr, "[LV2] sys_mutex_create → id=0x%X\n", mid);
+    /* sys_semaphore_create (84): r3=out*, r4=attr*, r5=initial, r6=max */
+    case 84: {
+        uint32_t out = (uint32_t)ctx->gpr[3];
+        int32_t  ini = (int32_t)ctx->gpr[5];
+        int32_t  mx  = (int32_t)ctx->gpr[6];
+        uint32_t id  = pool_alloc(LV2_SEM);
+        if (!id) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        g_pool[id].sem = CreateSemaphoreA(NULL, ini, mx > 0 ? mx : 0x7FFFFFFF, NULL);
+        if (out) vm_write32(out, id);
+        fprintf(stderr, "[LV2] sys_semaphore_create id=%u initial=%d max=%d\n", id, ini, mx);
         ctx->gpr[3] = 0;
         break;
     }
-    case 91:  /* sys_mutex_destroy */
-        ctx->gpr[3] = 0; break;
-    case 92:  /* sys_mutex_lock   */
-        ctx->gpr[3] = 0; break;
-    case 93:  /* sys_mutex_trylock */
-        ctx->gpr[3] = 0; break;
-    case 94:  /* sys_mutex_unlock */
-        ctx->gpr[3] = 0; break;
+    /* sys_semaphore_destroy (85): r3=id */
+    case 85: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_SEM);
+        if (o) { CloseHandle(o->sem); pool_free(id); }
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_semaphore_wait (86): r3=id, r4=timeout_us (0=infinite) */
+    case 86: {
+        uint32_t id  = (uint32_t)ctx->gpr[3];
+        uint64_t tus = ctx->gpr[4];
+        Lv2Obj* o = pool_get(id, LV2_SEM);
+        if (!o) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        DWORD wms = tus ? (DWORD)((tus + 999) / 1000) : INFINITE;
+        fprintf(stderr, "[LV2] sys_semaphore_wait id=%u timeout=%llu us\n",
+                id, (unsigned long long)tus);
+        DWORD r = WaitForSingleObject(o->sem, wms);
+        ctx->gpr[3] = (r == WAIT_TIMEOUT) ? 0x80410034ull : 0;
+        break;
+    }
+    /* sys_semaphore_trywait (87): r3=id */
+    case 87: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_SEM);
+        if (!o) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        ctx->gpr[3] = (WaitForSingleObject(o->sem, 0) == WAIT_OBJECT_0) ? 0 : 0x80410034ull;
+        break;
+    }
+    /* sys_semaphore_post (88): r3=id, r4=count */
+    case 88: {
+        uint32_t id  = (uint32_t)ctx->gpr[3];
+        uint32_t cnt = (uint32_t)ctx->gpr[4];
+        Lv2Obj* o = pool_get(id, LV2_SEM);
+        if (o) ReleaseSemaphore(o->sem, cnt ? (LONG)cnt : 1, NULL);
+        ctx->gpr[3] = 0;
+        break;
+    }
+
+    /* ---- Mutexes ---------------------------------------------------------- */
+
+    /* sys_mutex_create (90): r3=out*, r4=attr* */
+    case 90: {
+        uint32_t out = (uint32_t)ctx->gpr[3];
+        uint32_t id  = pool_alloc(LV2_MUTEX);
+        if (!id) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        InitializeCriticalSection(&g_pool[id].mutex.cs);
+        if (out) vm_write32(out, id);
+        fprintf(stderr, "[LV2] sys_mutex_create id=%u\n", id);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_mutex_destroy (91): r3=id */
+    case 91: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_MUTEX);
+        if (o) { DeleteCriticalSection(&o->mutex.cs); pool_free(id); }
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_mutex_lock (92): r3=id, r4=timeout_us */
+    case 92: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_MUTEX);
+        if (!o) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        EnterCriticalSection(&o->mutex.cs);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_mutex_trylock (93): r3=id */
+    case 93: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_MUTEX);
+        if (!o) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        ctx->gpr[3] = TryEnterCriticalSection(&o->mutex.cs) ? 0 : 0x8001000Bull;
+        break;
+    }
+    /* sys_mutex_unlock (94): r3=id */
+    case 94: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_MUTEX);
+        if (o) LeaveCriticalSection(&o->mutex.cs);
+        ctx->gpr[3] = 0;
+        break;
+    }
 
     /* ---- Condition variables ---------------------------------------------- */
-    case 95:  /* sys_cond_create  */
+
+    /* sys_cond_create (95): r3=out*, r4=mutex_id, r5=attr* */
+    case 95: {
+        uint32_t out  = (uint32_t)ctx->gpr[3];
+        uint32_t mid  = (uint32_t)ctx->gpr[4];
+        uint32_t id   = pool_alloc(LV2_COND);
+        if (!id) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        InitializeConditionVariable(&g_pool[id].cond.cv);
+        g_pool[id].cond.mutex_id = mid;
+        if (out) vm_write32(out, id);
+        fprintf(stderr, "[LV2] sys_cond_create id=%u mutex=%u\n", id, mid);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    case 96: /* sys_cond_destroy */
+        pool_free((uint32_t)ctx->gpr[3]);
         ctx->gpr[3] = 0; break;
-    case 96:  /* sys_cond_destroy */
+    /* sys_cond_wait (97): r3=cond_id, r4=timeout_us */
+    case 97: {
+        uint32_t cid = (uint32_t)ctx->gpr[3];
+        uint64_t tus = ctx->gpr[4];
+        Lv2Obj* co = pool_get(cid, LV2_COND);
+        if (!co) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        Lv2Obj* mo = pool_get(co->cond.mutex_id, LV2_MUTEX);
+        if (!mo) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        DWORD wms = tus ? (DWORD)((tus + 999) / 1000) : INFINITE;
+        fprintf(stderr, "[LV2] sys_cond_wait cond=%u mutex=%u\n", cid, co->cond.mutex_id);
+        BOOL ok = SleepConditionVariableCS(&co->cond.cv, &mo->mutex.cs, wms);
+        ctx->gpr[3] = ok ? 0 : 0x80410034ull;
+        break;
+    }
+    case 98: { /* sys_cond_signal */
+        Lv2Obj* o = pool_get((uint32_t)ctx->gpr[3], LV2_COND);
+        if (o) WakeConditionVariable(&o->cond.cv);
         ctx->gpr[3] = 0; break;
-    case 97:  /* sys_cond_wait    */
-        SwitchToThread();
+    }
+    case 99: { /* sys_cond_signal_all */
+        Lv2Obj* o = pool_get((uint32_t)ctx->gpr[3], LV2_COND);
+        if (o) WakeAllConditionVariable(&o->cond.cv);
         ctx->gpr[3] = 0; break;
-    case 98:  /* sys_cond_signal  */
-        ctx->gpr[3] = 0; break;
-    case 99:  /* sys_cond_signal_all */
-        ctx->gpr[3] = 0; break;
+    }
 
     /* ---- Lightweight mutexes (lwmutex) ------------------------------------ */
-    case 612: /* sys_lwmutex_create  */
-        ctx->gpr[3] = 0; break;
-    case 613: /* sys_lwmutex_destroy */
-        ctx->gpr[3] = 0; break;
-    case 614: /* sys_lwmutex_lock    */
-        ctx->gpr[3] = 0; break;
-    case 615: /* sys_lwmutex_trylock */
-        ctx->gpr[3] = 0; break;
-    case 616: /* sys_lwmutex_unlock  */
-        ctx->gpr[3] = 0; break;
 
-    /* ---- Semaphores -------------------------------------------------------- */
-    case 84:  /* sys_semaphore_create  */
+    /* sys_lwmutex_create (612): r3=guest lwmutex struct ptr, r4=attr* */
+    case 612: {
+        uint32_t lw = (uint32_t)ctx->gpr[3];
+        EnterCriticalSection(&g_lw_map_cs);
+        if (!g_lwmutex_map->count(lw)) {
+            auto* cs = (CRITICAL_SECTION*)malloc(sizeof(CRITICAL_SECTION));
+            InitializeCriticalSection(cs);
+            (*g_lwmutex_map)[lw] = cs;
+        }
+        LeaveCriticalSection(&g_lw_map_cs);
+        fprintf(stderr, "[LV2] sys_lwmutex_create lw=0x%08X\n", lw);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_lwmutex_destroy (613): r3=guest lwmutex struct ptr */
+    case 613: {
+        uint32_t lw = (uint32_t)ctx->gpr[3];
+        EnterCriticalSection(&g_lw_map_cs);
+        auto it = g_lwmutex_map->find(lw);
+        if (it != g_lwmutex_map->end()) {
+            DeleteCriticalSection(it->second);
+            free(it->second);
+            g_lwmutex_map->erase(it);
+        }
+        LeaveCriticalSection(&g_lw_map_cs);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_lwmutex_lock (614): r3=guest ptr, r4=timeout_us */
+    case 614: {
+        uint32_t lw = (uint32_t)ctx->gpr[3];
+        CRITICAL_SECTION* cs = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwmutex_map->find(lw); if (it != g_lwmutex_map->end()) cs = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        if (cs) { fprintf(stderr, "[LV2] sys_lwmutex_lock lw=0x%08X\n", lw); EnterCriticalSection(cs); }
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_lwmutex_trylock (615): r3=guest ptr */
+    case 615: {
+        uint32_t lw = (uint32_t)ctx->gpr[3];
+        CRITICAL_SECTION* cs = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwmutex_map->find(lw); if (it != g_lwmutex_map->end()) cs = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        ctx->gpr[3] = (cs && TryEnterCriticalSection(cs)) ? 0 : 0x8001000Bull;
+        break;
+    }
+    /* sys_lwmutex_unlock (616): r3=guest ptr */
+    case 616: {
+        uint32_t lw = (uint32_t)ctx->gpr[3];
+        CRITICAL_SECTION* cs = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwmutex_map->find(lw); if (it != g_lwmutex_map->end()) cs = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        if (cs) LeaveCriticalSection(cs);
+        ctx->gpr[3] = 0;
+        break;
+    }
+
+    /* ---- Lightweight condition variables (lwcond) ------------------------- */
+
+    /* sys_lwcond_create (620): r3=guest lwcond ptr, r4=lwmutex ptr, r5=attr* */
+    case 620: {
+        uint32_t lc = (uint32_t)ctx->gpr[3];
+        EnterCriticalSection(&g_lw_map_cs);
+        if (!g_lwcond_map->count(lc)) {
+            auto* cv = (CONDITION_VARIABLE*)malloc(sizeof(CONDITION_VARIABLE));
+            InitializeConditionVariable(cv);
+            (*g_lwcond_map)[lc] = cv;
+        }
+        LeaveCriticalSection(&g_lw_map_cs);
+        fprintf(stderr, "[LV2] sys_lwcond_create lc=0x%08X\n", lc);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    case 621: { /* sys_lwcond_destroy */
+        uint32_t lc = (uint32_t)ctx->gpr[3];
+        EnterCriticalSection(&g_lw_map_cs);
+        auto it = g_lwcond_map->find(lc);
+        if (it != g_lwcond_map->end()) { free(it->second); g_lwcond_map->erase(it); }
+        LeaveCriticalSection(&g_lw_map_cs);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_lwcond_wait (622): r3=lwcond ptr, r4=lwmutex ptr, r5=timeout_us */
+    case 622: {
+        uint32_t lc = (uint32_t)ctx->gpr[3], lm = (uint32_t)ctx->gpr[4];
+        uint64_t tus = ctx->gpr[5];
+        CONDITION_VARIABLE* cv = nullptr; CRITICAL_SECTION* cs = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwcond_map->find(lc);  if (it != g_lwcond_map->end())  cv = it->second; }
+        { auto it = g_lwmutex_map->find(lm); if (it != g_lwmutex_map->end()) cs = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        if (cv && cs) {
+            DWORD wms = tus ? (DWORD)((tus + 999) / 1000) : INFINITE;
+            fprintf(stderr, "[LV2] sys_lwcond_wait lc=0x%08X lm=0x%08X\n", lc, lm);
+            BOOL ok = SleepConditionVariableCS(cv, cs, wms);
+            ctx->gpr[3] = ok ? 0 : 0x80410034ull;
+        } else {
+            ctx->gpr[3] = 0;
+        }
+        break;
+    }
+    case 623: { /* sys_lwcond_signal */
+        uint32_t lc = (uint32_t)ctx->gpr[3];
+        CONDITION_VARIABLE* cv = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwcond_map->find(lc); if (it != g_lwcond_map->end()) cv = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        if (cv) WakeConditionVariable(cv);
         ctx->gpr[3] = 0; break;
-    case 85:  /* sys_semaphore_destroy */
+    }
+    case 624: { /* sys_lwcond_signal_all */
+        uint32_t lc = (uint32_t)ctx->gpr[3];
+        CONDITION_VARIABLE* cv = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwcond_map->find(lc); if (it != g_lwcond_map->end()) cv = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        if (cv) WakeAllConditionVariable(cv);
         ctx->gpr[3] = 0; break;
-    case 86:  /* sys_semaphore_wait    */
-        SwitchToThread();
+    }
+    case 625: { /* sys_lwcond_signal_to: wake all (Windows can't target specific waiter) */
+        uint32_t lc = (uint32_t)ctx->gpr[3];
+        CONDITION_VARIABLE* cv = nullptr;
+        EnterCriticalSection(&g_lw_map_cs);
+        { auto it = g_lwcond_map->find(lc); if (it != g_lwcond_map->end()) cv = it->second; }
+        LeaveCriticalSection(&g_lw_map_cs);
+        if (cv) WakeAllConditionVariable(cv);
         ctx->gpr[3] = 0; break;
-    case 87:  /* sys_semaphore_trywait */
-        ctx->gpr[3] = 0; break;
-    case 88:  /* sys_semaphore_post    */
-        ctx->gpr[3] = 0; break;
+    }
 
     /* ---- Event queues ----------------------------------------------------- */
-    case 125: /* sys_event_queue_create  */
+
+    /* sys_event_queue_create (125): r3=out*, r4=attr*, r5=key, r6=size */
+    case 125: {
+        uint32_t out = (uint32_t)ctx->gpr[3];
+        uint32_t sz  = (uint32_t)ctx->gpr[6];
+        uint32_t id  = pool_alloc(LV2_EVQ);
+        if (!id) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        Lv2Evq* q = (Lv2Evq*)calloc(1, sizeof(Lv2Evq));
+        InitializeCriticalSection(&q->cs);
+        q->avail = CreateSemaphoreA(NULL, 0, EVQ_CAP * 4, NULL);
+        g_pool[id].evq = q;
+        if (out) vm_write32(out, id);
+        fprintf(stderr, "[LV2] sys_event_queue_create id=%u size=%u\n", id, sz);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_event_queue_destroy (126): r3=id, r4=mode */
+    case 126: {
+        uint32_t id = (uint32_t)ctx->gpr[3];
+        Lv2Obj* o = pool_get(id, LV2_EVQ);
+        if (o && o->evq) {
+            CloseHandle(o->evq->avail);
+            DeleteCriticalSection(&o->evq->cs);
+            free(o->evq); o->evq = nullptr;
+        }
+        pool_free(id);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_event_queue_receive (127): r3=id, r4=out_event*(32B), r5=timeout_us */
+    case 127: {
+        uint32_t id  = (uint32_t)ctx->gpr[3];
+        uint32_t evp = (uint32_t)ctx->gpr[4];
+        uint64_t tus = ctx->gpr[5];
+        Lv2Obj* o = pool_get(id, LV2_EVQ);
+        if (!o || !o->evq) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        DWORD wms = tus ? (DWORD)((tus + 999) / 1000) : INFINITE;
+        fprintf(stderr, "[LV2] sys_event_queue_receive id=%u timeout=%llu us\n",
+                id, (unsigned long long)tus);
+        DWORD r = WaitForSingleObject(o->evq->avail, wms);
+        if (r == WAIT_TIMEOUT) { ctx->gpr[3] = 0x80410034ull; break; }
+        Lv2Evq* q = o->evq;
+        EnterCriticalSection(&q->cs);
+        Lv2Event ev = q->buf[q->head];
+        q->head = (q->head + 1) % EVQ_CAP;
+        q->cnt--;
+        LeaveCriticalSection(&q->cs);
+        if (evp) {
+            vm_write64(evp,      ev.source);
+            vm_write64(evp +  8, ev.data1);
+            vm_write64(evp + 16, ev.data2);
+            vm_write64(evp + 24, ev.data3);
+        }
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_event_queue_tryreceive (128): r3=id, r4=event_list*, r5=sz, r6=out_count* */
+    case 128: {
+        uint32_t id  = (uint32_t)ctx->gpr[3];
+        uint32_t evp = (uint32_t)ctx->gpr[4];
+        uint32_t cp  = (uint32_t)ctx->gpr[6];
+        Lv2Obj* o = pool_get(id, LV2_EVQ);
+        if (!o || !o->evq) { if (cp) vm_write32(cp, 0); ctx->gpr[3] = 0; break; }
+        if (WaitForSingleObject(o->evq->avail, 0) != WAIT_OBJECT_0) {
+            if (cp) vm_write32(cp, 0); ctx->gpr[3] = 0; break;
+        }
+        Lv2Evq* q = o->evq;
+        EnterCriticalSection(&q->cs);
+        Lv2Event ev = q->buf[q->head];
+        q->head = (q->head + 1) % EVQ_CAP;
+        q->cnt--;
+        LeaveCriticalSection(&q->cs);
+        if (evp) { vm_write64(evp, ev.source); vm_write64(evp+8, ev.data1); vm_write64(evp+16, ev.data2); vm_write64(evp+24, ev.data3); }
+        if (cp) vm_write32(cp, 1);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_event_port_create (130): r3=out*, r4=type, r5=name */
+    case 130: {
+        uint32_t out = (uint32_t)ctx->gpr[3];
+        uint64_t nm  = ctx->gpr[5];
+        uint32_t id  = pool_alloc(LV2_EVPORT);
+        if (!id) { ctx->gpr[3] = (uint64_t)-1LL; break; }
+        g_pool[id].port.queue_id = 0;
+        g_pool[id].port.name     = nm;
+        if (out) vm_write32(out, id);
+        fprintf(stderr, "[LV2] sys_event_port_create id=%u name=0x%llX\n",
+                id, (unsigned long long)nm);
+        ctx->gpr[3] = 0;
+        break;
+    }
+    case 131: /* sys_event_port_destroy */
+        pool_free((uint32_t)ctx->gpr[3]);
         ctx->gpr[3] = 0; break;
-    case 126: /* sys_event_queue_destroy */
-        ctx->gpr[3] = 0; break;
-    case 127: /* sys_event_queue_receive */
-        SwitchToThread();
-        ctx->gpr[3] = 0; break;
-    case 128: /* sys_event_queue_tryreceive */
-        ctx->gpr[3] = 0; break;
-    case 130: /* sys_event_port_create   */
-        ctx->gpr[3] = 0; break;
-    case 131: /* sys_event_port_destroy  */
-        ctx->gpr[3] = 0; break;
-    case 132: /* sys_event_port_connect_local */
-        ctx->gpr[3] = 0; break;
-    case 134: /* sys_event_port_send     */
-        ctx->gpr[3] = 0; break;
+    /* sys_event_port_connect_local (132): r3=port_id, r4=queue_id */
+    case 132: {
+        uint32_t pid = (uint32_t)ctx->gpr[3], qid = (uint32_t)ctx->gpr[4];
+        Lv2Obj* o = pool_get(pid, LV2_EVPORT);
+        if (o) { o->port.queue_id = qid; fprintf(stderr, "[LV2] port %u → queue %u\n", pid, qid); }
+        ctx->gpr[3] = 0;
+        break;
+    }
+    /* sys_event_port_send (134): r3=port_id, r4=data1, r5=data2, r6=data3 */
+    case 134: {
+        uint32_t pid = (uint32_t)ctx->gpr[3];
+        Lv2Obj* po = pool_get(pid, LV2_EVPORT);
+        if (!po) { ctx->gpr[3] = 0; break; }
+        Lv2Obj* qo = pool_get(po->port.queue_id, LV2_EVQ);
+        if (!qo || !qo->evq) { ctx->gpr[3] = 0; break; }
+        Lv2Evq* q = qo->evq;
+        Lv2Event ev = { po->port.name, ctx->gpr[4], ctx->gpr[5], ctx->gpr[6] };
+        EnterCriticalSection(&q->cs);
+        if (q->cnt < EVQ_CAP) {
+            q->buf[q->tail] = ev;
+            q->tail = (q->tail + 1) % EVQ_CAP;
+            q->cnt++;
+            ReleaseSemaphore(q->avail, 1, NULL);
+        } else {
+            fprintf(stderr, "[LV2] sys_event_port_send: queue %u full\n", po->port.queue_id);
+        }
+        LeaveCriticalSection(&q->cs);
+        ctx->gpr[3] = 0;
+        break;
+    }
 
     /* ---- Time -------------------------------------------------------------- */
     case 141: /* sys_time_get_system_time: returns µs since boot */

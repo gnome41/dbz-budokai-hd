@@ -69,14 +69,15 @@ Dispatches on `ctx->gpr[11]`. Currently handled:
 | 44 | `sys_ppu_thread_create` | allocates guest stack, creates a real Windows thread running `ppu_thread_proc` |
 | 45 | `sys_ppu_thread_yield` | `SwitchToThread()` |
 | 48 | `sys_ppu_thread_get_id` | returns placeholder |
-| 84–88 | semaphores | stubbed (returns 0 / yield) |
-| 90–94 | mutexes | stubbed |
-| 95–99 | condition variables | stubbed |
-| 125–134 | event queues/ports | stubbed |
+| 84–88 | semaphores | `CreateSemaphoreA`/`WaitForSingleObject`/`ReleaseSemaphore`; IDs in `g_pool[]` |
+| 90–94 | mutexes | `InitializeCriticalSection`/`EnterCriticalSection`/`LeaveCriticalSection`; IDs in `g_pool[]` |
+| 95–99 | condition variables | `InitializeConditionVariable`/`SleepConditionVariableCS`/`WakeConditionVariable` |
+| 125–134 | event queues/ports | circular buffer + counting semaphore + CRITICAL_SECTION; IDs in `g_pool[]` |
 | 141 | `sys_time_get_system_time` | `GetTickCount64() * 1000` |
 | 145 | `sys_time_get_timebase_frequency` | returns 79 800 000 |
 | 403 | `sys_tty_write` | prints game debug output |
-| 612–616 | lwmutex | stubbed |
+| 612–616 | lwmutex | `CRITICAL_SECTION` per guest ptr in `g_lwmutex_map` |
+| 620–625 | lwcond | `CONDITION_VARIABLE` per guest ptr in `g_lwcond_map` |
 | 988 | watchdog | `r3==1` is a heartbeat (logged, ignored); `r3==4` sets `g_abort_called`, dumps call stack |
 
 All others log and return 0. Add new cases directly to `lv2_syscall`.
@@ -98,28 +99,31 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 ## Current Status (last verified working state)
 
-**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state of `run_stderr.txt`:
+**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state of `run_stderr.txt` (7 threads now run):
 
 1. SPURS init runs (`func_0003B328`/`func_0003AAC4`/`func_0003AAC8`).
 2. SPURS workload state machine advances `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21`.
-3. Four startup threads spawn and run their lifted bodies to clean exit:
-   - Thread 1: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289590`)
-   - Thread 2: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289B90`)
-   - Thread 3: `sdu_yah_all_list_delete` @ `0x000EFACC`
-   - Thread 4: `Terminate Thread` @ `0x00039E20`
-4. C runtime wrapper (`func_0003B244` → `func_000F205C` HLE stub) returns.
-5. C++ destructor walker runs (`func_000F0A78` → `func_0003B4FC` → `func_0003B500` walks the dtor list at `[0x279B0C]`, firing 8 indirect dtor calls).
-6. `func_0003B328` returns; `main()` then explicitly calls `func_0003B244` a second time (re-entrancy harmless).
+3. Four original SPURS-spawned threads start; each spawns a sub-worker via `func_000F10FC`/`func_000F16DC`:
+   - Thread 1: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289590`) → spawns worker @ `0x000EFE30` → joins it → exits
+   - Thread 2: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289B90`) → spawns worker @ `0x000EFE30` → joins it → exits
+   - Thread 3: `sdu_yah_all_list_delete` @ `0x000EFACC` → spawns worker @ `0x000EFBE8` → exits
+   - Thread 4: `Terminate Thread` @ `0x00039E20` → exits immediately (no pending requests)
+4. Three sub-worker threads run and return (stubs):
+   - Worker A: `func_000EFE30` (sdu_yah_size_check worker, OPD 0x1613A0)
+   - Worker B: `func_000EFE30` (same function, second instance, OPD 0x1613A0)
+   - Worker C: `func_000EFBE8` (sdu_yah_all_list_delete worker, OPD 0x161388)
+5. C runtime wrapper (`func_0003B244` → `func_000F205C` HLE stub) returns.
+6. C++ destructor walker fires 8 indirect dtor calls; harmless `sys_ppu_thread_join: unknown tid 0x700000` warning from a dtor reading a stale SPURS pointer (ignored by the join handler).
 7. `[RUNTIME] all game threads finished` — program exits cleanly.
 
-**Why the game doesn't actually run gameplay:** the four startup threads exit immediately because every sync-primitive syscall (`sys_event_queue_receive`, `sys_semaphore_wait`, lwmutex/lwcond, etc.) is stubbed as `return 0`. On real hardware these threads would block waiting for SPU-task or kernel events; here they fall through and return.
+**Why the game doesn't actually run gameplay:** all initialization threads and their workers exit immediately (workers are stubs in `extra_funcs.cpp`). The SDU workers at `0x000EFE30`, `0x000EFEA4`, `0x000EFBE8`, `0x000EFD0C` need to be lifted or implemented to do real work.
 
-The three conditional tail-calls in `_start` (`func_0003B328` at ~lines 62743/62747/62751) that *could* divert into `func_0003B4F0`/`func_0003B4E4` gate on BSS sentinels `[0x28B248]`/`[0x28B24C]`/`[0x28B250]` — none of which the C++ ctors populate. So control always falls through to the SPURS-then-exit path. **There is no traditional `main()` call in this ELF's entry chain** — the actual game must drive itself from inside one of the worker threads once their wait-loops are no longer no-ops.
+**There is no traditional `main()` call in this ELF's entry chain** — `func_0003B244` only calls `func_000F205C` (NID 0xA2C7BA64, our stub returning 0) which would call main() on real PS3. The actual game must drive itself from inside the worker threads once they're fully implemented.
 
 **Outstanding questions for the next iteration:**
-- Implement real LV2 sync primitives (Windows `CreateSemaphore` / `WaitForSingleObject` backing the stubs) so worker threads actually block on events.
-- Then: which thread produces game output? Is there an SPU event-handler thread we need to fake (since SPU emulation isn't running)?
-- All 26 sysPrxForUser NIDs imported by this ELF are absent from `tools/nid_database.py` — they're either decorated symbols, internal helpers, or from a different SDK rev. Identifying them would let us add proper HLEs for the missing functions instead of zero-stubs.
+- Lift or stub the SDU worker functions so they actually do size checks and signal completion; once those work, more of the game's initialization chain will proceed.
+- Find the game's actual `main()` (or game-loop entry). NID 0xA2C7BA64 in `func_000F205C` is the C runtime that calls main() — implementing it to find and call the game's main entry would advance significantly.
+- Identify the 26 sysPrxForUser NIDs imported by this ELF (absent from `tools/nid_database.py`) to add proper HLEs instead of zero-stubs.
 
 ## Game-Specific Patches (in `main.cpp`)
 
@@ -187,6 +191,26 @@ vm_write8(0x27F830u, 1u);              /* signal func_00027084 to exit loop */
 
 ### `bcctrl` → direct `func_00000030` calls (`ppu_recomp.cpp`)
 Several `bctrl` instructions that target address `0x30` (the LV2 syscall gate) were lifted as trampoline-return stubs (`g_trampoline_fn = func_00000030; return`). These cause the calling function to return early instead of continuing. They were patched to `func_00000030(ctx); DRAIN_TRAMPOLINE(ctx);` so execution continues correctly after the call.
+
+### SDU pool bump allocator (`func_00032E58`, `recompiled/ppu_recomp.cpp`)
+`func_00032E58` (static stub, ~line 209) is the stwu-prologue wrapper for `func_00032E5C` (the SDU segregated free-list heap allocator at pool `0x27F8B8`). The full allocator is too complex to lift (uses `TODO: subfc`, multi-level free lists) and its backing pool is never initialized (the ctor at `0x14538` runs but only sets up function-pointer tables, not the heap). Replaced with a bump allocator at guest `0x8C0000+` (committed within main RAM, well past the game heap at `0x826000`). Callers only need a valid pointer; no metadata is written at the returned block.
+
+### SDU worker-thread spawners (`recompiled/ppu_recomp.cpp`)
+Two NID stubs promote from logging-only to real thread creation:
+
+**`func_000F10FC`** — sdu_yah_size_check spawner. Called with `r7=OPD1, r8=OPD2, r9=priority, r10=thread_arg, r6=id_out_ptr` (sp+0x70 in caller frame). Spawns one thread via syscall 44 from OPD1 with `arg=r10`; writes thread_id to `r6`; returns thread_id in r3.
+
+**`func_000F16DC`** — sdu_yah_all_list_delete spawner. Different register layout: `r3=id_out, r5=OPD1, r6=OPD2, r8=thread_arg`. Same logic.
+
+**`func_000F211C`** — thread join. Called after the spawner with `r3=block, r4=thread_id`. Invokes syscall 43 (`sys_ppu_thread_join`) to block until the worker exits.
+
+Worker stubs in `extra_funcs.cpp` (also in `extra_table`):
+| Address | Name | Notes |
+|---|---|---|
+| `0x000EFE30` | sdu_yah_size_check worker A | OPD 0x1613A0, spawned by `func_000F10FC` |
+| `0x000EFEA4` | sdu_yah_size_check worker B | OPD 0x1613A8, (not yet observed spawning) |
+| `0x000EFBE8` | sdu_yah_all_list_delete worker A | OPD 0x161388, spawned by `func_000F16DC` |
+| `0x000EFD0C` | sdu_yah_all_list_delete worker B | OPD 0x161390, (not yet observed spawning) |
 
 ### `func_000F205C` HLE stub (`extra_funcs.cpp`)
 sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244` with `r3=0`. On a real PS3 this is a libc helper (TLS / atexit / argv setup). Stubbed to `gpr[3] = 0`. The destructor walker still runs via the natural `func_000CE57C → func_000CE1E8 → func_000F0A78 → func_0003B4FC → func_0003B500` chain — we do not need to drive it from here.
