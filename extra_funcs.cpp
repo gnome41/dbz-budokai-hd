@@ -998,6 +998,22 @@ static void func_000EB354(ppu_context* ctx) {
     ctx->gpr[3] = 0;
 }
 
+/* UpdateThread (bnusCore audio management thread) at 0xD3020.
+   On PS3 this loops receiving audio events via sys_event_queue_receive and
+   dispatching audio updates to SPU programs.  Stub: 16 ms idle loop until
+   main() signals g_threads_should_exit before thread_runtime_join_all(). */
+extern "C" volatile bool g_threads_should_exit;
+void func_000D3020(ppu_context* ctx) {
+    fprintf(stderr, "[UpdateThread] started (bnusCore audio stub)\n");
+    fflush(stderr);
+    while (!g_threads_should_exit) {
+        Sleep(16);  /* ~60 Hz idle */
+    }
+    fprintf(stderr, "[UpdateThread] exiting\n");
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
 static const extra_entry extra_table[] = {
     { 0x00000030ULL, lv2_gate },          /* LV2 syscall gate (bctrl CTR=0x30) */
@@ -1030,6 +1046,7 @@ static const extra_entry extra_table[] = {
     { 0x000EFEA4ULL, func_000EFEA4 },   /* sdu_yah_size_check worker B */
     { 0x000EFBE8ULL, func_000EFBE8 },   /* sdu_yah_all_list_delete worker A */
     { 0x000EFD0CULL, func_000EFD0C },   /* sdu_yah_all_list_delete worker B */
+    { 0x000D3020ULL, func_000D3020 },   /* UpdateThread (bnusCore audio) entry — stub */
     { 0, nullptr },
 };
 

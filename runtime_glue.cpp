@@ -21,6 +21,9 @@ extern "C" uint8_t* vm_base = nullptr;
 
 /* Set to true by sys_988(r3=4) from the abort handler; checked by func_000F217C */
 extern "C" bool g_abort_called = false;
+/* Set to true by main() before thread_runtime_join_all() so background stubs
+   (UpdateThread, etc.) know to exit their idle loops. */
+extern "C" volatile bool g_threads_should_exit = false;
 
 /* Trampoline TLS variable for cross-fragment branches */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;

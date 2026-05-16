@@ -1,12 +1,95 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <setjmp.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
+
+/* ---- Win32 display window ------------------------------------------------ */
+#ifdef _WIN32
+static HWND  g_hwnd          = nullptr;
+static HBITMAP g_dib         = nullptr;  /* DIB section for software rendering */
+static uint32_t* g_framebuf  = nullptr;  /* BGRA pixel data, 1280x720 */
+static BITMAPINFO g_bmi      = {};
+static constexpr int FB_W = 1280, FB_H = 720;
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        if (g_dib) {
+            HDC mdc = CreateCompatibleDC(hdc);
+            HGDIOBJ old = SelectObject(mdc, g_dib);
+            BitBlt(hdc, 0, 0, FB_W, FB_H, mdc, 0, 0, SRCCOPY);
+            SelectObject(mdc, old);
+            DeleteDC(mdc);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static DWORD WINAPI window_thread_proc(LPVOID) {
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); /* IDC_ARROW */
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = L"DBZBudokaiHD";
+    RegisterClassExW(&wc);
+
+    /* Client area = 1280x720; adjust for frame */
+    RECT r = { 0, 0, FB_W, FB_H };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    g_hwnd = CreateWindowExW(0, L"DBZBudokaiHD",
+        L"DBZ Budokai HD - PS3 Static Recompilation",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        r.right - r.left, r.bottom - r.top,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (!g_hwnd) return 1;
+
+    /* Create 1280x720 DIB for software framebuffer */
+    g_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    g_bmi.bmiHeader.biWidth       = FB_W;
+    g_bmi.bmiHeader.biHeight      = -FB_H;  /* top-down */
+    g_bmi.bmiHeader.biPlanes      = 1;
+    g_bmi.bmiHeader.biBitCount    = 32;
+    g_bmi.bmiHeader.biCompression = BI_RGB;
+    HDC screen = GetDC(nullptr);
+    g_dib = CreateDIBSection(screen, &g_bmi, DIB_RGB_COLORS,
+                             (void**)&g_framebuf, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+
+    /* Fill with PS3 startup blue */
+    if (g_framebuf) {
+        for (int i = 0; i < FB_W * FB_H; i++)
+            g_framebuf[i] = 0xFF001040u;  /* dark blue */
+    }
+
+    ShowWindow(g_hwnd, SW_SHOWNORMAL);
+    UpdateWindow(g_hwnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return 0;
+}
+
+/* Call to blit current framebuffer to the window (from any thread) */
+extern "C" void rsx_present_frame() {
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+#endif /* _WIN32 */
 
 #include "recompiled/ppu_recomp.h"
 
@@ -17,6 +100,7 @@ int     g_process_exit_code = -1;
 
 extern "C" void thread_runtime_init();
 extern "C" void thread_runtime_join_all();
+extern "C" volatile bool g_threads_should_exit;
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
 
 #define DRAIN_TRAMPOLINE(ctx) do { \
@@ -271,6 +355,12 @@ int main(int argc, char* argv[]) {
     ctx.gpr[5]  = SCRATCH + 0x100; /* envp – same pattern */
     ctx.gpr[6]  = 0;             /* envp count = 0 */
 
+    /* Start display window on a background thread */
+#ifdef _WIN32
+    CreateThread(nullptr, 0, window_thread_proc, nullptr, 0, nullptr);
+    Sleep(200);  /* Let window open before game starts */
+#endif
+
     printf("Entering recompiled entry point...\n");
     /* Entry prolog at 0x3B220 (8 instructions):
        - loads TOC from OPD[0x161404]  (pre-loaded into ctx.gpr[2] above)
@@ -313,6 +403,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     printf("Entry point returned. Waiting for game threads...\n");
+    g_threads_should_exit = true;  /* signal stub threads (UpdateThread etc.) to exit */
     thread_runtime_join_all();
     vm_shutdown();
     return 0;
