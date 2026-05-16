@@ -99,7 +99,7 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 ## Current Status (last verified working state)
 
-**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state (7 threads run, then game main executes):
+**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state (8 threads run, including the UpdateThread audio stub):
 
 1. SPURS init runs (`func_0003B328`/`func_0003AAC4`/`func_0003AAC8`).
 2. SPURS workload state machine advances `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21`.
@@ -110,6 +110,7 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
    - Thread 4: `Terminate Thread` @ `0x00039E20` → exits immediately (no pending requests)
 4. Three sub-worker threads run and return (stubs).
 5. C runtime wrapper (`func_0003B244` → `func_000F205C`) calls game main `func_00012420`.
+   - `func_000510E4` (now implemented) creates Thread 8: UpdateThread (bnusCore audio stub at 0xD3020).
 6. Game main passes all GCM init checks (force-succeeded), runs through RSX sync (RSX REF null backend), and executes its full initialization sequence.
 7. C++ destructor walker fires; `[RUNTIME] all game threads finished` — program exits cleanly.
 
@@ -123,24 +124,29 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 **`func_00012258` (0x12258, zero-stub):** reads/initializes game state at 0x243AF0-0x27BDB4, ends with `memset(0x243C18, 0, 0x100)`. Pure initialization helper, not the game loop.
 
-**Why the game doesn't actually run gameplay:** All 7 PS3 threads are SDU management threads (not the game loop). The `UpdateThread` (game loop thread) is never created because the initialization chain that triggers it is not reached. Specifically, `func_000510E4` (zero-stub, called from game main) is supposed to register a callback that eventually leads to `func_000B8790`. Since `func_000510E4` is a stub, the callback never fires.
+**Why the game doesn't actually run gameplay:** All 7 PS3 threads are SDU management threads. The `UpdateThread` is a bnusCore audio management thread (NOT the main game loop); the actual game loop is SPURS/SPU-driven and requires SPU emulation. `func_000510E4` (zero-stub at line 453, called from game main) is supposed to register a callback that eventually creates the UpdateThread via `func_000B8790`. Since it's a stub, the audio thread is never started.
 
-**Game loop thread chain (traced from ELF binary):**
-- Game loop thread name: `"UpdateThread"` (string at 0xF5C38)
-- Thread spawner: `func_000D2F90` (zero-stub at line ~978) → calls `sys_ppu_thread_create` (syscall 44) internally
-- Called by: `func_000B89BC` (lines 370581+) → reads TOC[-0x6910] (UpdateThread name) and calls func_000D2F90
-- Called by: `func_000B87D8` (line 699353) / `func_000B8794` (line 370428) → first calls syscall 133/130, then on error: calls func_000B89BC
-- Called from: `func_000B8790` (stwu wrapper, line 370423) which is in the address table but never dispatched
-- Root cause: `func_000510E4` (zero-stub, line 453) should register func_000B8790 as a callback but doesn't
+**Win32 display window:** A `window_thread_proc` thread is launched from `main()` 200ms before the game entry point. It creates a 1280×720 DIB-backed window ("DBZ Budokai HD – PS3 Static Recompilation") with a dark-blue initial fill. `rsx_present_frame()` (exported from `main.cpp`) invalidates the window on each RSX frame. The framebuffer pointer (`g_framebuf`, BGRA) is accessible from `runtime_glue.cpp` for future RSX blit.
 
-**LV2 syscall gate fix (this session):** `func_00000030` was a zero-stub — every `sc`/`bctrl CTR=0x30` syscall from lifted code was silently dropped. Now forwards to `lv2_syscall`. Address `0x30 → lv2_gate` added to `extra_table` so that the 604 mass-replaced `ctx->ctr=...; ps3_indirect_call(ctx)` patterns still route correctly when CTR=0x30.
+**UpdateThread (bnusCore audio) — now running:**
+- Thread name: `"UpdateThread"` (string at 0xF5C38); entry code at 0xD3020 (`func_000D3020` stub in `extra_funcs.cpp`)
+- `func_000510E4` (ppu_recomp.cpp line 453): implemented — pre-patches OPD at `[TOC[-0x6158]]=0x27BBF8` to (code=0xD3020, toc=0x16A0F8), then calls sys_ppu_thread_create (syscall 44) directly, bypassing the event port callback chain
+- `func_000D3020` stub: 16 ms idle loop on `g_threads_should_exit` flag (in runtime_glue.cpp); main() sets flag before `thread_runtime_join_all()`
+- The event port chain (func_000B8790 → func_000B8794 → syscall 130 → func_000B89BC → func_000D2F90) is not used; func_000D2F90's OPD pre-patch is also done inside func_000510E4 now
+
+**LV2 syscall gate fix:** `func_00000030` now forwards to `lv2_syscall`. Address `0x30 → lv2_gate` in `extra_table`. 604 CTR-setting + `func_00000030` patterns mass-replaced with `ps3_indirect_call`.
+
+**Game main `func_00012420` structure (line 7950):**
+- Loads sysmodules via `func_000F0E9C` (IDs 0x17 and 0xE) — returns 0 (stub), continues
+- Calls `func_000510E4` (line 7997) with r3=stack struct containing 0xF2890, r4=0xF2890
+- Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
 **Outstanding questions for the next iteration:**
-- Lift `func_000510E4` (0x510E4, zero-stub) from binary — this function registers the callback chain that triggers `func_000B8790` and ultimately creates the UpdateThread game loop.
-- Implement `func_000D2F90` (zero-stub) — the game's internal PPU thread creation wrapper: called with r3=config/name, r4=thread_name, internally loads thread entry from a global struct and calls sys_ppu_thread_create.
-- Identify NID 0xA2C7BA64 (`func_000F205C`) to understand what the C runtime calls after init.
-- Identify the 26 sysPrxForUser NIDs imported by this ELF.
-- Implement a real RSX/graphics backend (currently fully null).
+- RSX command buffer parsing: game writes NV4097 commands to the RSX FIFO; parse them and blit to `g_framebuf` (1280×720 BGRA in main.cpp) for visible output in the Win32 window
+- Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
+- SPU/SPURS emulation for the actual game loop (long-term; the game's rendering and logic run on SPUs)
+- Identify the 26 sysPrxForUser NIDs imported by this ELF
+- New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented
 
 ## Game-Specific Patches (in `main.cpp`)
 
