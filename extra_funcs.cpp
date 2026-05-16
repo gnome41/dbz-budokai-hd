@@ -940,13 +940,33 @@ void func_000EFD0C(ppu_context* ctx) {
 }
 
 /* ---- HLE: sysPrxForUser NID 0xA2C7BA64 (called by func_0003B244, r3=0) ----
- * Called from the C runtime startup wrapper.  In a real PS3 build this would
- * be a libc helper (TLS/atexit/argv setup).  Stub: return 0.  The natural
- * call flow through func_000CE57C still runs the .init_array / .fini_array
- * walkers (func_000CE1E8) and the destructor list (func_000F0A78 →
- * func_0003B4FC → func_0003B500), so we do not need to drive those here. */
+ * On real PS3 this is the C runtime init that calls the game's main().
+ * The game's main() is func_00012420 (0x12420) — identified by it being the
+ * only early-address lifted function reachable only via OPD, not from any
+ * direct call chain, and by it calling sys_process_exit on init failure.
+ *
+ * The lifter dropped func_00012420's stwu prologue (stdu r1,-0xF0(r1));
+ * the back-chain + 0xF0 epilogue is intact.  We perform the stack frame
+ * allocation here before calling so the callee-saves and back-chain are
+ * correctly placed. */
 void func_000F205C(ppu_context* ctx) {
-    ctx->gpr[3] = 0;
+    /* Guard: the dtor chain calls back through func_0003B2BC → func_0003B244
+     * → here a second time.  Only call main() once. */
+    static bool s_main_called = false;
+    if (s_main_called) {
+        fprintf(stderr, "[F205C] skipping re-entrant call\n");
+        ctx->gpr[3] = 0;
+        return;
+    }
+    s_main_called = true;
+    fprintf(stderr, "[F205C] calling game main() → func_00012420\n");
+    fflush(stderr);
+    /* Missing stwu r1,-0xF0(r1) */
+    vm_write64(ctx->gpr[1] - 0xF0, ctx->gpr[1]);
+    ctx->gpr[1] -= 0xF0;
+    func_00012420(ctx);
+    DRAIN_TRAMPOLINE(ctx);
+    /* func_00012420 restores sp in its own epilogue (gpr[1] += 0xF0) */
 }
 
 /* ---- Secondary function table ------------------------------------------ */
@@ -975,6 +995,7 @@ static const extra_entry extra_table[] = {
     { 0x000E9208ULL, func_000E9208 },
     { 0x000EFD18ULL, func_000EFD18 },   /* sdu_yah_size_check thread entry: missing stwu wrapper */
     { 0x000EFACCULL, func_000EFACC },   /* sdu_yah_all_list_delete thread entry: missing stdu wrapper */
+    { 0x00057A38ULL, func_00057A3C },    /* OPD entry 4 bytes before func_00057A3C; body includes stwu */
     { 0x000EFE30ULL, func_000EFE30 },   /* sdu_yah_size_check worker A (spawned by func_000F10FC) */
     { 0x000EFEA4ULL, func_000EFEA4 },   /* sdu_yah_size_check worker B */
     { 0x000EFBE8ULL, func_000EFBE8 },   /* sdu_yah_all_list_delete worker A */

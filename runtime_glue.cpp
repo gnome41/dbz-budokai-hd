@@ -398,6 +398,23 @@ extern "C" void vm_write32(uint64_t addr, uint32_t val) {
                 val, (val == 0) ? " → redirected to 0x70B000" : ""); fflush(stderr);
         if (val == 0) val = 0x0070B000u;  /* preserve states 11/13/14 struct chain */
     }
+    /* Null RSX backend: when PPU writes the RSX PUT register (0x10), update
+     * the RSX GET register (0x00) to the same value so the game never stalls
+     * waiting for RSX to "process" commands it submitted.  This makes every
+     * RSX command-buffer flush appear to complete instantly. */
+    if (a == 0x10u) {
+        vm_base[0x00] = (uint8_t)(val >> 24);
+        vm_base[0x01] = (uint8_t)(val >> 16);
+        vm_base[0x02] = (uint8_t)(val >>  8);
+        vm_base[0x03] = (uint8_t)(val);
+    }
+    /* Null RSX backend: RSX REF register (0x04) is polled by game code that
+     * writes 0xFFFFFFFF as a "pending" sentinel and spins until RSX clears it.
+     * Discard all writes so it stays at 0 — RSX "instantly acknowledges". */
+    if (a == 0x4u) {
+        fprintf(stderr, "[RSX-REF] write 0x%08X discarded (keeping REF=0)\n", val); fflush(stderr);
+        return;
+    }
     vm_base[a]     = (uint8_t)(val >> 24);
     vm_base[a + 1] = (uint8_t)(val >> 16);
     vm_base[a + 2] = (uint8_t)(val >>  8);
