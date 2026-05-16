@@ -84,16 +84,18 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 | SPURS / game-context initialization sequence | ✅ Working |
 | `_start` + `func_0003AAC8` complete without abort | ✅ Working |
 | SPURS workload state machine runs to completion (states 2 → 21) | ✅ Working |
-| `sys_ppu_thread_create` fires; all 4 startup threads run their lifted bodies | ✅ Working |
-| C runtime startup wrapper (`func_0003B244` → `func_000F205C`) | ✅ Stubbed-clean |
-| C++ destructor walker (`func_000F0A78` → `func_0003B4FC` → `func_0003B500`) | ✅ Working |
+| `sys_ppu_thread_create` fires; all 7 startup threads run their lifted bodies | ✅ Working |
+| Real LV2 sync primitives (semaphore / mutex / condvar / lwmutex / lwcond / event-queue) | ✅ Working |
+| C runtime startup wrapper → game main `func_00012420` | ✅ Working |
+| Game main: sysmodule loads, cellGcmInit, display buffer alloc, full init sequence | ✅ Working (GCM force-succeeded; null RSX backend) |
+| C++ destructor walker | ✅ Working |
 | Process exits cleanly with no AV / no abort | ✅ Working |
-| **Real LV2 sync primitives** (sem/mutex/lwmutex/event-queue actually block) | 🔲 Next milestone — worker threads currently exit immediately because stubbed waits return success |
-| Graphics (RSX / cellGcm) | 🔲 Stubbed |
+| **Game loop** | 🔲 Not yet — game main is pure init; actual game loop is SPURS/SPU-driven |
+| Graphics (RSX / cellGcm) | 🔲 Null backend — PUT/GET mirrored, REF discarded |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
 
-Current end-state of a run (`run_stderr.txt`): SPURS init → SPURS workload state machine runs to 21 → 4 worker threads spawn (`sdu_yah_size_check ×2`, `sdu_yah_all_list_delete`, `Terminate Thread`), each runs its lifted body and exits → C++ destructor walker runs → main returns → `[RUNTIME] all game threads finished`.
+Current end-state of a run: SPURS init → state machine 2→21 → 7 worker threads (sdu_yah_size_check ×2 + sub-workers, sdu_yah_all_list_delete + sub-worker, Terminate Thread) run and exit → game main `func_00012420` runs full GCM + display-buffer init → C++ destructor walker → `[RUNTIME] all game threads finished` → clean exit.
 
 ### Key patches applied
 
@@ -114,8 +116,10 @@ Current end-state of a run (`run_stderr.txt`): SPURS init → SPURS workload sta
 - **LV2/TLS high region** `0xFFFF0000–0xFFFFFFFF` committed — the `func_0003AAC8` cleanup path writes to guest `0xFFFF9004` (PS3 LV2-mapped TLS area); without this the host throws an access violation.
 - **Caller-frame headroom** at `0xE0000000` — one 4 KB page committed above the stack. PPC ABI saves LR into the *caller's* frame at `SP+0xF0` *before* the prologue decrements SP; with initial `SP=0xDFFFFE00` the first save lands at `0xE0000000`, which would AV without this page.
 - **`bcctrl` → `func_00000030` direct calls** — the lifter emitted trampoline stubs for several `bctrl` instructions targeting address `0x30` (the LV2 syscall gate). These were replaced with direct `func_00000030(ctx)` calls to avoid incorrect early-return behaviour.
-- **`func_000F205C` HLE stub** (`extra_funcs.cpp`) — sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244`. Stubbed to `gpr[3] = 0`; the destructor walker still runs via the natural `func_000CE57C → func_000CE1E8 → func_000F0A78 → func_0003B4FC → func_0003B500` chain.
+- **`func_000F205C` HLE stub** (`extra_funcs.cpp`) — sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244`. Now calls game main `func_00012420` (with a manually-inserted `stdu r1,-0xF0` prologue) behind a re-entrant-call guard so the dtor chain can't invoke it a second time.
 - **Two-step entry call** in `main.cpp` — the ELF prologue at `0x3B220` calls `func_0003B328` then falls through into `func_0003B244`. We replicate this explicitly: `func_0003B328(&ctx)` → `DRAIN_TRAMPOLINE` → `func_0003B244(&ctx)` → `DRAIN_TRAMPOLINE`.
+- **GCM init force-successes** (`recompiled/ppu_recomp.cpp`) — three cellGcmSys helper functions (`func_0004370C` cellGcmInit, `func_00040C0C`, `func_00040BD4`) all dereference the RSX context pointer at `TOC[-0x7FA0]` which is null without a real RSX backend. Each is patched to early-return `r3=0`; `func_00040BD4` additionally writes a dummy IO size of `0x200000` (2 MB) to its output buffer so downstream code gets a non-zero size.
+- **RSX REF register null backend** (`runtime_glue.cpp`) — guest address `0x4` is the RSX reference counter. The game writes `0xFFFFFFFF` as a "pending" sentinel then spin-polls until RSX clears it. Without real RSX this would spin forever. Writes to address `0x4` are now discarded (keeping it at 0 from BSS), so the poll exits on the very first read.
 
 ### Lifter bugs fixed by hand
 
