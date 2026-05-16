@@ -123,13 +123,24 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 **`func_00012258` (0x12258, zero-stub):** reads/initializes game state at 0x243AF0-0x27BDB4, ends with `memset(0x243C18, 0, 0x100)`. Pure initialization helper, not the game loop.
 
-**Why the game doesn't actually run gameplay:** the game loop is not in `func_00012420` (game main) — it runs via SPURS/SPU worker dispatch which requires SPU emulation, or via callbacks the game registers during init. All 7 PS3 threads are SDU management threads (not the game loop), and they exit as stubs.
+**Why the game doesn't actually run gameplay:** All 7 PS3 threads are SDU management threads (not the game loop). The `UpdateThread` (game loop thread) is never created because the initialization chain that triggers it is not reached. Specifically, `func_000510E4` (zero-stub, called from game main) is supposed to register a callback that eventually leads to `func_000B8790`. Since `func_000510E4` is a stub, the callback never fires.
+
+**Game loop thread chain (traced from ELF binary):**
+- Game loop thread name: `"UpdateThread"` (string at 0xF5C38)
+- Thread spawner: `func_000D2F90` (zero-stub at line ~978) → calls `sys_ppu_thread_create` (syscall 44) internally
+- Called by: `func_000B89BC` (lines 370581+) → reads TOC[-0x6910] (UpdateThread name) and calls func_000D2F90
+- Called by: `func_000B87D8` (line 699353) / `func_000B8794` (line 370428) → first calls syscall 133/130, then on error: calls func_000B89BC
+- Called from: `func_000B8790` (stwu wrapper, line 370423) which is in the address table but never dispatched
+- Root cause: `func_000510E4` (zero-stub, line 453) should register func_000B8790 as a callback but doesn't
+
+**LV2 syscall gate fix (this session):** `func_00000030` was a zero-stub — every `sc`/`bctrl CTR=0x30` syscall from lifted code was silently dropped. Now forwards to `lv2_syscall`. Address `0x30 → lv2_gate` added to `extra_table` so that the 604 mass-replaced `ctx->ctr=...; ps3_indirect_call(ctx)` patterns still route correctly when CTR=0x30.
 
 **Outstanding questions for the next iteration:**
-- Find the game's actual game-loop entry point. It is likely driven by SPURS SPU task dispatch or by a registered callback, not a plain PPU thread.
+- Lift `func_000510E4` (0x510E4, zero-stub) from binary — this function registers the callback chain that triggers `func_000B8790` and ultimately creates the UpdateThread game loop.
+- Implement `func_000D2F90` (zero-stub) — the game's internal PPU thread creation wrapper: called with r3=config/name, r4=thread_name, internally loads thread entry from a global struct and calls sys_ppu_thread_create.
 - Identify NID 0xA2C7BA64 (`func_000F205C`) to understand what the C runtime calls after init.
-- Identify the 26 sysPrxForUser NIDs imported by this ELF (absent from `tools/nid_database.py`) to add proper HLEs instead of zero-stubs.
-- Implement a real RSX/graphics backend (currently fully null — writes to PUT/GET/REF are all discarded or mirrored).
+- Identify the 26 sysPrxForUser NIDs imported by this ELF.
+- Implement a real RSX/graphics backend (currently fully null).
 
 ## Game-Specific Patches (in `main.cpp`)
 
