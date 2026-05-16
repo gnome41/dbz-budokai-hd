@@ -347,6 +347,30 @@ int main(int argc, char* argv[]) {
        the scratch block at 0x700100 zeroed in case any surviving code path
        still reads through it, but the main initialization is now real. */
 
+    /* Minimal GCM (RSX graphics) context at 0x70E000.
+       cellGcm* functions read the context pointer from TOC[-0x7FA0] = [0x162158].
+       Without a valid context, func_00040BD4 (cellGcmGetMemorySize) and similar
+       return error 0x80310002 or read from null → crash.
+       Fields used by the game's cellGcm helpers:
+         +0x08: current command buffer write pointer (updated as game writes cmds)
+         +0x0C: begin of command buffer
+         +0x10: end of command buffer
+         +0x18: RSX IO mapping size (read by func_00040BD4 and func_00040C0C)
+         +0x1C: flags / reference count (must be non-zero for some paths)
+       The RSX command buffer lives at 0xD0100000 (well below the stack base
+       0xDFFFFE00 and above the stack top 0xD0000000 + the committed region). */
+    {
+        const uint32_t GCM_CTX   = 0x70E000u;
+        const uint32_t CMD_BUF   = 0xD0100000u;
+        const uint32_t CMD_SIZE  = 0x00100000u;  /* 1 MB command buffer */
+        vm_write32(0x162158u, GCM_CTX);           /* TOC[-0x7FA0] → GCM ctx ptr */
+        vm_write32(GCM_CTX + 0x08u, CMD_BUF);    /* current = command buffer start */
+        vm_write32(GCM_CTX + 0x0Cu, CMD_BUF);    /* begin */
+        vm_write32(GCM_CTX + 0x10u, CMD_BUF + CMD_SIZE - 4u); /* end */
+        vm_write32(GCM_CTX + 0x18u, 0x200000u);  /* IO size = 2 MB */
+        vm_write32(GCM_CTX + 0x1Cu, 1u);         /* flags = 1 (initialized) */
+    }
+
     ppu_context ctx = {};
     ctx.gpr[1]  = 0xD0000000u + 0x10000000u - 0x200u;  /* stack top */
     ctx.gpr[2]  = 0x0016A0F8u;   /* TOC base (from OPD at 0x161400+4) */
