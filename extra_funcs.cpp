@@ -971,8 +971,38 @@ void func_000F205C(ppu_context* ctx) {
 
 /* ---- Secondary function table ------------------------------------------ */
 
+/* LV2 syscall gateway: address 0x30 is the PS3 syscall gate called via bctrl.
+   When func_00000030(ctx) is replaced with ps3_indirect_call(ctx), this entry
+   routes CTR=0x30 back to lv2_syscall so real syscalls still work. */
+static void lv2_gate(ppu_context* ctx) { lv2_syscall(ctx); }
+
+/* Vtable cleanup callbacks in Terminate Thread (func_00039E24).
+   Check/invoke a registered shutdown callback; safe to stub as no-op. */
+static void func_000EFEC0(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] + -0x80, ctx->gpr[1]); ctx->gpr[1] += -0x80;
+    ctx->gpr[31] = vm_read32((uint32_t)ctx->gpr[3] + 0xC);
+    if ((uint32_t)ctx->gpr[31] == 0) {
+        ctx->gpr[1] = (int64_t)(int32_t)(ctx->gpr[1] + 0x80); ctx->gpr[3] = 0; return;
+    }
+    ctx->gpr[3] = ctx->gpr[31];
+    ctx->gpr[1] = (int64_t)(int32_t)(ctx->gpr[1] + 0x80);
+    /* would call callback at r3; stub it */
+    ctx->gpr[3] = 0;
+}
+static void func_000EB354(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] + -0x70, ctx->gpr[1]); ctx->gpr[1] += -0x70;
+    if ((uint32_t)ctx->gpr[3] == 0) {
+        ctx->gpr[1] = (int64_t)(int32_t)(ctx->gpr[1] + 0x70); ctx->gpr[3] = 0; return;
+    }
+    ctx->gpr[1] = (int64_t)(int32_t)(ctx->gpr[1] + 0x70);
+    ctx->gpr[3] = 0;
+}
+
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
 static const extra_entry extra_table[] = {
+    { 0x00000030ULL, lv2_gate },          /* LV2 syscall gate (bctrl CTR=0x30) */
+    { 0x000EFEC0ULL, func_000EFEC0 },   /* vtable cleanup callback (Terminate Thread) */
+    { 0x000EB354ULL, func_000EB354 },   /* vtable cleanup callback (Terminate Thread) */
     { 0x000E9218ULL, func_000E9218 },
     { 0x000CB5B0ULL, func_000CB5B0 },
     { 0x000C5C9CULL, func_000C5C9C },
