@@ -99,7 +99,7 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 ## Current Status (last verified working state)
 
-**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state of `run_stderr.txt` (7 threads now run):
+**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state (7 threads run, then game main executes):
 
 1. SPURS init runs (`func_0003B328`/`func_0003AAC4`/`func_0003AAC8`).
 2. SPURS workload state machine advances `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21`.
@@ -108,22 +108,28 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
    - Thread 2: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289B90`) → spawns worker @ `0x000EFE30` → joins it → exits
    - Thread 3: `sdu_yah_all_list_delete` @ `0x000EFACC` → spawns worker @ `0x000EFBE8` → exits
    - Thread 4: `Terminate Thread` @ `0x00039E20` → exits immediately (no pending requests)
-4. Three sub-worker threads run and return (stubs):
-   - Worker A: `func_000EFE30` (sdu_yah_size_check worker, OPD 0x1613A0)
-   - Worker B: `func_000EFE30` (same function, second instance, OPD 0x1613A0)
-   - Worker C: `func_000EFBE8` (sdu_yah_all_list_delete worker, OPD 0x161388)
-5. C runtime wrapper (`func_0003B244` → `func_000F205C` HLE stub) returns.
-6. C++ destructor walker fires 8 indirect dtor calls; harmless `sys_ppu_thread_join: unknown tid 0x700000` warning from a dtor reading a stale SPURS pointer (ignored by the join handler).
-7. `[RUNTIME] all game threads finished` — program exits cleanly.
+4. Three sub-worker threads run and return (stubs).
+5. C runtime wrapper (`func_0003B244` → `func_000F205C`) calls game main `func_00012420`.
+6. Game main passes all GCM init checks (force-succeeded), runs through RSX sync (RSX REF null backend), and executes its full initialization sequence.
+7. C++ destructor walker fires; `[RUNTIME] all game threads finished` — program exits cleanly.
 
-**Why the game doesn't actually run gameplay:** all initialization threads and their workers exit immediately (workers are stubs in `extra_funcs.cpp`). The SDU workers at `0x000EFE30`, `0x000EFEA4`, `0x000EFBE8`, `0x000EFD0C` need to be lifted or implemented to do real work.
+**Game main `func_00012420` architecture:**
+- Called from `func_0003B2BC → func_0003B244 → func_000F205C` (within func_0003B328's lifecycle)
+- Loads sysmodules (func_000F0E9C — NID stubs returning 0)
+- Calls `cellGcmInit` (`func_0004370C`, force-succeeded), `func_00040C0C`, `func_00040BD4` (all force-succeeded with null RSX context)
+- Allocates display buffers (slab bump guard + `func_000D908C`)
+- Calls `func_0004BE54` (display buffer setup) and `func_00012258` (init helper, zero-stub)
+- Returns after completing init — there is NO game loop in `func_00012420`
 
-**There is no traditional `main()` call in this ELF's entry chain** — `func_0003B244` only calls `func_000F205C` (NID 0xA2C7BA64, our stub returning 0) which would call main() on real PS3. The actual game must drive itself from inside the worker threads once they're fully implemented.
+**`func_00012258` (0x12258, zero-stub):** reads/initializes game state at 0x243AF0-0x27BDB4, ends with `memset(0x243C18, 0, 0x100)`. Pure initialization helper, not the game loop.
+
+**Why the game doesn't actually run gameplay:** the game loop is not in `func_00012420` (game main) — it runs via SPURS/SPU worker dispatch which requires SPU emulation, or via callbacks the game registers during init. All 7 PS3 threads are SDU management threads (not the game loop), and they exit as stubs.
 
 **Outstanding questions for the next iteration:**
-- Lift or stub the SDU worker functions so they actually do size checks and signal completion; once those work, more of the game's initialization chain will proceed.
-- Find the game's actual `main()` (or game-loop entry). NID 0xA2C7BA64 in `func_000F205C` is the C runtime that calls main() — implementing it to find and call the game's main entry would advance significantly.
+- Find the game's actual game-loop entry point. It is likely driven by SPURS SPU task dispatch or by a registered callback, not a plain PPU thread.
+- Identify NID 0xA2C7BA64 (`func_000F205C`) to understand what the C runtime calls after init.
 - Identify the 26 sysPrxForUser NIDs imported by this ELF (absent from `tools/nid_database.py`) to add proper HLEs instead of zero-stubs.
+- Implement a real RSX/graphics backend (currently fully null — writes to PUT/GET/REF are all discarded or mirrored).
 
 ## Game-Specific Patches (in `main.cpp`)
 
@@ -213,7 +219,26 @@ Worker stubs in `extra_funcs.cpp` (also in `extra_table`):
 | `0x000EFD0C` | sdu_yah_all_list_delete worker B | OPD 0x161390, (not yet observed spawning) |
 
 ### `func_000F205C` HLE stub (`extra_funcs.cpp`)
-sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244` with `r3=0`. On a real PS3 this is a libc helper (TLS / atexit / argv setup). Stubbed to `gpr[3] = 0`. The destructor walker still runs via the natural `func_000CE57C → func_000CE1E8 → func_000F0A78 → func_0003B4FC → func_0003B500` chain — we do not need to drive it from here.
+sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244` with `r3=0`. Calls game main `func_00012420` (with manually-inserted stwu -0xF0 frame setup), guarded with `s_main_called` to prevent re-entrant calls from the dtor chain. The destructor walker still runs via the natural `func_000CE57C → func_000CE1E8 → func_000F0A78 → func_0003B4FC → func_0003B500` chain.
+
+### GCM init force-successes (`recompiled/ppu_recomp.cpp`)
+Three cellGcmSys helper functions fail with `0x80310002`/`0x80310005` because the RSX context pointer `TOC[-0x7FA0]` is null (no real RSX). All three are force-succeeded with early returns:
+
+| Function | Purpose | Error without fix |
+|---|---|---|
+| `func_0004370C` | cellGcmInit | 0x80310005 — null RSX context |
+| `func_00040C0C` | cellGcmGetContextSize | 0x80310002 — null RSX ctx read |
+| `func_00040BD4` | cellGcmGetMemorySize | 0x80310002 — null RSX ctx read |
+
+`func_00040BD4` also writes a dummy RSX IO size of `0x200000` (2 MB) to the output pointer (sp+0x84) so the subsequent `func_0004F82C` call gets a non-zero IO size.
+
+### RSX REF register null backend (`runtime_glue.cpp: vm_write32`)
+The RSX REF register (guest address `0x4`) is used by the game for synchronization:
+1. Game writes `0xFFFFFFFF` as a "pending" sentinel
+2. On real PS3, RSX processes a `SET_REFERENCE` command and writes the reference value back
+3. CPU polls [0x4] until RSX clears it
+
+Without real RSX, this spin never exits. Fix: writes to `0x4` are **discarded** (logged as `[RSX-REF]`), keeping [0x4] at 0 (BSS). The game reads 0 immediately after its write and the spin exits.
 
 ### Two-step entry call (`main.cpp`)
 `func_0003B328` (`_start`) runs SPURS init + global ctors, then falls through into `func_0003B244` (C runtime / `main()` / `sys_process_exit`). We replicate this explicitly:
