@@ -74,6 +74,9 @@ typedef struct spu_ctx {
     /* Verbose tracing: when non-zero, log DMA + channel ops */
     int      verbose;
     uint64_t insn_count;   /* total instructions executed */
+    /* Instruction trace: log first N instructions of execution (0=off) */
+    uint32_t trace_limit;
+    uint64_t trace_count;  /* how many instructions traced so far */
 } spu_ctx_t;
 
 /* ---- Public API ----------------------------------------------------------- */

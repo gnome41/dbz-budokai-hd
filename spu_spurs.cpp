@@ -75,8 +75,9 @@ extern "C" void spurs_start(void) {
 
     spu_ctx_init(&g_spurs_ctx, 0, vm_base);
 
-    /* Verbose: log first 500 DMA ops / channel reads to understand protocol */
+    /* Verbose: log DMA ops + channel reads. Trace: log first 80 insns of restart-2. */
     g_spurs_ctx.verbose = 1;
+    g_spurs_ctx.trace_limit = 0;  /* will be set for restart-2 */
 
     /* Load the SPURS kernel ELF from guest memory */
     const uint8_t *elf_ptr = vm_base + SPURS_KERNEL_A_GADDR;
@@ -128,6 +129,33 @@ extern "C" void spurs_start(void) {
     g_spurs_ctx.gpr[3].u32[3] = 0;
     g_spurs_ctx.gpr[4].u32[0] = 0;  /* EA high = 0 */
 
+    /* The kernel encodes the return address across three rotmai instructions:
+     *   LS[0x138]: rotmai r0, r86, 511  → r0 = r86 >> 1   (sh=1)
+     *   LS[0x14C]: rotmai r0, r55, 205  → r0 = r55 >> 51  (sh=51, overwrites)
+     *   LS[0x150]: rotmai r0, r70, 245  → r0 = r70 >> 2   (sh=2, final value)
+     * Then "bi r0" branches to the return address (LS[0x40]).
+     * On a real PS3, LV2 sets r86,r55,r70 to encode return_addr in each step.
+     * Our sentinel is LS[0x40], so the last rotmai needs r70 = 0x40 << 2 = 0x100. */
+    /* Each "bi r0" (function return) uses r0 = return_addr = LS[0x40].
+     * The kernel computes r0 via multiple rotmai/rotmi instructions from different
+     * source registers.  On a real PS3, LV2 sets these registers to encode
+     * return_addr * 2^sh.  Our sentinel is LS[0x40], so for each instruction
+     * with shift sh: src_reg = 0x40 << sh.
+     *
+     * Path 1 (LS[0x138..0x154], first pass through entry):
+     *   LS[0x138]: rotmai r0, r86, I7=127 → sh=1   → r86=0x40<<1=0x80
+     *   LS[0x14C]: rotmai r0, r55, I7=77  → sh=51  (overwritten by next)
+     *   LS[0x150]: rotmai r0, r70, I7=117 → sh=11  → r70=0x40<<11=0x20000
+     *
+     * Path 2 (LS[0x022C..0x027C], second code region):
+     *   LS[0x0254]: rotmi r0, r89, I7=127 → sh=1   → r89=0x40<<1=0x80 */
+    g_spurs_ctx.gpr[86].u32[0] = 0x80;     /* r86 >> 1  = 0x40 (LS[0x138]) */
+    g_spurs_ctx.gpr[70].u32[0] = 0x20000;  /* r70 >> 11 = 0x40 (LS[0x150]) */
+    g_spurs_ctx.gpr[89].u32[0] = 0x80;     /* r89 >> 1  = 0x40 (LS[0x254]) */
+    g_spurs_ctx.gpr[86].u32[1] = 0;
+    g_spurs_ctx.gpr[86].u32[2] = 0;
+    g_spurs_ctx.gpr[86].u32[3] = 0;
+
     /* Run synchronously for a diagnostic burst so we can see the first DMA
        operations regardless of thread scheduling latency.  After this burst
        the kernel will likely be blocked on rdch (waiting for PPU mailbox).
@@ -146,9 +174,18 @@ extern "C" void spurs_start(void) {
             uint32_t code = g_spurs_ctx.stop_code;
             if (code == 0) {
                 /* SPURS idle — continue from current PC */
-                fprintf(stderr, "[SPURS] restart %d (idle) at PC=0x%X insns=%u\n",
-                        restart+1, g_spurs_ctx.pc, total);
+                fprintf(stderr, "[SPURS] restart %d (idle) at PC=0x%X insns=%u r0=0x%X\n",
+                        restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0]);
                 fflush(stderr);
+                /* Enable per-instruction trace for restart 2 (the critical 40-insn batch) */
+                if (restart == 1) {
+                    g_spurs_ctx.trace_limit = 80;
+                    g_spurs_ctx.trace_count = 0;
+                    fprintf(stderr, "[SPURS] TRACE ENABLED for restart 2 (80 insns)\n");
+                    fflush(stderr);
+                } else {
+                    g_spurs_ctx.trace_limit = 0;
+                }
                 g_spurs_ctx.running = 1;
             } else if (code == 0x100) {
                 /* Kernel returned (bi $0 → stop 0x100 sentinel) — restart from entry */
