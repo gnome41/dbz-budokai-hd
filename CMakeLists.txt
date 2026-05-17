@@ -63,6 +63,7 @@ add_executable(${PROJECT_NAME}
     runtime_glue.cpp
     extra_funcs.cpp
     spu_interp.cpp
+    spu_spurs.cpp
     recompiled/ppu_recomp.cpp
 )
 
