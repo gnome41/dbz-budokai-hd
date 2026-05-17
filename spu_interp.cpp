@@ -130,20 +130,24 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
     uint32_t sz  = ctx->mfc_size;
     if (sz > 16384) sz = 16384;
 
-    /* Clamp EA to 32-bit PS3 address space */
     uint32_t ea32 = (uint32_t)ea;
 
     switch (cmd & 0xFF) {
         case MFC_GET: case MFC_GETB:
-            /* DMA GET: copy from main memory to local store */
-            memcpy(ctx->ls + lsa, ctx->vm_base + ea32, sz);
+            if (ctx->verbose)
+                fprintf(stderr, "[SPU%d] DMA GET  ea=0x%08X ls=0x%05X sz=0x%X tag=%u\n",
+                        ctx->id, ea32, lsa, sz, ctx->mfc_tag);
+            if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
+                memcpy(ctx->ls + lsa, ctx->vm_base + ea32, sz);
             break;
         case MFC_PUT: case MFC_PUTB:
-            /* DMA PUT: copy from local store to main memory */
-            memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
+            if (ctx->verbose)
+                fprintf(stderr, "[SPU%d] DMA PUT  ea=0x%08X ls=0x%05X sz=0x%X tag=%u\n",
+                        ctx->id, ea32, lsa, sz, ctx->mfc_tag);
+            if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
+                memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
             break;
         default:
-            /* Barrier/fence/sync — no-op for our purposes */
             break;
     }
 }
@@ -300,16 +304,25 @@ void spu_step(spu_ctx_t *ctx) {
 
     /* ---- Channel instructions (check before RI10 for wrch conflict) ------ */
     if (op11 == 0x00D) { /* rdch */
-        R[rt].u32[0] = rdch(ctx, F_CH(insn));
+        uint32_t ch = F_CH(insn);
+        uint32_t val = rdch(ctx, ch);
+        if (ctx->verbose)
+            fprintf(stderr, "[SPU%d] rdch ch=%u val=0x%X\n", ctx->id, ch, val);
+        R[rt].u32[0] = val;
         R[rt].u32[1] = R[rt].u32[2] = R[rt].u32[3] = 0;
         return;
     }
     if (op11 == 0x10D) { /* wrch */
-        wrch(ctx, F_CH(insn), R[rt].u32[0]);
+        uint32_t ch = F_CH(insn);
+        if (ctx->verbose)
+            fprintf(stderr, "[SPU%d] wrch ch=%u val=0x%X\n", ctx->id, ch, R[rt].u32[0]);
+        wrch(ctx, ch, R[rt].u32[0]);
         return;
     }
     if (op11 == 0x00F) { /* rchcnt */
-        R[rt].u32[0] = rchcnt(ctx, F_CH(insn));
+        uint32_t ch = F_CH(insn);
+        uint32_t cnt = rchcnt(ctx, ch);
+        R[rt].u32[0] = cnt;
         R[rt].u32[1] = R[rt].u32[2] = R[rt].u32[3] = 0;
         return;
     }
@@ -371,12 +384,11 @@ void spu_step(spu_ctx_t *ctx) {
         case 0x044: { /* stqa RT, I16 (absolute address) */
             uint32_t ea = (F_I16U(insn) << 2) & (SPU_LS_SIZE-1) & ~15u;
             ls_write128(ctx, ea, &R[rt]); return; }
-        case 0x067: { /* lqr  RT, I16 (PC-relative) */
-            uint32_t ea = ((pc + (uint32_t)(int32_t)(F_I16(insn)<<2)) & (SPU_LS_SIZE-1)) & ~15u;
-            ls_read128(ctx, ea, &R[rt]); return; }
-        case 0x065: { /* stqr RT, I16 (PC-relative) */
-            uint32_t ea = ((pc + (uint32_t)(int32_t)(F_I16(insn)<<2)) & (SPU_LS_SIZE-1)) & ~15u;
-            ls_write128(ctx, ea, &R[rt]); return; }
+        /* NOTE: lqr(0x067) and stqr(0x065) share op9 with rotmai/rotmi when
+           i10_top1=1.  Since all useful rotmi/rotmai shifts use i10_top1=1,
+           prioritising lqr/stqr here would mis-decode the majority of
+           rotate-mask instructions.  lqr/stqr appear to be rare in this
+           game's SPU programs; skip them here — the fallback no-op is safer. */
     }
 
     /* ---- RI10 format (8-bit opcode) -------------------------------------- */
@@ -750,6 +762,7 @@ uint32_t spu_run(spu_ctx_t *ctx, uint32_t max_insns) {
     uint32_t n = 0;
     while (ctx->running && n < max_insns) {
         spu_step(ctx);
+        ctx->insn_count++;
         n++;
     }
     return n;

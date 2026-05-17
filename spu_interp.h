@@ -70,6 +70,10 @@ typedef struct spu_ctx {
 
     /* vm_base pointer (set at init from runtime_glue) */
     uint8_t *vm_base;
+
+    /* Verbose tracing: when non-zero, log DMA + channel ops */
+    int      verbose;
+    uint64_t insn_count;   /* total instructions executed */
 } spu_ctx_t;
 
 /* ---- Public API ----------------------------------------------------------- */

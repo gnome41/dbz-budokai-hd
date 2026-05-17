@@ -101,6 +101,8 @@ int     g_process_exit_code = -1;
 extern "C" void thread_runtime_init();
 extern "C" void thread_runtime_join_all();
 extern "C" volatile bool g_threads_should_exit;
+extern "C" void spurs_start(void);
+extern "C" void spurs_verbose_off(void);
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
 
 #define DRAIN_TRAMPOLINE(ctx) do { \
@@ -408,6 +410,10 @@ int main(int argc, char* argv[]) {
     __try {
         func_0003B328(&ctx);   /* SPURS / global-ctor init phase */
         DRAIN_TRAMPOLINE(&ctx);
+        /* Start the SPURS kernel SPU thread now that the PPU SPURS state
+           machine has finished (states 2→21).  The kernel loads the SPURS
+           management area from guest 0x700000 and begins dispatching workloads. */
+        spurs_start();
         func_0003B244(&ctx);   /* C++ runtime → main() → sys_process_exit */
         DRAIN_TRAMPOLINE(&ctx);
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
@@ -427,6 +433,8 @@ int main(int argc, char* argv[]) {
 #endif
 
     printf("Entry point returned. Waiting for game threads...\n");
+
+
     g_threads_should_exit = true;  /* signal stub threads (UpdateThread etc.) to exit */
     thread_runtime_join_all();
     vm_shutdown();
