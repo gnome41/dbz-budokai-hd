@@ -266,6 +266,17 @@ void spu_step(spu_ctx_t *ctx) {
     uint32_t insn = ls_read32(ctx, pc);
     ctx->pc = (pc + 4) & (SPU_LS_SIZE - 1);
 
+    /* Optional per-instruction trace */
+    if (ctx->trace_limit && ctx->trace_count < ctx->trace_limit) {
+        ctx->trace_count++;
+        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=0x%X r3=0x%X r11=0x%X r13=0x%X\n",
+                ctx->id, (unsigned long long)ctx->trace_count,
+                pc, insn,
+                ctx->gpr[0].u32[0], ctx->gpr[3].u32[0],
+                ctx->gpr[11].u32[0], ctx->gpr[13].u32[0]);
+        fflush(stderr);
+    }
+
     uint32_t op4  = F_OP4(insn);
     uint32_t op7  = F_OP7(insn);
     uint32_t op8  = F_OP8(insn);
@@ -472,9 +483,16 @@ void spu_step(spu_ctx_t *ctx) {
             int sh = -(int)(F_I7(insn)) & 63;
             for (int i=0;i<4;i++) R[rt].s32[i] = (sh>=32)?(R[ra].s32[i]>>31):(R[ra].s32[i]>>sh);
             return; }
-        case 0x3E: { /* rotmhi: rotate and mask halfword immediate */
+        case 0x3E: { /* rotmhi: rotate and mask halfword immediate (logical) */
             int sh = -(int)(F_I7(insn)) & 31;
             for (int i=0;i<8;i++) R[rt].u16[i] = (sh>=16)?0:(R[ra].u16[i]>>sh);
+            return; }
+        case 0x12: { /* rotmahi: rotate and mask algebraic halfword immediate
+                        Confirmed: 677 occurrences in SPURS kernel.
+                        I7=127→sh=1, I7=0→sh=0 (copy), I7=126→sh=2, etc.
+                        sh = (-I7) & 31. For sh≥16 result is sign-extension. */
+            int sh = -(int)(F_I7(insn)) & 31;
+            for (int i=0;i<8;i++) R[rt].s16[i] = (sh>=16)?(R[ra].s16[i]>>15):(R[ra].s16[i]>>sh);
             return; }
         case 0x38: { /* rothi: rotate halfword immediate */
             uint32_t sh = F_I7(insn) & 0xF;
@@ -593,6 +611,12 @@ void spu_step(spu_ctx_t *ctx) {
             spu_reg_t t;
             for (int i=0;i<16;i++) t.u8[i]=R[ra].u8[(i+sh)&15];
             R[rt]=t; return; }
+        case 0x07A: { /* shlhi RT, RA, I7 — shift left halfword immediate
+                        Confirmed RI7 form: 14 occurrences in SPURS kernel.
+                        I7=125 → sh=13 (I7 & 15). Differs from shlqbii(0x07B) by 1 bit. */
+            uint32_t sh = F_I7(insn) & 15;
+            for (int i=0;i<8;i++) R[rt].u16[i] = (uint16_t)(R[ra].u16[i] << sh);
+            return; }
         case 0x17F: { /* rotqbyi RT, RA, I7 */
             uint32_t sh = F_I7(insn) & 15;
             spu_reg_t t;
@@ -640,6 +664,18 @@ void spu_step(spu_ctx_t *ctx) {
             return; }
 
         /* Misc */
+        case 0x2AE: { /* xswd: Extend Sign Word to Doubleword
+                        192 occurrences in SPURS kernel, RB always r0 (ignored).
+                        Each 64-bit doubleword gets its low word sign-extended. */
+            R[rt].s64[0] = (int64_t)R[ra].s32[1];  /* big-endian: low word is [1] */
+            R[rt].s64[1] = (int64_t)R[ra].s32[3];
+            return; }
+        case 0x1B4: { /* sumb: Sum Bytes into Halfwords
+                        34 occurrences, RB often r0. Each halfword = sum of 2 bytes from RA + 2 from RB. */
+            for (int i=0;i<8;i++) {
+                R[rt].u16[i] = (uint16_t)R[ra].u8[i*2]   + (uint16_t)R[ra].u8[i*2+1] +
+                               (uint16_t)R[rb].u8[i*2]   + (uint16_t)R[rb].u8[i*2+1];
+            } return; }
         case 0x2A5: { /* clz RT, RA */
             for (int i=0;i<4;i++) {
                 uint32_t v=R[ra].u32[i]; int n=0;
