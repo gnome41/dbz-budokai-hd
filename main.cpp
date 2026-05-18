@@ -17,6 +17,11 @@ static uint32_t* g_framebuf  = nullptr;  /* BGRA pixel data, 1280x720 */
 static BITMAPINFO g_bmi      = {};
 static constexpr int FB_W = 1280, FB_H = 720;
 
+/* Exported for RSX command processor in runtime_glue.cpp */
+extern "C" uint32_t* rsx_framebuf(void) { return g_framebuf; }
+extern "C" int rsx_fb_width(void)  { return FB_W; }
+extern "C" int rsx_fb_height(void) { return FB_H; }
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
@@ -366,6 +371,13 @@ int main(int argc, char* argv[]) {
         const uint32_t CMD_BUF   = 0xD0100000u;
         const uint32_t CMD_SIZE  = 0x00100000u;  /* 1 MB command buffer */
         vm_write32(0x162158u, GCM_CTX);           /* TOC[-0x7FA0] → GCM ctx ptr */
+        /* Cover both possible cellGcmContext layouts:
+         * Some versions have current/begin/end at +0x00/+0x04/+0x08.
+         * This game's helpers (per reverse-engineering) use +0x08/+0x0C/+0x10.
+         * Populate both so the game's GCM library finds a valid pointer
+         * regardless of which layout it expects. */
+        vm_write32(GCM_CTX + 0x00u, CMD_BUF);    /* current (alt layout) */
+        vm_write32(GCM_CTX + 0x04u, CMD_BUF);    /* begin   (alt layout) */
         vm_write32(GCM_CTX + 0x08u, CMD_BUF);    /* current = command buffer start */
         vm_write32(GCM_CTX + 0x0Cu, CMD_BUF);    /* begin */
         vm_write32(GCM_CTX + 0x10u, CMD_BUF + CMD_SIZE - 4u); /* end */
@@ -437,6 +449,7 @@ int main(int argc, char* argv[]) {
 
     g_threads_should_exit = true;  /* signal stub threads (UpdateThread etc.) to exit */
     thread_runtime_join_all();
+
     vm_shutdown();
     return 0;
 }
