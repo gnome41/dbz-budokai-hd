@@ -35,6 +35,10 @@ extern "C" volatile bool g_threads_should_exit;
  * so loading extra is safe — BSS regions remain zero. */
 #define SPURS_KERNEL_ELF_SIZE  0x36800u
 
+/* Game workload ELF sizes: gap between consecutive ELF start addresses */
+#define GAME_WORKLOAD_1_SIZE  (GAME_WORKLOAD_2_GADDR - GAME_WORKLOAD_1_GADDR)  /* ~0x8580 */
+#define GAME_WORKLOAD_2_SIZE  0x10000u  /* safe upper bound for workload 2 */
+
 /* SPURS management area EA (the synthetic context we set up in main.cpp).
  * Must satisfy: byte[2]&0xF0==0 AND byte[3]&0x0F==0 so that the SPURS kernel's
  * ceqi check at LS[0x17C] passes (the rothi+rotqbybi chain extracts EA bits
@@ -44,6 +48,126 @@ extern "C" volatile bool g_threads_should_exit;
 
 static spu_ctx_t g_spurs_ctx;
 static int       g_spurs_started = 0;
+
+/* ---- Game workload runner ------------------------------------------------ */
+/* Loaded lazily on first dispatch.  One shared context reused per slot since
+ * we run workloads synchronously during the diagnostic burst. */
+static spu_ctx_t  g_wl_ctx;          /* reused for each workload dispatch */
+static int        g_wl_ctx_valid = 0;/* 1 after successful spu_load_elf */
+
+static void spurs_run_workload(int slot_idx) {
+    /* Only load the ELF on the first dispatch (slot 0).
+     * The game has two workload ELFs; start with workload 1 for all slots. */
+    if (!g_wl_ctx_valid) {
+        uint32_t gaddr = GAME_WORKLOAD_1_GADDR;
+        uint32_t gsz   = GAME_WORKLOAD_1_SIZE;
+        const uint8_t* elf_ptr = vm_base + gaddr;
+
+        if (elf_ptr[0] != 0x7F || elf_ptr[1] != 'E' ||
+            elf_ptr[2] != 'L'  || elf_ptr[3] != 'F') {
+            fprintf(stderr, "[WL] no ELF magic at guest 0x%X — skipping\n", gaddr);
+            fflush(stderr);
+            return;
+        }
+
+        spu_ctx_init(&g_wl_ctx, 2, vm_base);
+        g_wl_ctx.verbose = 1;      /* log DMA + channel ops */
+        g_wl_ctx.trace_limit = 50; /* trace first 50 instructions */
+        g_wl_ctx.trace_count = 0;
+
+        if (spu_load_elf(&g_wl_ctx, elf_ptr, gsz) != 0) {
+            fprintf(stderr, "[WL] spu_load_elf failed for workload at 0x%X\n", gaddr);
+            fflush(stderr);
+            return;
+        }
+        g_wl_ctx_valid = 1;
+
+        fprintf(stderr, "[WL] ELF loaded from guest 0x%X, entry=0x%X, size=0x%X\n",
+                gaddr, g_wl_ctx.pc, gsz);
+        fflush(stderr);
+    } else {
+        /* Subsequent dispatches: re-run from entry, keeping the loaded LS.
+         * Reset PC to entry (stored in pc at load time — we'd need to save it). */
+        g_wl_ctx.trace_limit = 0;  /* no per-insn trace after first run */
+        /* pc will be set from the ELF entry on each reload; since we reuse
+         * the ctx after the first load, we reset pc to the ELF entry.
+         * For now: just skip subsequent dispatches (focus on slot 0). */
+        fprintf(stderr, "[WL] slot %d: reusing ctx (skipping reload)\n", slot_idx);
+        fflush(stderr);
+        return;
+    }
+
+    /* Set up minimal register state:
+     * r3 = SPURS management area EA (the synthetic context at 0x70A000)
+     * r0 = return address = sentinel at LS[0x40]
+     * All other registers = 0 (may cause workload to crash, but we'll see) */
+    g_wl_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
+    g_wl_ctx.gpr[0].u32[0] = 0x40;
+
+    /* Place stop 0x100 at LS[0x40] as the "workload done" sentinel */
+    uint8_t stop100[4] = {0x00, 0x00, 0x01, 0x00};
+    memcpy(g_wl_ctx.ls + 0x40, stop100, 4);
+
+    /* Set return address registers used by the kernel's rotmai patterns
+     * (same pattern as spu_spurs.cpp does for the kernel itself). */
+    g_wl_ctx.gpr[86].u32[0] = 0x80;  /* r86 >> 1 = 0x40 */
+    g_wl_ctx.gpr[89].u32[0] = 0x80;  /* r89 >> 1 = 0x40 */
+
+    /* Run workload with restart handling (same lifecycle as the SPURS kernel):
+     *   stop 0   = yield/wait: restart from current PC
+     *   stop 0x100 = workload "returned": done
+     *   other    = real halt
+     * Run up to 20 restart iterations, up to 50K insns each.            */
+    fprintf(stderr, "[WL] slot %d: running from entry 0x%X\n", slot_idx, g_wl_ctx.pc);
+    fflush(stderr);
+
+    uint32_t ran = 0;
+    for (int wl_restart = 0; wl_restart < 20; wl_restart++) {
+        ran += spu_run(&g_wl_ctx, 50000);
+        if (!g_wl_ctx.running) {
+            uint32_t wcode = g_wl_ctx.stop_code;
+            if (wcode == 0) {
+                /* Yield — restart from current PC */
+                fprintf(stderr, "[WL] slot %d restart %d at PC=0x%X r3=0x%X r4=0x%X\n",
+                        slot_idx, wl_restart+1, g_wl_ctx.pc,
+                        g_wl_ctx.gpr[3].u32[0], g_wl_ctx.gpr[4].u32[0]);
+                fflush(stderr);
+                if (g_wl_ctx.pc >= 0x20000u) {
+                    fprintf(stderr, "[WL] slot %d: BSS idle at 0x%X — done\n",
+                            slot_idx, g_wl_ctx.pc);
+                    break;
+                }
+                g_wl_ctx.running = 1;
+                /* Trace next 30 instructions of first restart to understand the code */
+                if (wl_restart == 0) {
+                    g_wl_ctx.trace_limit = 30;
+                    g_wl_ctx.trace_count = 0;
+                } else {
+                    g_wl_ctx.trace_limit = 0;
+                }
+            } else if (wcode == 0x100) {
+                fprintf(stderr, "[WL] slot %d: workload returned (stop 0x100)\n", slot_idx);
+                break;
+            } else if (wcode == 0x3FFF) {
+                /* SPURS LV2 service trap — restart from next PC to explore further */
+                fprintf(stderr, "[WL] slot %d: SPURS svc trap 0x3FFF at PC=0x%X r3=0x%X r4=0x%X (continuing)\n",
+                        slot_idx, g_wl_ctx.pc,
+                        g_wl_ctx.gpr[3].u32[0], g_wl_ctx.gpr[4].u32[0]);
+                fflush(stderr);
+                g_wl_ctx.running = 1;
+                g_wl_ctx.trace_limit = 30;
+                g_wl_ctx.trace_count = 0;
+            } else {
+                fprintf(stderr, "[WL] slot %d: stop=0x%X at PC=0x%X\n", slot_idx, wcode, g_wl_ctx.pc);
+                break;
+            }
+        }
+    }
+
+    fprintf(stderr, "[WL] slot %d: done ran=%u insns stop=0x%X pc=0x%X\n",
+            slot_idx, ran, g_wl_ctx.stop_code, g_wl_ctx.pc);
+    fflush(stderr);
+}
 
 /* ---- SPURS kernel thread ------------------------------------------------ */
 static DWORD WINAPI spurs_kernel_thread(LPVOID) {
@@ -228,6 +352,19 @@ extern "C" void spurs_start(void) {
                         restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0],
                         g_spurs_ctx.gpr[4].u32[0]);
                 fflush(stderr);
+                /* Dispatch signal: kernel stopped at LS[0x04..0x3C] = "run workload".
+                 * These 15 stops are the kernel signalling LV2 to start workload threads. */
+                if (g_spurs_ctx.pc >= 0x04u && g_spurs_ctx.pc <= 0x3Cu) {
+                    int slot = (int)((g_spurs_ctx.pc - 0x04u) / 4u);
+                    fprintf(stderr, "[SPURS] dispatch slot %d at PC=0x%X\n",
+                            slot, g_spurs_ctx.pc);
+                    fflush(stderr);
+                    spurs_run_workload(slot);
+                    g_spurs_ctx.running = 1;  /* kernel continues from next instruction */
+                    total += spu_run(&g_spurs_ctx, 200000);
+                    continue;
+                }
+
                 /* End burst when kernel idles in BSS/data regions past the code section.
                  * 0x298E0: old "no workload" idle; 0x20600+: new "wait for completion" idle.
                  * Stop the burst at either, so we don't burn restarts on sequential stops. */
