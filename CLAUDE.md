@@ -318,10 +318,27 @@ LS[0xADD0] contains: `"EDGE ASSERTION FAILURE: %s(%d)\n"` — confirms this is S
 - r4=0xADD0: LS context address (points to the assertion string = an EDGE internal table entry)
 On real PS3: EDGE's PPU-side task manager handles this, loading the next EDGE sub-task into LS.
 
-**What's needed for actual game rendering:**
-Implementing EDGE's PPU-side task manager for the stop 0x3FFF callback. EDGE's task system dispatches geometry processing, decompression, and rendering sub-tasks. This is a complex library reimplementation. Without it, EDGE runs through its "no task" exit path (dispatching empty sub-task signals and returning).
+**EDGE geometry processor at LS[0x3108]:**
+```
+ila  r85, 0xBC00          ; r85 = geometry table at LS[0xBC00]
+ori  r87, r3, 0           ; r87 = task descriptor arg (from caller's r3)
+ilh  r88, 0x1             ; r88 = 1 (some mode flag)
+rdch r81, SPU_RdMachStat  ; read machine status
+ila  r2, 0x3180; bi r2    ; jump to main processing loop at LS[0x3180]
+```
+This function reads r3 = EDGE task descriptor (geometry data EAs, output buffer, etc.)
 
-Workload 2 (0x14AE80) is likely also EDGE-related (same entry structure).
+**All 15 workload slots** now run 47 instructions each (EDGE "no task" path).
+Total: SPURS kernel (2980) + 15 × EDGE (47 each = 705) = ~3685 SPU insns/cycle.
+
+**What's needed for actual game rendering:**
+Implement the stop 0x3FFF handler with a real EDGE task descriptor:
+1. When stop 0x3FFF fires (r3=0x01000100, r4=0xADD0), load EDGE task descriptor to LS
+2. Set task descriptor to point to geometry data EAs (from game's data files)
+3. After stop 0x3FFF returns, EDGE geometry processor (LS[0x3108]) runs with r3=descriptor
+4. Geometry processor DMA's geometry data → GPU commands → RSX rendering output
+
+Workload 2 (0x14AE80, ~38KB, entry=0x3050) is also EDGE-based with same entry structure.
 
 **New opcodes in dispatch code (0x0560 area):**
 - `shlqbi` (0x1DD, RR): shift-left 128-bit quad by (RB&7) bits. Same pattern as rotqbi but without wrap.
