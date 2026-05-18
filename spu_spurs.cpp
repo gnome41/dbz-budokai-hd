@@ -119,6 +119,10 @@ extern "C" void spurs_start(void) {
     memcpy(g_spurs_ctx.ls + 0x40, stop100, 4);
     g_spurs_ctx.gpr[0].u32[0] = 0x40;  /* r0 = return address = LS[0x40] */
 
+    /* No patch needed — rotqbybi was the missing instruction.
+     * With op11=0x1DC now implemented, r4 should be set correctly before
+     * the ceqi check at LS[0x17C]. */
+
     /* Set up initial arguments:
      *   GPR[3] = EA of SPURS management area (low 32 bits)
      *   GPR[4] = EA high 32 bits (always 0 on PS3)
@@ -156,6 +160,14 @@ extern "C" void spurs_start(void) {
     g_spurs_ctx.gpr[86].u32[2] = 0;
     g_spurs_ctx.gpr[86].u32[3] = 0;
 
+    /* SPURS type field encoded in r3 upper word.
+     * The kernel does: r11=rothi(r3,12); r4=rotqbybi(r11,sh=15); ceqi r2,r4,8.
+     * For ceqi to pass, r4.u32[0] must equal 8.
+     * Working backwards: r4.u32[0]=8 requires r11.byte[15]=0x08, which requires
+     * r3.u16[7]=0x8000 (rotate(0x8000,12)→0x0800, high byte=0x08).
+     * r3.u16[7]=0x8000 means r3.u32[3]=0x80000000 in LE host storage. */
+    g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;  /* SPURS type=8 in high word of r3 */
+
     /* Run synchronously for a diagnostic burst so we can see the first DMA
        operations regardless of thread scheduling latency.  After this burst
        the kernel will likely be blocked on rdch (waiting for PPU mailbox).
@@ -169,19 +181,25 @@ extern "C" void spurs_start(void) {
      * stop 0x100 = kernel "returned" (bi $0 → LS[0x00]): restart from entry
      * Other stop = real halt, exit loop */
     uint32_t total = 0;
-    for (int restart = 0; restart < 20; restart++) {
+    for (int restart = 0; restart < 200; restart++) {
         if (!g_spurs_ctx.running) {
             uint32_t code = g_spurs_ctx.stop_code;
             if (code == 0) {
                 /* SPURS idle — continue from current PC */
-                fprintf(stderr, "[SPURS] restart %d (idle) at PC=0x%X insns=%u r0=0x%X\n",
-                        restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0]);
+                fprintf(stderr, "[SPURS] restart %d (idle) at PC=0x%X insns=%u r0=0x%X r4=0x%X\n",
+                        restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0],
+                        g_spurs_ctx.gpr[4].u32[0]);
                 fflush(stderr);
-                /* Enable per-instruction trace for restart 2 (the critical 40-insn batch) */
-                if (restart == 1) {
-                    g_spurs_ctx.trace_limit = 80;
+                /* Enable per-instruction trace for restarts 1 and 2 */
+                if (restart == 0) {
+                    g_spurs_ctx.trace_limit = 50;
                     g_spurs_ctx.trace_count = 0;
-                    fprintf(stderr, "[SPURS] TRACE ENABLED for restart 2 (80 insns)\n");
+                    fprintf(stderr, "[SPURS] TRACE restart 1 (50 insns)\n");
+                    fflush(stderr);
+                } else if (restart == 1) {
+                    g_spurs_ctx.trace_limit = 200;
+                    g_spurs_ctx.trace_count = 0;
+                    fprintf(stderr, "[SPURS] TRACE restart 2 (200 insns)\n");
                     fflush(stderr);
                 } else {
                     g_spurs_ctx.trace_limit = 0;
@@ -196,6 +214,7 @@ extern "C" void spurs_start(void) {
                 g_spurs_ctx.running = 1;
                 /* Reset initial arguments for the new dispatch cycle */
                 g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
+                g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;  /* preserve type field */
                 g_spurs_ctx.gpr[4].u32[0] = 0;
                 g_spurs_ctx.gpr[0].u32[0] = 0x40;  /* restore return addr */
                 /* Re-place sentinel (kernel may have overwritten LS[0x40]) */

@@ -269,10 +269,11 @@ void spu_step(spu_ctx_t *ctx) {
     /* Optional per-instruction trace */
     if (ctx->trace_limit && ctx->trace_count < ctx->trace_limit) {
         ctx->trace_count++;
-        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=0x%X r3=0x%X r11=0x%X r13=0x%X\n",
+        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=%X r2=%X r3=%X r4=%X r11=%X r13=%X\n",
                 ctx->id, (unsigned long long)ctx->trace_count,
                 pc, insn,
-                ctx->gpr[0].u32[0], ctx->gpr[3].u32[0],
+                ctx->gpr[0].u32[0], ctx->gpr[2].u32[0],
+                ctx->gpr[3].u32[0], ctx->gpr[4].u32[0],
                 ctx->gpr[11].u32[0], ctx->gpr[13].u32[0]);
         fflush(stderr);
     }
@@ -598,30 +599,36 @@ void spu_step(spu_ctx_t *ctx) {
             spu_reg_t t; memset(&t,0,16);
             if (sh<16) for(int i=0;i<16-sh;i++) t.u8[i]=R[ra].u8[i+sh];
             R[rt]=t; return; }
-        case 0x07F: { /* shlqbyi already done above, but keep compat */ return; }
+        case 0x07F: { /* shlqbyi RT, RA, I7 — shift left quad by byte immediate */
+            uint32_t sh = F_I7(insn) & 15;
+            spu_reg_t t; memset(&t,0,16);
+            if (sh<16) for(int i=0;i<16-sh;i++) t.u8[i]=R[ra].u8[i+sh];
+            R[rt]=t; return; }
 
-        /* Rotate quad */
-        case 0x1FC: { /* rotqbybi RT, RA, RB (rotate quad by bit-offset in RB) */
+        /* Rotate quad — correct opcodes verified against spu_disasm.py:
+         * 0x1DB = rotqbi (RR), 0x1DC = rotqbybi (RR), 0x1FC = rotqby (RR)
+         * 0x1FB = rotqbii (RI7), 0x1FF = rotqbyi (RI7) */
+        case 0x1DB: { /* rotqbi RT, RA, RB — rotate 128-bit quad LEFT by (RB&7) bits */
+            int sh = R[rb].u32[0] & 7;
+            if (!sh) { R[rt]=R[ra]; return; }
+            spu_reg_t t;
+            for (int i=0;i<16;i++)
+                t.u8[i]=(uint8_t)((R[ra].u8[i]<<sh)|(R[ra].u8[(i+1)&15]>>(8-sh)));
+            R[rt]=t; return; }
+        case 0x1DC: { /* rotqbybi RT, RA, RB — rotate quad by byte count = RB>>3 */
             uint32_t sh = (R[rb].u32[0]>>3) & 15;
             spu_reg_t t;
             for (int i=0;i<16;i++) t.u8[i]=R[ra].u8[(i+sh)&15];
             R[rt]=t; return; }
-        case 0x1F8: { /* rotqby RT, RA, RB */
+        case 0x1FC: { /* rotqby RT, RA, RB — rotate quad by byte count in RB */
             uint32_t sh = R[rb].u32[0] & 15;
             spu_reg_t t;
             for (int i=0;i<16;i++) t.u8[i]=R[ra].u8[(i+sh)&15];
             R[rt]=t; return; }
-        case 0x07A: { /* shlhi RT, RA, I7 — shift left halfword immediate
-                        Confirmed RI7 form: 14 occurrences in SPURS kernel.
-                        I7=125 → sh=13 (I7 & 15). Differs from shlqbii(0x07B) by 1 bit. */
+        case 0x07A: { /* shlhi RT, RA, I7 — shift left halfword immediate */
             uint32_t sh = F_I7(insn) & 15;
             for (int i=0;i<8;i++) R[rt].u16[i] = (uint16_t)(R[ra].u16[i] << sh);
             return; }
-        case 0x17F: { /* rotqbyi RT, RA, I7 */
-            uint32_t sh = F_I7(insn) & 15;
-            spu_reg_t t;
-            for (int i=0;i<16;i++) t.u8[i]=R[ra].u8[(i+sh)&15];
-            R[rt]=t; return; }
 
         /* Compare */
         case 0x3C0: { /* ceq RT, RA, RB */
@@ -750,7 +757,9 @@ void spu_step(spu_ctx_t *ctx) {
     }
 
     /* Fallback: unknown instruction */
-    (void)0; /* no-op; could log */
+    if (ctx->verbose)
+        fprintf(stderr, "[SPU%d] UNIMPL PC=0x%04X insn=0x%08X op11=0x%03X op8=0x%02X op7=0x%02X\n",
+                ctx->id, pc, insn, op11, op8, op7);
 }
 
 /* --------------------------------------------------------------------------
