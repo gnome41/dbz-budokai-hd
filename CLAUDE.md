@@ -142,7 +142,7 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
 **Outstanding questions for the next iteration:**
-- **SPU/SPURS workload dispatch** — the next major milestone. The SPURS kernel correctly reaches idle (2837 instructions) and awaits a PPU mailbox signal. To dispatch a workload: (1) implement `cellSpursAddWorkload` HLE to populate CellSpurs management area at 0x70A000 with descriptors; (2) send `ctx->inbound_mbox` + `ctx->inbound_mbox_count=1` to wake the kernel; (3) the kernel will DMA the management area, find a ready workload slot (r13 < 0x10000), and dispatch. See CLAUDE.md §SPU Interpreter section for the full algorithm.
+- **SPU workload execution** — the SPURS kernel now dispatches 15 workload slots via stop-0 signals at LS[0x04..0x3C] and reaches the "wait for completion" idle at LS[0x20614] (2980 total instructions). The next step: intercept the dispatch signals (stop-0 at LS[0x04..0x3C] in the burst loop) and actually run the game's SPU workload ELFs (at 0x142900 and 0x14AE80) in new spu_ctx_t threads. This requires understanding the workload → kernel interface (registers, LS layout at completion).
 - **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`). However: investigation revealed the game writes **zero NV4097 rendering commands** during init. PUT=0x43 is RSX FIFO initialization, not actual draw calls. The game's rendering is entirely SPURS/SPU-driven. Visible graphics requires SPURS workloads running first. The RSX parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94) for when real commands eventually arrive.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
@@ -256,10 +256,39 @@ The dispatch path (LS[0x0280]–LS[0x03C0]) executes in three phases:
 | `0x1F630..0x1F64F` | Shift-mask table (0xFFFF, 0x7FFF, ..., 0x0001) |
 | `0x0C41C..0x0C45B` | Sorted dispatch table built by sort loop (64 workload slots) |
 
-### All UNIMPL instructions resolved
-- `rotqbii` (op11=0x1D4): now implemented ✓  
-- `xswd` (op11=0x2AE), `fscrrd/zeroes-RT` (op11=0x2B6): already implemented ✓  
-- No UNIMPL messages in kernel scan loop execution.
+### All UNIMPL instructions resolved (through dispatch path)
+| op11 | Instruction | Notes |
+|------|-------------|-------|
+| `0x1D4` | `rotqbii` (RI7, immediate bit count) | Needed for workload init loop |
+| `0x1DD` | `shlqbi` (RR, shift-left quad by RB[2:0] bits) | Needed in dispatch code 0x0560 |
+| `0x1DF` | `shlqbybi` (RR, shift-left quad by (RB>>3)&15 bytes) | Needed in dispatch code 0x0574 |
+| `0x2AE` | `xswd` (extend sign word to doubleword) | Already implemented |
+| `0x2B6` | `fscrrd` (returns 0 for RT) | Already implemented |
+
+### SPURS kernel dispatch: current verified flow (2980 instructions)
+
+1. Entry (0xD0, 34 insns) → stop-0 at LS[0x154] (first idle)
+2. Dispatch path from LS[0x158]:
+   - ceqi patch (ilh r2,1 at 0x17C) → brnz fires → dispatch branch at 0x280
+   - 64-iteration sort loop (0x310-0x38C): builds priority table in LS
+   - brhnz r13 patch (lnop at 0x03C0) → forces dispatch code at 0x03C4+
+   - Dispatch code (0x03C4-0x06XX): processes workload descriptors from LS
+3. Dispatch signals (15 × stop-0 at LS[0x04..0x3C]):
+   - Each stop-0 at LS[0x04], [0x08], ..., [0x3C] = one SPURS workload dispatch signal
+   - On real PS3: LV2 intercepts each and starts the SPU workload thread
+   - In our emulation: burst loop restarts each time (workload thread not started)
+4. Return via stop-0x100 at LS[0x40] → restart from entry 0xD0
+5. 20 instructions from 0xD0 → stop-0 at LS[0x20614] (post-dispatch idle)
+6. Burst ends: kernel correctly waiting for workloads to complete
+
+**What's needed to run real workloads:**
+- When burst sees stop-0 at PC=0x04..0x3C: load game SPU ELF (0x142900 or 0x14AE80) into new spu_ctx_t and run it in a thread
+- Workload entry = 0x3050 for both game workload ELFs
+- Workload completion: some signal back to the kernel (specifics TBD)
+
+**New opcodes in dispatch code (0x0560 area):**
+- `shlqbi` (0x1DD, RR): shift-left 128-bit quad by (RB&7) bits. Same pattern as rotqbi but without wrap.
+- `shlqbybi` (0x1DF, RR): shift-left 128-bit quad by (RB>>3)&15 bytes. Same as shlqby but RB>>3.
 
 ## Game-Specific Patches (in `main.cpp`)
 
