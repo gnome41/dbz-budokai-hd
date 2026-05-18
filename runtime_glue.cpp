@@ -383,6 +383,135 @@ extern "C" void vm_write16(uint64_t addr, uint16_t val) {
     vm_base[a]     = (uint8_t)(val >> 8);
     vm_base[a + 1] = (uint8_t)(val);
 }
+/* ---- RSX FIFO parser -------------------------------------------------------
+ * When the game writes the RSX PUT register (guest addr 0x10), we parse all
+ * NV4097 commands queued in the command buffer since the last flush.
+ *
+ * Command format (big-endian in guest memory):
+ *   header[31:18] = count  (number of 32-bit arguments that follow)
+ *   header[17:0]  = method (NV4097 register address, always 4-byte aligned)
+ *   header bit 29 = jump flag (next PUT is target address, not a command)
+ *   header bit 30 = non-incrementing (all count args go to same register)
+ *
+ * CMD_BUF at 0xD0100000 (committed guest memory, 1MB).
+ * PUT value written by game = guest EA of the new write position.
+ */
+extern "C" uint32_t* rsx_framebuf(void);
+extern "C" int       rsx_fb_width(void);
+extern "C" int       rsx_fb_height(void);
+extern "C" void      rsx_present_frame(void);
+
+/* RSX IO GET head — starts at 0 (RSX IO offset 0, which maps to CMD_BUF guest EA
+ * once the game calls cellGcmMapEaIoAddress; without that mapping, commands may
+ * land at guest EA 0x00+, overlapping RSX MMIO regs which we also intercept).
+ * We start at 0 and advance with PUT to scan wherever the game wrote commands. */
+static uint32_t g_rsx_get_ea    = 0x0u; /* RSX IO GET position = 0 initially */
+static uint32_t g_rsx_clr_color = 0u;          /* last NV4097_SET_COLOR_CLEAR_VALUE */
+static uint32_t g_rsx_surf_ea   = 0u;          /* color surface EA (from SET_SURFACE_COLOR_AOFFSET) */
+
+static inline uint32_t rsx_r32(uint32_t ea) {
+    return ((uint32_t)vm_base[ea]<<24)|((uint32_t)vm_base[ea+1]<<16)
+          |((uint32_t)vm_base[ea+2]<<8)|vm_base[ea+3];
+}
+
+static void rsx_handle(uint32_t method, uint32_t arg) {
+    switch (method & 0xFFFFu) {
+        case 0x1820: /* NV4097_SET_COLOR_CLEAR_VALUE  (RGBA8) */
+            g_rsx_clr_color = arg;
+            break;
+
+        case 0x0200: /* NV4097_SET_SURFACE_COLOR_AOFFSET — color buffer A offset in RSX IO */
+            g_rsx_surf_ea = 0xD0000000u + arg;  /* RSX IO base + offset */
+            break;
+
+        case 0x1D94: { /* NV4097_CLEAR_SURFACE — bits[7:4]=RGBA, bits[1:0]=depth/stencil */
+            bool clr_color = (arg & 0xF0u) != 0;
+            if (clr_color) {
+                /* Convert RSX RGBA8 → Windows DIB BGRA8 */
+                uint8_t r = (g_rsx_clr_color >> 24) & 0xFF;
+                uint8_t g = (g_rsx_clr_color >> 16) & 0xFF;
+                uint8_t b = (g_rsx_clr_color >>  8) & 0xFF;
+                uint8_t a = (g_rsx_clr_color)       & 0xFF;
+                uint32_t bgra = ((uint32_t)a << 24) | ((uint32_t)r << 16)
+                              | ((uint32_t)g <<  8) | b;
+                uint32_t* fb = rsx_framebuf();
+                int n = rsx_fb_width() * rsx_fb_height();
+                if (fb) {
+                    for (int i = 0; i < n; i++) fb[i] = bgra;
+                    rsx_present_frame();
+                }
+                fprintf(stderr, "[RSX] CLEAR color=RGBA(%u,%u,%u,%u)\n", r,g,b,a);
+                fflush(stderr);
+            }
+            break;
+        }
+
+        case 0x1808: /* NV4097_DRAW_ARRAYS — just log for now */
+            fprintf(stderr, "[RSX] DRAW_ARRAYS arg=0x%08X\n", arg); fflush(stderr);
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* Map RSX IO offset → guest EA where commands live.
+ * On real PS3: RSX IO offset 0x00 maps to the base of the IO-mapped guest region
+ * (configured by cellGcmMapEaIoAddress).  In our emulation, the only committed
+ * region that can receive these commands is CMD_BUF at 0xD0100000.
+ * If put_ea is a small RSX IO offset (< 0x1000000), map it to CMD_BUF+offset.
+ * If put_ea is already a full guest EA in our committed range, use it directly. */
+static uint32_t rsx_io_to_ea(uint32_t io_off) {
+    if (io_off < 0x1000000u) return 0xD0100000u + io_off;  /* RSX IO offset */
+    return io_off;                                           /* already a guest EA */
+}
+
+static void rsx_process_fifo(uint32_t put_val) {
+    uint32_t get_ea = rsx_io_to_ea(g_rsx_get_ea);
+    uint32_t put_ea = rsx_io_to_ea(put_val);
+
+    if (put_ea <= get_ea) {
+        g_rsx_get_ea = put_val;
+        return;
+    }
+
+    /* Log only when there are actual commands (non-zero content to parse) */
+    uint32_t nbytes = put_ea - get_ea;
+    (void)nbytes;
+
+    const uint32_t CMD_BUF_END = 0xD0200000u;
+    uint32_t ptr = get_ea;
+    while (ptr + 4 <= put_ea && ptr < CMD_BUF_END) {
+        uint32_t hdr = rsx_r32(ptr);
+
+        if (hdr == 0) { ptr += 4; continue; }          /* NOP */
+
+        if (hdr & 0x20000000u) {                        /* JUMP */
+            uint32_t jmp = hdr & ~0x20000000u;
+            jmp = rsx_io_to_ea(jmp);
+            if (jmp < 0xD0100000u || jmp >= CMD_BUF_END) break;
+            ptr = jmp;
+            continue;
+        }
+
+        uint32_t method  = hdr & 0x3FFFFu;             /* register address */
+        uint32_t count   = (hdr >> 18) & 0x7FFu;       /* argument count */
+        bool     no_inc  = (hdr & 0x40000000u) != 0;
+
+        if (count == 0 || ptr + 4 + count * 4 > CMD_BUF_END) {
+            ptr += 4; continue;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t arg = rsx_r32(ptr + 4 + i * 4);
+            uint32_t reg = no_inc ? method : (method + i * 4);
+            rsx_handle(reg, arg);
+        }
+        ptr += 4 + count * 4;
+    }
+    g_rsx_get_ea = put_val;
+}
+
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE32] guest addr=0x%08X val=0x%08X\n", a, val); fflush(stderr); }
@@ -401,11 +530,10 @@ extern "C" void vm_write32(uint64_t addr, uint32_t val) {
                 val, (val == 0) ? " → redirected to 0x70B000" : ""); fflush(stderr);
         if (val == 0) val = 0x0070B000u;  /* preserve states 11/13/14 struct chain */
     }
-    /* Null RSX backend: when PPU writes the RSX PUT register (0x10), update
-     * the RSX GET register (0x00) to the same value so the game never stalls
-     * waiting for RSX to "process" commands it submitted.  This makes every
-     * RSX command-buffer flush appear to complete instantly. */
+    /* RSX PUT register: parse queued commands then mirror to GET so the game
+     * never stalls.  rsx_process_fifo() advances g_rsx_get_ea to val. */
     if (a == 0x10u) {
+        rsx_process_fifo(val);
         vm_base[0x00] = (uint8_t)(val >> 24);
         vm_base[0x01] = (uint8_t)(val >> 16);
         vm_base[0x02] = (uint8_t)(val >>  8);
