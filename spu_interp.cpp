@@ -607,7 +607,15 @@ void spu_step(spu_ctx_t *ctx) {
 
         /* Rotate quad — correct opcodes verified against spu_disasm.py:
          * 0x1DB = rotqbi (RR), 0x1DC = rotqbybi (RR), 0x1FC = rotqby (RR)
-         * 0x1FB = rotqbii (RI7), 0x1FF = rotqbyi (RI7) */
+         * 0x1D4 = rotqbii (RI7, bit-count immediate)  ← NOT 0x1FB; 0x1FB not seen in this kernel
+         * 0x1FF = rotqbyi (RI7, byte-count immediate) */
+        case 0x1D4: { /* rotqbii RT, RA, I7 — rotate 128-bit quad LEFT by (I7&7) bits */
+            int sh = F_I7(insn) & 7;
+            if (!sh) { R[rt]=R[ra]; return; }
+            spu_reg_t t;
+            for (int i=0;i<16;i++)
+                t.u8[i]=(uint8_t)((R[ra].u8[i]<<sh)|(R[ra].u8[(i+1)&15]>>(8-sh)));
+            R[rt]=t; return; }
         case 0x1DB: { /* rotqbi RT, RA, RB — rotate 128-bit quad LEFT by (RB&7) bits */
             int sh = R[rb].u32[0] & 7;
             if (!sh) { R[rt]=R[ra]; return; }
