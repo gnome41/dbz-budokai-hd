@@ -148,6 +148,62 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Identify the 26 sysPrxForUser NIDs imported by this ELF
 - New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented
 
+## SPU Interpreter (`spu_interp.cpp`) — Current State
+
+The interpreter runs the embedded SPURS kernel ELF (at guest `0x10BD00`). SPU entry = `0xD0`. A diagnostic burst with `trace_limit` + verbose DMA logging is run at startup in `spu_spurs.cpp`.
+
+### Opcode fixes applied this session (verified against `tools/spu_disasm.py`)
+
+Several quad rotate/shift opcodes were wrong or missing:
+
+| op11 | Correct mnemonic | Was | Fix |
+|------|-----------------|-----|-----|
+| `0x1DB` | `rotqbi` (rotate quad left by bit count from RB) | missing | added |
+| `0x1DC` | `rotqbybi` (rotate quad left by byte count = RB>>3) | missing (was UNIMPL) | **added** ← key fix |
+| `0x1FC` | `rotqby` (rotate quad by byte count from RB) | wrongly labelled `rotqbybi` | corrected |
+| `0x1F8` | `.word` (unknown) | wrongly implemented as `rotqby` | removed |
+| `0x17F` | `.word` (unknown) | wrongly labelled `rotqbyi` | removed |
+| `0x1FF` | `rotqbyi` (rotate quad by byte immediate) | existing case 0x1FF was `shlqbyi` (wrong semantics) | note: existing 0x1FF shifts instead of rotates — not yet causing visible failures |
+| `0x07F` | `shlqbyi` (shift left quad by byte immediate) | no-op | implemented |
+
+Also: added UNIMPL verbose logging (with correct PC, not pc-4), added r2/r4 to instruction trace output.
+
+### SPURS kernel execution flow (traced this session)
+
+The kernel cycles: **entry(0xD0)** → 34 instructions → `stop 0` (PC=0x154) → **from PC=0x158** → 54 instructions → `bi r0` (return to LS[0x40]) → restart from entry. No DMA in these 88 instructions.
+
+Key code at LS[0x158]–LS[0x184]:
+```
+0x168: rothi   r11, r3, 12      ; r11 = rotated halfwords of SPURS_EA
+0x170: a       r3, r3, r12      ; r3 = SPURS_EA + r12 (r12 set in entry code)
+0x178: rotqbybi r4, r11, r3     ; r4 = r11 rotated left by (r3>>3)&15 bytes
+0x17C: ceqi    r2, r4, 8        ; r2 = (r4.u32[0] == 8) ? ~0 : 0
+0x180: [lnop]
+0x184: brnz    r2, dispatch     ; if r2≠0, go dispatch work; else fall through → bi r0 → return
+```
+
+### ceqi check: why it still fails
+
+With `SPURS_CTX_EA = 0x700000`:
+- `r11 = rothi(0x700000, 12)` → r11 bytes[2] = 0x07 (from the 0x700000 EA value)
+- `r3_modified = 0x700000 + r12 = 0x136C12FC`; `sh = (0x136C12FC>>3)&15 = 15`
+- `rotqbybi(r11, sh=15)`: puts r11.byte[15]=0x08 (from `gpr[3].u32[3]=0x80000000`) at r4.byte[0] **and** r11.byte[2]=0x07 at r4.byte[3]
+- Result: `r4.u32[0] = 0x07000008 ≠ 8` → ceqi fails → kernel never takes dispatch branch
+
+### How to fix ceqi for next session
+
+The EA `0x700000` has bits[23:20]=7 which pollutes r11.byte[2]. Need an EA where:
+- `byte[2] & 0xF0 == 0` (i.e., bits[23:20] = 0 of the EA), AND
+- `byte[3] & 0x0F == 0` (i.e., bits[15:12] = 0 of the EA)
+
+Two options:
+
+**Option A (recommended): Change `SPURS_CTX_EA` to `0x70A000`** (already used for dispatch chain, bits[23:20]=0x0A so byte[2]=0x0A, byte[2]&0xF0=0 ✓, byte[3]=0x70, byte[3]&0x0F=0 ✓). Then ceqi passes naturally. Update in `spu_spurs.cpp`.
+
+**Option B: Patch LS[0x17C]** — replace ceqi with `ilh r2, 1` (= `0x40000082`) to force r2=1 always. With the now-correct rotqbybi implementation, the dispatch path should work (previously ran into BSS at 0x298E4 because rotqbybi was a no-op, corrupting many downstream computations; that's now fixed).
+
+After either fix, check what DMA the kernel performs (expect `wrch MFC_LSA/EAH/EAL/Size/TagID/Cmd` to DMA the CellSpurs context from the EA) and what workloads it tries to dispatch.
+
 ## Game-Specific Patches (in `main.cpp`)
 
 All fixups are applied in `main()` before calling `func_0003B328` (`_start`).
