@@ -608,9 +608,23 @@ void spu_step(spu_ctx_t *ctx) {
             R[rt]=t; return; }
 
         /* Rotate quad — correct opcodes verified against spu_disasm.py:
-         * 0x1DB = rotqbi (RR), 0x1DC = rotqbybi (RR), 0x1FC = rotqby (RR)
-         * 0x1D4 = rotqbii (RI7, bit-count immediate)  ← NOT 0x1FB; 0x1FB not seen in this kernel
+         * 0x1DB = rotqbi  (RR), 0x1DC = rotqbybi  (RR), 0x1FC = rotqby (RR)
+         * 0x1DD = shlqbi  (RR), 0x1DF = shlqbybi  (RR)  ← shift-left variants
+         * 0x1D4 = rotqbii (RI7, bit-count immediate)
          * 0x1FF = rotqbyi (RI7, byte-count immediate) */
+        case 0x1DD: { /* shlqbi RT, RA, RB — shift left 128-bit quad by (RB&7) bits */
+            int sh = R[rb].u32[0] & 7;
+            if (!sh) { R[rt]=R[ra]; return; }
+            spu_reg_t t;
+            for (int i=0;i<15;i++)
+                t.u8[i]=(uint8_t)((R[ra].u8[i]<<sh)|(R[ra].u8[i+1]>>(8-sh)));
+            t.u8[15]=(uint8_t)(R[ra].u8[15]<<sh);
+            R[rt]=t; return; }
+        case 0x1DF: { /* shlqbybi RT, RA, RB — shift left quad by (RB>>3)&15 bytes */
+            uint32_t sh = (R[rb].u32[0]>>3) & 15;
+            spu_reg_t t; memset(&t,0,16);
+            for (uint32_t i=0; i+sh<16; i++) t.u8[i]=R[ra].u8[i+sh];
+            R[rt]=t; return; }
         case 0x1D4: { /* rotqbii RT, RA, I7 — rotate 128-bit quad LEFT by (I7&7) bits */
             int sh = F_I7(insn) & 7;
             if (!sh) { R[rt]=R[ra]; return; }

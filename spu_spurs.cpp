@@ -145,6 +145,22 @@ extern "C" void spurs_start(void) {
         fprintf(stderr, "[SPURS] patched LS[0x17C] with ilh r2,1 (0x%08X)\n", ilh_r2_1);
     }
 
+    /* Patch LS[0x03C0]: replace brhnz r13, 0x298E0 → lnop to force dispatch.
+     *
+     * The `brhnz r13` at 0x03C0 checks if r13.high≠0 → idles.  r13 is
+     * always 0x1F5F0 (from `ila r13, 0x1F5F0` at 0x0308) — upper halfword=1.
+     * The check is a "no workload found" sentinel.  Patching to lnop forces
+     * fall-through so the dispatch code at 0x03C4+ runs and we can trace
+     * what the kernel does when it tries to dispatch a workload. */
+    {
+        uint32_t lnop_insn = 0x00200000u;   /* lnop = no-operation (odd pipe) */
+        g_spurs_ctx.ls[0x3C0] = (uint8_t)(lnop_insn >> 24);
+        g_spurs_ctx.ls[0x3C1] = (uint8_t)(lnop_insn >> 16);
+        g_spurs_ctx.ls[0x3C2] = (uint8_t)(lnop_insn >>  8);
+        g_spurs_ctx.ls[0x3C3] = (uint8_t)(lnop_insn);
+        fprintf(stderr, "[SPURS] patched LS[0x03C0] brhnz-r13 → lnop (force dispatch)\n");
+    }
+
     /* Set up initial arguments:
      *   GPR[3] = EA of SPURS management area (low 32 bits)
      *   GPR[4] = EA high 32 bits (always 0 on PS3)
@@ -212,23 +228,23 @@ extern "C" void spurs_start(void) {
                         restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0],
                         g_spurs_ctx.gpr[4].u32[0]);
                 fflush(stderr);
-                /* Kernel reached the "no work" idle spin (BSS stops at 0x298E0+).
-                 * This is expected behavior — kernel correctly ran its dispatch loop
-                 * and found no workloads registered.  Stop the burst here. */
+                /* End burst if kernel idles in BSS area (>0x20560 = past kernel ELF).
+                 * With brhnz r13 patched, the kernel may now reach new code;
+                 * stop only if it goes above 0x29000 (deep BSS). */
                 if (g_spurs_ctx.pc >= 0x29000u) {
-                    fprintf(stderr, "[SPURS] kernel idle at PC=0x%X — ending burst\n",
+                    fprintf(stderr, "[SPURS] kernel deep-idle at PC=0x%X — ending burst\n",
                             g_spurs_ctx.pc);
                     fflush(stderr);
-                    g_spurs_ctx.running = 1;  /* allow background thread to continue */
+                    g_spurs_ctx.running = 1;
                     break;
                 }
                 /* Enable per-instruction trace for the dispatch run (restart=1 in loop).
                  * Note: restart=0 is the initial spu_run; the if-block first fires
                  * at restart=1 (after the 34-insn entry pass hits its first stop 0). */
                 if (restart == 1) {
-                    g_spurs_ctx.trace_limit = 100;
+                    g_spurs_ctx.trace_limit = 200;
                     g_spurs_ctx.trace_count = 0;
-                    fprintf(stderr, "[SPURS] TRACE dispatch run (100 insns)\n");
+                    fprintf(stderr, "[SPURS] TRACE dispatch run (200 insns from brhnz)\n");
                     fflush(stderr);
                 } else {
                     g_spurs_ctx.trace_limit = 0;
