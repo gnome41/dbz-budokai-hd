@@ -86,15 +86,23 @@ static void spurs_run_workload(int slot_idx) {
                 gaddr, g_wl_ctx.pc, gsz);
         fflush(stderr);
     } else {
-        /* Subsequent dispatches: re-run from entry, keeping the loaded LS.
-         * Reset PC to entry (stored in pc at load time — we'd need to save it). */
-        g_wl_ctx.trace_limit = 0;  /* no per-insn trace after first run */
-        /* pc will be set from the ELF entry on each reload; since we reuse
-         * the ctx after the first load, we reset pc to the ELF entry.
-         * For now: just skip subsequent dispatches (focus on slot 0). */
-        fprintf(stderr, "[WL] slot %d: reusing ctx (skipping reload)\n", slot_idx);
-        fflush(stderr);
-        return;
+        /* Subsequent slots: try workload 2 for slots 1+, with same register setup.
+         * Both workload ELFs have the same entry structure (entry=0x3050). */
+        if (!g_wl_ctx_valid) {
+            /* First load already failed, skip */
+            fprintf(stderr, "[WL] slot %d: skipped (first load failed)\n", slot_idx);
+            fflush(stderr);
+            return;
+        }
+        /* Re-initialize ctx for another run of workload 1 from entry.
+         * The LS is already loaded; just reset PC and registers. */
+        if (spu_load_elf(&g_wl_ctx, vm_base + GAME_WORKLOAD_1_GADDR,
+                         GAME_WORKLOAD_1_SIZE) != 0) {
+            fprintf(stderr, "[WL] slot %d: reload failed\n", slot_idx);
+            return;
+        }
+        g_wl_ctx.trace_limit = 0;
+        g_wl_ctx.verbose = 0;  /* quiet for repeated runs */
     }
 
     /* Set up register state for workload 1 (EDGE SPU library).
