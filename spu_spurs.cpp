@@ -97,21 +97,33 @@ static void spurs_run_workload(int slot_idx) {
         return;
     }
 
-    /* Set up minimal register state:
-     * r3 = SPURS management area EA (the synthetic context at 0x70A000)
-     * r0 = return address = sentinel at LS[0x40]
-     * All other registers = 0 (may cause workload to crash, but we'll see) */
-    g_wl_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
-    g_wl_ctx.gpr[0].u32[0] = 0x40;
+    /* Set up register state for workload 1 (EDGE SPU library).
+     *
+     * The workload entry encodes the return address via three rotmai chains
+     * that all write to r0 — whichever runs last wins.  Decoded from the
+     * disassembly (wl1.elf LS[0x30B0..0x30C0]):
+     *   rotmai r0, r88,  511 → r0 = r88 >> 1    (shift=1)
+     *   rotmai r0, r19,  0   → r0 = r19 >> 0    (shift=0, direct copy)
+     *   rotmai r0, r114, 56  → r0 = r114 >> 8   (shift=8)
+     * For all three to give r0=0x40 (our stop-0x100 sentinel): */
+    g_wl_ctx.gpr[3].u32[0]   = SPURS_CTX_EA;  /* SPURS management area EA */
+    g_wl_ctx.gpr[0].u32[0]   = 0x40;           /* initial r0 (overwritten by rotmai) */
+    g_wl_ctx.gpr[88].u32[0]  = 0x80;   /* r88>>1  = 0x40 */
+    g_wl_ctx.gpr[19].u32[0]  = 0x40;   /* r19>>0  = 0x40 */
+    g_wl_ctx.gpr[114].u32[0] = 0x4000; /* r114>>8 = 0x40 */
+    /* Also copy the kernel's return-addr pattern for safety */
+    g_wl_ctx.gpr[86].u32[0] = 0x80;
+    g_wl_ctx.gpr[89].u32[0] = 0x80;
+
+    /* Mechanism: first pass stores r0=0x40 to stack (stqd r0, 0x10(r1)),
+     * then allocates frame (ai r1, r1, -32), issues stop-0x3FFF.
+     * After stop-0x3FFF restart: lqd r0, 0x30(r1_new) = lqd r0, 0x30(r1_old-32)
+     * = reads from r1_old+0x10 = the same location we saved to → r0=0x40.
+     * bi r0 → LS[0x40] = stop-0x100 sentinel → workload returns. */
 
     /* Place stop 0x100 at LS[0x40] as the "workload done" sentinel */
     uint8_t stop100[4] = {0x00, 0x00, 0x01, 0x00};
     memcpy(g_wl_ctx.ls + 0x40, stop100, 4);
-
-    /* Set return address registers used by the kernel's rotmai patterns
-     * (same pattern as spu_spurs.cpp does for the kernel itself). */
-    g_wl_ctx.gpr[86].u32[0] = 0x80;  /* r86 >> 1 = 0x40 */
-    g_wl_ctx.gpr[89].u32[0] = 0x80;  /* r89 >> 1 = 0x40 */
 
     /* Run workload with restart handling (same lifecycle as the SPURS kernel):
      *   stop 0   = yield/wait: restart from current PC
