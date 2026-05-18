@@ -281,10 +281,38 @@ The dispatch path (LS[0x0280]–LS[0x03C0]) executes in three phases:
 5. 20 instructions from 0xD0 → stop-0 at LS[0x20614] (post-dispatch idle)
 6. Burst ends: kernel correctly waiting for workloads to complete
 
-**What's needed to run real workloads:**
-- When burst sees stop-0 at PC=0x04..0x3C: load game SPU ELF (0x142900 or 0x14AE80) into new spu_ctx_t and run it in a thread
-- Workload entry = 0x3050 for both game workload ELFs
-- Workload completion: some signal back to the kernel (specifics TBD)
+**Workload execution (now running for slot 0):**
+`spurs_run_workload()` loads workload 1 (guest 0x142900) on first dispatch signal.
+
+Workload 1 ELF: entry=0x3050, code LS[0x3000-0xB3DF], BSS LS[0xB800-0x3D97F] (200KB+).
+
+Workload lifecycle (63 total instructions):
+1. Entry pass (30 insns, 0x3050-0x30C4): standard SPURS framework init → stop-0
+2. Setup pass (13 insns, 0x30C8-0x30F8):
+   - `ila r4, 0xADD0` (LS destination addr)
+   - `ilh r3, 0x0100` then rotmai → r3=0x1000100 (SPURS service code)
+   - `stop 0x3FFF` ← LV2 task context load request
+3. Post-service (3 insns): branches to LS[0x0000] → executes LS[0x04..0x3C] stop signals
+4. 15×stop-0 at LS[0x04..0x3C]: workload dispatches its OWN 15 sub-workloads
+5. stop-0x100 at LS[0x40]: workload returns
+
+**Multi-level SPURS hierarchy:**
+```
+SPURS kernel (0x10BD00)  → 15 dispatch signals (LS[0x04..0x3C])
+  └── Workload 1 (0x142900)  → stop 0x3FFF (context load r3=0x1000100,r4=0xADD0)
+        └── 15 more dispatch signals (LS[0x04..0x3C])
+              └── Sub-workloads (actual game code, not yet identified)
+```
+
+**stop 0x3FFF = SPURS task context load.** Parameters:
+- r3=0x1000100: task type/encoding (bits[24]=1, bits[8]=1, likely task ID or size)
+- r4=0xADD0: LS address for LV2 to DMA the task's saved context
+
+On real PS3: LV2 finds the task's code/state from the SPURS taskset and DMA's it to LS[0xADD0]. On first run, provides default initial state (the actual game code). Without implementing this, workload jumps to LS[0x0000] and runs through stop-signal sequence (correct "no task available" behavior).
+
+**What's needed for actual game code execution:**
+1. Implement stop 0x3FFF: find the game task code matching r3=0x1000100 and DMA it to LS[0xADD0]
+2. The game task code likely contains the actual rendering/physics SPU programs (not yet found in game binary)
 
 **New opcodes in dispatch code (0x0560 area):**
 - `shlqbi` (0x1DD, RR): shift-left 128-bit quad by (RB&7) bits. Same pattern as rotqbi but without wrap.
