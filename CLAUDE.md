@@ -199,14 +199,58 @@ LS[0x298E0] is in the kernel's BSS (intentional `stop 0`). On real PS3, LV2 woul
 
 **Total verified execution: 2837 instructions** from entry through dispatch check to idle stop.
 
-### What the kernel needs to dispatch work
+### Scan loop algorithm (fully analyzed via disassembly + trace)
 
-The `brhnz r13` at LS[0x03C0] checks if the workload slot number in r13 is valid (< 0x10000). The kernel reads workload descriptors from its LS-internal table (set up in the 0x02B4 loop). For a workload to be dispatched:
-1. The kernel needs a workload registered in the SPURS management area (at SPURS_CTX_EA=0x70A000)
-2. The kernel would DMA this structure into LS (no DMA was issued — the kernel finds nothing to dispatch first)
-3. A valid workload entry would cause r13 to be set to a slot index < 0x10000
+The dispatch path (LS[0x0280]–LS[0x03C0]) executes in three phases:
 
-**Next step for SPU workload dispatch:** Set up valid workload descriptor(s) in the SPURS context at 0x70A000 (CellSpurs structure format). The kernel reads from LS internal tables initialized from this area. Requires reverse-engineering the CellSpurs struct layout.
+**Phase 1 (0x0280–0x0308): Setup**
+- Saves registers, r81=SPURS_CTX_EA (0x70A000), r10=0 (counter)
+- r14=0x1F5B0 (sort order table), r13=0x1F5F0 (priority table / "no workload" sentinel)
+- `ila r13, 0x1F5F0` at 0x0308 — sets r13 as BOTH the priority table base AND the no-workload marker
+
+**Phase 2 (0x030C–0x038C): 64-iteration workload priority sort loop**
+- r10 = 0..63, terminates at `ceqi r9, r10, 64` / `brz r9, 0x310`
+- Each iteration reads from sort table at LS[r10+r14=0x1F5B0] and priority table at LS[r10+r13=0x1F5F0]
+- `stqx r20, r10, r11` builds a sorted dispatch table at LS[r10+r11] (LS[0x0C41C+])
+- r20 = workload ready bitmask (derived from r79/r77 = DMA'd management area data = 0 currently)
+
+**Phase 3 (0x0390–0x03C0): Dispatch check**
+```
+0x0394: rotmahi r12, r79, 239   ; r12 = r79>>17 per halfword (workload found indicator)
+0x03B4: selb r42, r41, r14, r12 ; blend workload IDs using r12 mask
+0x03B8: selb r42, r11, r43, r13 ; blend using r13 mask → r42 = dispatch target
+0x03BC: brhnz r12, 0x298D0      ; if r12.high≠0 → idle (stop 0)
+0x03C0: brhnz r13, 0x298E0      ; if r13.high≠0 → idle (stop 0)  ← ALWAYS taken
+0x03C4+: dispatch workload r42  ; only reached when both r12.high=0 AND r13.high=0
+```
+
+**Why dispatch never happens (currently):**
+- r79 = 0 (no DMA from management area — kernel never issues MFC DMA commands)
+- r13 = 0x1F5F0 (set by `ila`, never updated to a workload ID because r79=0)
+- r13.u32[0] >> 16 = 1 ≠ 0 → `brhnz r13, 0x298E0` always branches to idle
+
+**Root cause:** The kernel waits for a PPU mailbox signal (`rdch CH_SPU_RdInMbox`). LV2 would:
+1. Receive the stop-0 exception at LS[0x298E0]
+2. Check PPU signal queue → find pending workload → restart kernel with r79/r77 populated
+3. On restart, r79 ≠ 0 → sort loop finds workload → dispatch
+
+**What's needed for SPU dispatch:**
+1. `cellSpursAddWorkload` HLE populates CellSpurs struct at 0x70A000 with descriptors
+2. PPU signals kernel: `ctx->inbound_mbox = info; ctx->inbound_mbox_count = 1;`
+3. Kernel restarts with management area data → r79/r77 populated → workload dispatched
+
+### LS data structures (from analysis)
+| LS Address | Contents |
+|---|---|
+| `0x1F5B0..0x1F5EF` | Sort order permutation table (64 bytes, values 0x00–0x3F) |
+| `0x1F5F0..0x1F62F` | Priority lookup table (values 0x08–0x53) |
+| `0x1F630..0x1F64F` | Shift-mask table (0xFFFF, 0x7FFF, ..., 0x0001) |
+| `0x0C41C..0x0C45B` | Sorted dispatch table built by sort loop (64 workload slots) |
+
+### All UNIMPL instructions resolved
+- `rotqbii` (op11=0x1D4): now implemented ✓  
+- `xswd` (op11=0x2AE), `fscrrd/zeroes-RT` (op11=0x2B6): already implemented ✓  
+- No UNIMPL messages in kernel scan loop execution.
 
 ## Game-Specific Patches (in `main.cpp`)
 

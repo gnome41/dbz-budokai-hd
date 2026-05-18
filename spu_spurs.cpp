@@ -83,7 +83,7 @@ extern "C" void spurs_start(void) {
 
     spu_ctx_init(&g_spurs_ctx, 0, vm_base);
 
-    /* Verbose: log DMA ops + channel reads. Trace: first 50 insns to confirm dispatch. */
+    /* Verbose: log DMA + channel ops.  Trace: first 50 insns only (entry path). */
     g_spurs_ctx.verbose = 1;
     g_spurs_ctx.trace_limit = 50;
     g_spurs_ctx.trace_count = 0;
@@ -222,11 +222,13 @@ extern "C" void spurs_start(void) {
                     g_spurs_ctx.running = 1;  /* allow background thread to continue */
                     break;
                 }
-                /* Enable per-instruction trace for restarts 1 and 2 */
-                if (restart == 0) {
-                    g_spurs_ctx.trace_limit = 50;
+                /* Enable per-instruction trace for the dispatch run (restart=1 in loop).
+                 * Note: restart=0 is the initial spu_run; the if-block first fires
+                 * at restart=1 (after the 34-insn entry pass hits its first stop 0). */
+                if (restart == 1) {
+                    g_spurs_ctx.trace_limit = 100;
                     g_spurs_ctx.trace_count = 0;
-                    fprintf(stderr, "[SPURS] TRACE restart 1 (50 insns)\n");
+                    fprintf(stderr, "[SPURS] TRACE dispatch run (100 insns)\n");
                     fflush(stderr);
                 } else {
                     g_spurs_ctx.trace_limit = 0;
