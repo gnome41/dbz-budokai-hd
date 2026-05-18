@@ -269,12 +269,14 @@ void spu_step(spu_ctx_t *ctx) {
     /* Optional per-instruction trace */
     if (ctx->trace_limit && ctx->trace_count < ctx->trace_limit) {
         ctx->trace_count++;
-        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=%X r2=%X r3=%X r4=%X r11=%X r13=%X\n",
+        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=%X r2=%X r3=%X r4=%X r8=%X r9=%X r10=%X r11=%X r13=%X r14=%X\n",
                 ctx->id, (unsigned long long)ctx->trace_count,
                 pc, insn,
                 ctx->gpr[0].u32[0], ctx->gpr[2].u32[0],
                 ctx->gpr[3].u32[0], ctx->gpr[4].u32[0],
-                ctx->gpr[11].u32[0], ctx->gpr[13].u32[0]);
+                ctx->gpr[8].u32[0], ctx->gpr[9].u32[0],
+                ctx->gpr[10].u32[0], ctx->gpr[11].u32[0],
+                ctx->gpr[13].u32[0], ctx->gpr[14].u32[0]);
         fflush(stderr);
     }
 
