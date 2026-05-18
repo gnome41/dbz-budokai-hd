@@ -228,11 +228,11 @@ extern "C" void spurs_start(void) {
                         restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0],
                         g_spurs_ctx.gpr[4].u32[0]);
                 fflush(stderr);
-                /* End burst if kernel idles in BSS area (>0x20560 = past kernel ELF).
-                 * With brhnz r13 patched, the kernel may now reach new code;
-                 * stop only if it goes above 0x29000 (deep BSS). */
-                if (g_spurs_ctx.pc >= 0x29000u) {
-                    fprintf(stderr, "[SPURS] kernel deep-idle at PC=0x%X — ending burst\n",
+                /* End burst when kernel idles in BSS/data regions past the code section.
+                 * 0x298E0: old "no workload" idle; 0x20600+: new "wait for completion" idle.
+                 * Stop the burst at either, so we don't burn restarts on sequential stops. */
+                if (g_spurs_ctx.pc >= 0x29000u || g_spurs_ctx.pc >= 0x20600u) {
+                    fprintf(stderr, "[SPURS] kernel post-dispatch idle at PC=0x%X — ending burst\n",
                             g_spurs_ctx.pc);
                     fflush(stderr);
                     g_spurs_ctx.running = 1;
