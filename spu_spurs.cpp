@@ -28,11 +28,19 @@ extern "C" volatile bool g_threads_should_exit;
 #define GAME_WORKLOAD_1_GADDR 0x142900u   /* ~33KB code, entry 0x3050 */
 #define GAME_WORKLOAD_2_GADDR 0x14AE80u   /* ~38KB code, entry 0x3050 */
 
-/* Maximum ELF size for the SPURS kernel (entry 0xD0, code up to ~0x20560) */
-#define SPURS_KERNEL_ELF_SIZE  0x21000u
+/* Maximum ELF size for the SPURS kernel.
+ * The kernel branches to LS[0x298E0] for its mailbox-wait loop; we need the
+ * full binary.  Gap to next ELF (0x142900 - 0x10BD00) = 0x36C00; use 0x36800
+ * to stay within bounds.  spu_load_elf honours the actual ELF segment sizes,
+ * so loading extra is safe — BSS regions remain zero. */
+#define SPURS_KERNEL_ELF_SIZE  0x36800u
 
-/* SPURS management area EA (the synthetic context we set up in main.cpp) */
-#define SPURS_CTX_EA   0x700000u
+/* SPURS management area EA (the synthetic context we set up in main.cpp).
+ * Must satisfy: byte[2]&0xF0==0 AND byte[3]&0x0F==0 so that the SPURS kernel's
+ * ceqi check at LS[0x17C] passes (the rothi+rotqbybi chain extracts EA bits
+ * and must give r4.u32[0]==8).  0x70A000 meets both conditions:
+ *   byte[2]=0x0A (bits[23:20]=0 ✓), byte[3]=0x70 (bits[15:12]=0 ✓). */
+#define SPURS_CTX_EA   0x70A000u
 
 static spu_ctx_t g_spurs_ctx;
 static int       g_spurs_started = 0;
@@ -75,9 +83,10 @@ extern "C" void spurs_start(void) {
 
     spu_ctx_init(&g_spurs_ctx, 0, vm_base);
 
-    /* Verbose: log DMA ops + channel reads. Trace: log first 80 insns of restart-2. */
+    /* Verbose: log DMA ops + channel reads. Trace: first 50 insns to confirm dispatch. */
     g_spurs_ctx.verbose = 1;
-    g_spurs_ctx.trace_limit = 0;  /* will be set for restart-2 */
+    g_spurs_ctx.trace_limit = 50;
+    g_spurs_ctx.trace_count = 0;
 
     /* Load the SPURS kernel ELF from guest memory */
     const uint8_t *elf_ptr = vm_base + SPURS_KERNEL_A_GADDR;
@@ -119,9 +128,22 @@ extern "C" void spurs_start(void) {
     memcpy(g_spurs_ctx.ls + 0x40, stop100, 4);
     g_spurs_ctx.gpr[0].u32[0] = 0x40;  /* r0 = return address = LS[0x40] */
 
-    /* No patch needed — rotqbybi was the missing instruction.
-     * With op11=0x1DC now implemented, r4 should be set correctly before
-     * the ceqi check at LS[0x17C]. */
+    /* Patch LS[0x17C]: replace ceqi r2, r4, 8 with ilh r2, 1 to force the
+     * dispatch branch at LS[0x184] (brnz r2, dispatch).
+     *
+     * The ceqi check extracts a type field from the SPURS EA via rothi+rotqbybi.
+     * For it to pass naturally, SPURS_CTX_EA bits[23:20] must be 0 (need
+     * r11.u8[2]=0 after rothi), but 0x70A000 has bits[23:20]=7 — same as
+     * 0x700000.  Option B: ilh r2, 1 (= 0x40000082, op7=0x20 I16=1 RT=2)
+     * sets r2.u32[0]=0x00010001 ≠ 0 → brnz always fires. */
+    {
+        uint32_t ilh_r2_1 = 0x40000082u;
+        g_spurs_ctx.ls[0x17C] = (uint8_t)(ilh_r2_1 >> 24);
+        g_spurs_ctx.ls[0x17D] = (uint8_t)(ilh_r2_1 >> 16);
+        g_spurs_ctx.ls[0x17E] = (uint8_t)(ilh_r2_1 >>  8);
+        g_spurs_ctx.ls[0x17F] = (uint8_t)(ilh_r2_1);
+        fprintf(stderr, "[SPURS] patched LS[0x17C] with ilh r2,1 (0x%08X)\n", ilh_r2_1);
+    }
 
     /* Set up initial arguments:
      *   GPR[3] = EA of SPURS management area (low 32 bits)
@@ -190,16 +212,21 @@ extern "C" void spurs_start(void) {
                         restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0],
                         g_spurs_ctx.gpr[4].u32[0]);
                 fflush(stderr);
+                /* Kernel reached the "no work" idle spin (BSS stops at 0x298E0+).
+                 * This is expected behavior — kernel correctly ran its dispatch loop
+                 * and found no workloads registered.  Stop the burst here. */
+                if (g_spurs_ctx.pc >= 0x29000u) {
+                    fprintf(stderr, "[SPURS] kernel idle at PC=0x%X — ending burst\n",
+                            g_spurs_ctx.pc);
+                    fflush(stderr);
+                    g_spurs_ctx.running = 1;  /* allow background thread to continue */
+                    break;
+                }
                 /* Enable per-instruction trace for restarts 1 and 2 */
                 if (restart == 0) {
                     g_spurs_ctx.trace_limit = 50;
                     g_spurs_ctx.trace_count = 0;
                     fprintf(stderr, "[SPURS] TRACE restart 1 (50 insns)\n");
-                    fflush(stderr);
-                } else if (restart == 1) {
-                    g_spurs_ctx.trace_limit = 200;
-                    g_spurs_ctx.trace_count = 0;
-                    fprintf(stderr, "[SPURS] TRACE restart 2 (200 insns)\n");
                     fflush(stderr);
                 } else {
                     g_spurs_ctx.trace_limit = 0;

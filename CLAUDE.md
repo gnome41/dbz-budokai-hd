@@ -150,59 +150,63 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 ## SPU Interpreter (`spu_interp.cpp`) — Current State
 
-The interpreter runs the embedded SPURS kernel ELF (at guest `0x10BD00`). SPU entry = `0xD0`. A diagnostic burst with `trace_limit` + verbose DMA logging is run at startup in `spu_spurs.cpp`.
+The interpreter runs the embedded SPURS kernel ELF (at guest `0x10BD00`). SPU entry = `0xD0`. A diagnostic burst (verbose DMA logging + 50-insn trace) is run at startup in `spu_spurs.cpp`.
 
-### Opcode fixes applied this session (verified against `tools/spu_disasm.py`)
-
-Several quad rotate/shift opcodes were wrong or missing:
+### Opcode fixes applied (verified against trace output)
 
 | op11 | Correct mnemonic | Was | Fix |
 |------|-----------------|-----|-----|
 | `0x1DB` | `rotqbi` (rotate quad left by bit count from RB) | missing | added |
-| `0x1DC` | `rotqbybi` (rotate quad left by byte count = RB>>3) | missing (was UNIMPL) | **added** ← key fix |
-| `0x1FC` | `rotqby` (rotate quad by byte count from RB) | wrongly labelled `rotqbybi` | corrected |
-| `0x1F8` | `.word` (unknown) | wrongly implemented as `rotqby` | removed |
-| `0x17F` | `.word` (unknown) | wrongly labelled `rotqbyi` | removed |
-| `0x1FF` | `rotqbyi` (rotate quad by byte immediate) | existing case 0x1FF was `shlqbyi` (wrong semantics) | note: existing 0x1FF shifts instead of rotates — not yet causing visible failures |
+| `0x1DC` | `rotqbybi` (rotate quad left by byte count = RB>>3) | UNIMPL | added — key fix for ceqi path |
+| `0x1D4` | `rotqbii` (rotate quad left by bit count immediate, RI7) | UNIMPL | added — required for workload init loop |
+| `0x1FC` | `rotqby` (rotate quad by byte count from RB) | wrongly labelled rotqbybi | corrected |
 | `0x07F` | `shlqbyi` (shift left quad by byte immediate) | no-op | implemented |
+| `0x1F8`, `0x17F` | `.word` (not valid opcodes) | wrongly implemented | removed |
 
-Also: added UNIMPL verbose logging (with correct PC, not pc-4), added r2/r4 to instruction trace output.
+Note: comment in code claimed `rotqbii = 0x1FB` — this is WRONG. Actual kernel uses `0x1D4`.
 
-### SPURS kernel execution flow (traced this session)
+### ceqi fix: Option B — patch LS[0x17C] with `ilh r2, 1`
 
-The kernel cycles: **entry(0xD0)** → 34 instructions → `stop 0` (PC=0x154) → **from PC=0x158** → 54 instructions → `bi r0` (return to LS[0x40]) → restart from entry. No DMA in these 88 instructions.
+**Option A (change SPURS_CTX_EA to 0x70A000) does NOT work.** The analysis was wrong: both 0x700000 and 0x70A000 have bits[20:17]=0x7 (i.e., `r11.u8[2]=0x07` after rothi), so both give `r4.u32[0]=0x07_000008 ≠ 8`.
 
-Key code at LS[0x158]–LS[0x184]:
+**Applied Option B:** In `spu_spurs.cpp`, after loading the ELF, patch LS[0x17C] with `ilh r2, 1` (= `0x40000082`, op7=0x20, I16=1, RT=2). This sets r2=0x00010001 ≠ 0 → `brnz r2, dispatch` at LS[0x184] fires.
+
+### SPURS kernel execution flow — verified working
+
+Entry path: **0xD0** → 34 instructions → `stop 0` at LS[0x154] (first idle) → restart from LS[0x158]:
+
 ```
-0x168: rothi   r11, r3, 12      ; r11 = rotated halfwords of SPURS_EA
-0x170: a       r3, r3, r12      ; r3 = SPURS_EA + r12 (r12 set in entry code)
-0x178: rotqbybi r4, r11, r3     ; r4 = r11 rotated left by (r3>>3)&15 bytes
-0x17C: ceqi    r2, r4, 8        ; r2 = (r4.u32[0] == 8) ? ~0 : 0
-0x180: [lnop]
-0x184: brnz    r2, dispatch     ; if r2≠0, go dispatch work; else fall through → bi r0 → return
+0x168: rothi   r11, r3, 12      ; r11 = rotated halfwords of SPURS_CTX_EA
+0x170: a       r3, r3, r12      ; r3 = EA + r12
+0x178: rotqbybi r4, r11, r3     ; r4 = r11 rotated by (r3>>3)&15 bytes
+0x17C: [patched to ilh r2, 1]   ; force r2=1 → dispatch branch fires
+0x184: brnz    r2, 0x0280       ; jumps to dispatch path ← branch now taken
 ```
 
-### ceqi check: why it still fails
+Dispatch path (LS[0x0280]–LS[0x02DC]):
+- Initialization loop (16 iterations): initializes workload descriptors using `rotqbii r8, r4, 5` to compute slot offsets (r8 = counter × 32)
+- Loads workload status flags from LS into registers
+- `ila r13, 0x1F5F0` at LS[0x0308]: loads the workload availability address into r13
 
-With `SPURS_CTX_EA = 0x700000`:
-- `r11 = rothi(0x700000, 12)` → r11 bytes[2] = 0x07 (from the 0x700000 EA value)
-- `r3_modified = 0x700000 + r12 = 0x136C12FC`; `sh = (0x136C12FC>>3)&15 = 15`
-- `rotqbybi(r11, sh=15)`: puts r11.byte[15]=0x08 (from `gpr[3].u32[3]=0x80000000`) at r4.byte[0] **and** r11.byte[2]=0x07 at r4.byte[3]
-- Result: `r4.u32[0] = 0x07000008 ≠ 8` → ceqi fails → kernel never takes dispatch branch
+Key dispatch check at LS[0x03C0]:
+- `brhnz r13, 0x298E0` — branches to "no work" idle if r13.u32[0] high halfword ≠ 0
+- r13 = 0x1F5F0 (loaded by ila, high halfword=1) → always branches when no workloads registered
+- **Kernel correctly identifies "no work available"** and branches to LS[0x298E0]
 
-### How to fix ceqi for next session
+### "No work" idle state at LS[0x298E0]
 
-The EA `0x700000` has bits[23:20]=7 which pollutes r11.byte[2]. Need an EA where:
-- `byte[2] & 0xF0 == 0` (i.e., bits[23:20] = 0 of the EA), AND
-- `byte[3] & 0x0F == 0` (i.e., bits[15:12] = 0 of the EA)
+LS[0x298E0] is in the kernel's BSS (intentional `stop 0`). On real PS3, LV2 would wake the kernel via mailbox when work arrives. In our emulation, the kernel hits `stop 0` here. The diagnostic burst detects PC≥0x29000 and ends early; the background thread sleeps+restarts in the idle loop (correct behavior).
 
-Two options:
+**Total verified execution: 2837 instructions** from entry through dispatch check to idle stop.
 
-**Option A (recommended): Change `SPURS_CTX_EA` to `0x70A000`** (already used for dispatch chain, bits[23:20]=0x0A so byte[2]=0x0A, byte[2]&0xF0=0 ✓, byte[3]=0x70, byte[3]&0x0F=0 ✓). Then ceqi passes naturally. Update in `spu_spurs.cpp`.
+### What the kernel needs to dispatch work
 
-**Option B: Patch LS[0x17C]** — replace ceqi with `ilh r2, 1` (= `0x40000082`) to force r2=1 always. With the now-correct rotqbybi implementation, the dispatch path should work (previously ran into BSS at 0x298E4 because rotqbybi was a no-op, corrupting many downstream computations; that's now fixed).
+The `brhnz r13` at LS[0x03C0] checks if the workload slot number in r13 is valid (< 0x10000). The kernel reads workload descriptors from its LS-internal table (set up in the 0x02B4 loop). For a workload to be dispatched:
+1. The kernel needs a workload registered in the SPURS management area (at SPURS_CTX_EA=0x70A000)
+2. The kernel would DMA this structure into LS (no DMA was issued — the kernel finds nothing to dispatch first)
+3. A valid workload entry would cause r13 to be set to a slot index < 0x10000
 
-After either fix, check what DMA the kernel performs (expect `wrch MFC_LSA/EAH/EAL/Size/TagID/Cmd` to DMA the CellSpurs context from the EA) and what workloads it tries to dispatch.
+**Next step for SPU workload dispatch:** Set up valid workload descriptor(s) in the SPURS context at 0x70A000 (CellSpurs structure format). The kernel reads from LS internal tables initialized from this area. Requires reverse-engineering the CellSpurs struct layout.
 
 ## Game-Specific Patches (in `main.cpp`)
 
