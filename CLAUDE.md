@@ -142,9 +142,18 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
 **Outstanding questions for the next iteration:**
-- RSX command buffer parsing: game writes NV4097 commands to the RSX FIFO; parse them and blit to `g_framebuf` (1280×720 BGRA in main.cpp) for visible output in the Win32 window
+- **SPU/SPURS workload dispatch** — the next major milestone. The SPURS kernel correctly reaches idle (2837 instructions) and awaits a PPU mailbox signal. To dispatch a workload: (1) implement `cellSpursAddWorkload` HLE to populate CellSpurs management area at 0x70A000 with descriptors; (2) send `ctx->inbound_mbox` + `ctx->inbound_mbox_count=1` to wake the kernel; (3) the kernel will DMA the management area, find a ready workload slot (r13 < 0x10000), and dispatch. See CLAUDE.md §SPU Interpreter section for the full algorithm.
+- **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`). However: investigation revealed the game writes **zero NV4097 rendering commands** during init. PUT=0x43 is RSX FIFO initialization, not actual draw calls. The game's rendering is entirely SPURS/SPU-driven. Visible graphics requires SPURS workloads running first. The RSX parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94) for when real commands eventually arrive.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
-- SPU/SPURS emulation for the actual game loop (long-term; the game's rendering and logic run on SPUs)
+
+### RSX command buffer infrastructure (`runtime_glue.cpp`)
+The RSX FIFO parser (`rsx_process_fifo`) fires on every PUT register write (guest addr 0x10). Parsed registers:
+- `0x1820` NV4097_SET_COLOR_CLEAR_VALUE → stores RGBA8 clear color
+- `0x1D94` NV4097_CLEAR_SURFACE → fills g_framebuf with clear color and calls rsx_present_frame()
+
+The parser tracks RSX IO GET position (g_rsx_get_ea), converts RSX IO offsets to guest EAs via `rsx_io_to_ea()` (small offsets < 0x1000000 map to CMD_BUF=0xD0100000+offset). The GCM command buffer (CMD_BUF=0xD0100000, 1MB) is committed in the guest RSX IO-mapped region.
+
+GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158 → 0x70E000): fields set at BOTH possible layouts (+0x00/+0x04 current/begin AND +0x08/+0x0C current/begin) so either cellGcm version works. End pointer at +0x10 = 0xD01FFFFC. IO size at +0x18, flags at +0x1C.
 - Identify the 26 sysPrxForUser NIDs imported by this ELF
 - New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented
 
