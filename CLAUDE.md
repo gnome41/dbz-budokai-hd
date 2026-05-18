@@ -310,9 +310,18 @@ SPURS kernel (0x10BD00)  → 15 dispatch signals (LS[0x04..0x3C])
 
 On real PS3: LV2 finds the task's code/state from the SPURS taskset and DMA's it to LS[0xADD0]. On first run, provides default initial state (the actual game code). Without implementing this, workload jumps to LS[0x0000] and runs through stop-signal sequence (correct "no task available" behavior).
 
-**What's needed for actual game code execution:**
-1. Implement stop 0x3FFF: find the game task code matching r3=0x1000100 and DMA it to LS[0xADD0]
-2. The game task code likely contains the actual rendering/physics SPU programs (not yet found in game binary)
+**Identity of workload 1 (0x142900): Sony EDGE SPU library**
+LS[0xADD0] contains: `"EDGE ASSERTION FAILURE: %s(%d)\n"` — confirms this is Sony SCEE's EDGE library, a graphics/geometry processing SPU framework used by many PS3 games.
+
+**stop 0x3FFF = EDGE task scheduler callback.** When EDGE's SPU scheduler calls stop 0x3FFF:
+- r3=0x01000100: EDGE function/task code (0x0100 = some EDGE task ID)
+- r4=0xADD0: LS context address (points to the assertion string = an EDGE internal table entry)
+On real PS3: EDGE's PPU-side task manager handles this, loading the next EDGE sub-task into LS.
+
+**What's needed for actual game rendering:**
+Implementing EDGE's PPU-side task manager for the stop 0x3FFF callback. EDGE's task system dispatches geometry processing, decompression, and rendering sub-tasks. This is a complex library reimplementation. Without it, EDGE runs through its "no task" exit path (dispatching empty sub-task signals and returning).
+
+Workload 2 (0x14AE80) is likely also EDGE-related (same entry structure).
 
 **New opcodes in dispatch code (0x0560 area):**
 - `shlqbi` (0x1DD, RR): shift-left 128-bit quad by (RB&7) bits. Same pattern as rotqbi but without wrap.
