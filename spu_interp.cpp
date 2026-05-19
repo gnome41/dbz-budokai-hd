@@ -34,6 +34,9 @@
 # define sqrtf_impl __builtin_sqrtf
 #endif
 
+/* Forward-declare RSX edge-write notifier from runtime_glue.cpp */
+extern "C" void rsx_on_edge_write(uint32_t put_end_ea);
+
 /* --------------------------------------------------------------------------
  * Helpers
  * -------------------------------------------------------------------------- */
@@ -146,6 +149,9 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
                         ctx->id, ea32, lsa, sz, ctx->mfc_tag);
             if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
                 memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
+            /* Notify RSX parser when EDGE writes into the RSX IO-mapped region */
+            if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u)
+                rsx_on_edge_write(ea32 + sz);
             break;
         default:
             break;

@@ -169,14 +169,59 @@ static void spurs_run_workload(int slot_idx) {
                 fprintf(stderr, "[WL] slot %d: workload returned (stop 0x100)\n", slot_idx);
                 break;
             } else if (wcode == 0x3FFF) {
-                /* SPURS LV2 service trap — restart from next PC to explore further */
-                fprintf(stderr, "[WL] slot %d: SPURS svc trap 0x3FFF at PC=0x%X r3=0x%X r4=0x%X (continuing)\n",
-                        slot_idx, g_wl_ctx.pc,
-                        g_wl_ctx.gpr[3].u32[0], g_wl_ctx.gpr[4].u32[0]);
-                fflush(stderr);
+                uint32_t cur_pc = g_wl_ctx.pc;
+
+                if (cur_pc >= 0x3100u) {
+                    /* stop 0x3FFF from inside the geometry processor (batch complete).
+                     * On real PS3, EDGE PPU task manager handles this and either provides
+                     * the next batch or signals all work done.  For now: no more data
+                     * available — treat as workload done. */
+                    fprintf(stderr, "[WL] slot %d: EDGE geometry batch done"
+                            " (stop 0x3FFF at PC=0x%X) ran=%u insns\n",
+                            slot_idx, cur_pc, ran);
+                    fflush(stderr);
+                    break;
+                }
+
+                /* EDGE scheduler stop 0x3FFF: r4 = LS destination for task context.
+                 * Write a synthetic task descriptor at LS[r4] and jump to the geometry
+                 * processor at LS[0x3108] so it runs during each SPURS dispatch cycle. */
+                uint32_t desc_ls = g_wl_ctx.gpr[4].u32[0];  /* = 0xADD0 */
+                uint32_t src_ea  = 0x70A000u;   /* synthetic source EA (SPURS ctx area) */
+                uint32_t out_ea  = 0xD0100000u; /* RSX IO command buffer — geometry output */
+
+                /* 16-byte task descriptor (big-endian words):
+                 *   word 0 (+0x00): flags / task type
+                 *   word 1 (+0x04): source geometry EA (MFC GET address)
+                 *   word 2 (+0x08): output buffer EA   (MFC PUT address for RSX cmds)
+                 *   word 3 (+0x0C): batch size / padding */
+                auto be32 = [&](uint32_t off, uint32_t v) {
+                    g_wl_ctx.ls[off+0] = (uint8_t)(v>>24);
+                    g_wl_ctx.ls[off+1] = (uint8_t)(v>>16);
+                    g_wl_ctx.ls[off+2] = (uint8_t)(v>> 8);
+                    g_wl_ctx.ls[off+3] = (uint8_t)(v);
+                };
+                be32(desc_ls+ 0, 0u);
+                be32(desc_ls+ 4, src_ea);
+                be32(desc_ls+ 8, out_ea);
+                be32(desc_ls+12, 0u);
+
+                /* Redirect to geometry processor entry */
+                g_wl_ctx.gpr[3].u32[0]  = desc_ls;
+                g_wl_ctx.gpr[87].u32[0] = desc_ls;  /* ori r87, r3, 0 at 0x310C */
+                g_wl_ctx.pc      = 0x3108;
                 g_wl_ctx.running = 1;
-                g_wl_ctx.trace_limit = 30;
-                g_wl_ctx.trace_count = 0;
+
+                /* Enable verbose DMA trace on first dispatch to capture output addresses */
+                if (slot_idx == 0) {
+                    g_wl_ctx.verbose     = 1;
+                    g_wl_ctx.trace_limit = 100;
+                    g_wl_ctx.trace_count = 0;
+                    fprintf(stderr, "[WL] slot %d: EDGE svc 0x3FFF (sched PC=0x%X)"
+                            " → geometry proc desc_ls=0x%X src_ea=0x%X out_ea=0x%X\n",
+                            slot_idx, cur_pc, desc_ls, src_ea, out_ea);
+                    fflush(stderr);
+                }
             } else {
                 fprintf(stderr, "[WL] slot %d: stop=0x%X at PC=0x%X\n", slot_idx, wcode, g_wl_ctx.pc);
                 break;
