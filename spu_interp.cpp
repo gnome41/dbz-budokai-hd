@@ -316,6 +316,9 @@ static spu_reg_t do_shufb(const spu_reg_t *a, const spu_reg_t *b, const spu_reg_
  * -------------------------------------------------------------------------- */
 void spu_step(spu_ctx_t *ctx) {
     uint32_t pc = ctx->pc & (SPU_LS_SIZE - 1);
+
+    /* (Change detectors removed after analysis — see CLAUDE.md for findings.) */
+
     uint32_t insn = ls_read32(ctx, pc);
     ctx->pc = (pc + 4) & (SPU_LS_SIZE - 1);
 
