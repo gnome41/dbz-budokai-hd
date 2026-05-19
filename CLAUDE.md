@@ -39,9 +39,11 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 | File | Purpose |
 |---|---|
 | `main.cpp` | Reserves 4 GB guest VA, loads ELF segments, patches pool-manager sentinels + game-context stub, calls `func_0003B328` (`_start`) then `func_0003B244` (two-step entry); defines `DRAIN_TRAMPOLINE` macro |
-| `runtime_glue.cpp` | `vm_base` + `vm_read*/vm_write*` (big-endian, 32-bit truncated addresses); `lv2_syscall` dispatcher; `ps3_indirect_call` for CTR indirect branches |
+| `runtime_glue.cpp` | `vm_base` + `vm_read*/vm_write*` (big-endian, 32-bit truncated addresses); `lv2_syscall` dispatcher; `ps3_indirect_call` for CTR indirect branches; RSX FIFO parser (`rsx_process_fifo`) |
 | `extra_funcs.cpp` | Hand-lifted PPU functions missed by the lifter (ctors/dtors reached only via indirect calls); same `void func_XXXXXXXX(ppu_context*)` signature |
 | `stubs.cpp` | Reference template for NID overrides/module hooks — not compiled; kept as documentation |
+| `spu_interp.cpp` | SPU instruction interpreter — all opcodes for SPURS kernel + EDGE geometry processor, including lqx (0x1FD), orx (0x3F8), shlqbi (0x1DD), shlqbybi (0x1DF) |
+| `spu_spurs.cpp` | SPURS/SPU orchestration: loads kernel ELF, patches LS, runs SPU burst loop, dispatches EDGE workloads, `spurs_test_edge_geometry()` diagnostic |
 | `recompiled/ppu_recomp.cpp` | **Auto-generated base** — but does receive targeted manual patches (e.g. `bcctrl` trampoline fixups, guard insertions). Document any manual edits clearly with comments. |
 | `recompiled/ppu_recomp.h` | **Auto-generated** — declares `ppu_context`, memory helpers, all `func_XXXXXXXX` prototypes |
 | `config.toml` | Lifter config: input ELF path, output dir, HLE/LLE module choices, memory/threading/graphics/audio settings |
@@ -142,8 +144,8 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
 **Outstanding questions for the next iteration:**
-- **SPU workload execution** — the SPURS kernel now dispatches 15 workload slots via stop-0 signals at LS[0x04..0x3C] and reaches the "wait for completion" idle at LS[0x20614] (2980 total instructions). The next step: intercept the dispatch signals (stop-0 at LS[0x04..0x3C] in the burst loop) and actually run the game's SPU workload ELFs (at 0x142900 and 0x14AE80) in new spu_ctx_t threads. This requires understanding the workload → kernel interface (registers, LS layout at completion).
-- **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`). However: investigation revealed the game writes **zero NV4097 rendering commands** during init. PUT=0x43 is RSX FIFO initialization, not actual draw calls. The game's rendering is entirely SPURS/SPU-driven. Visible graphics requires SPURS workloads running first. The RSX parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94) for when real commands eventually arrive.
+- **Real EDGE geometry data** — EDGE DMA is confirmed working (8427+ MFC reads with synthetic descriptor). Bottleneck: providing a real EDGE task descriptor when stop 0x3FFF fires. Load a descriptor to LS[0xADD0+] pointing to actual game geometry EAs. The geometry processor at LS[0x3108] is ready to receive it and will produce RSX vertex commands.
+- **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`). Investigation confirmed the game writes **zero NV4097 rendering commands** during PPU init — rendering is entirely SPURS/SPU-driven. Visible geometry requires EDGE to produce RSX vertex commands first. Parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94) for when real commands arrive.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
 ### RSX command buffer infrastructure (`runtime_glue.cpp`)
@@ -171,6 +173,10 @@ The interpreter runs the embedded SPURS kernel ELF (at guest `0x10BD00`). SPU en
 | `0x1FC` | `rotqby` (rotate quad by byte count from RB) | wrongly labelled rotqbybi | corrected |
 | `0x07F` | `shlqbyi` (shift left quad by byte immediate) | no-op | implemented |
 | `0x1F8`, `0x17F` | `.word` (not valid opcodes) | wrongly implemented | removed |
+| `0x1DD` | `shlqbi` (shift left quad by RB[2:0] bits) | UNIMPL | added — SPURS dispatch code 0x0560 |
+| `0x1DF` | `shlqbybi` (shift left quad by (RB>>3)&15 bytes) | UNIMPL | added — SPURS dispatch code 0x0574 |
+| `0x1FD` | `lqx` variant (load quad indexed: LS[(RA+RB)&~15]→RT) | UNIMPL | added — EDGE geometry; key fix for DMA (without it MFC_EAL=0) |
+| `0x3F8` | `orx` variant (OR across 4 words of RA into RT.u32[0]) | UNIMPL | added — EDGE geometry result accumulation |
 
 Note: comment in code claimed `rotqbii = 0x1FB` — this is WRONG. Actual kernel uses `0x1D4`.
 
@@ -256,12 +262,14 @@ The dispatch path (LS[0x0280]–LS[0x03C0]) executes in three phases:
 | `0x1F630..0x1F64F` | Shift-mask table (0xFFFF, 0x7FFF, ..., 0x0001) |
 | `0x0C41C..0x0C45B` | Sorted dispatch table built by sort loop (64 workload slots) |
 
-### All UNIMPL instructions resolved (through dispatch path)
+### All UNIMPL instructions resolved (SPURS dispatch + EDGE geometry)
 | op11 | Instruction | Notes |
 |------|-------------|-------|
-| `0x1D4` | `rotqbii` (RI7, immediate bit count) | Needed for workload init loop |
-| `0x1DD` | `shlqbi` (RR, shift-left quad by RB[2:0] bits) | Needed in dispatch code 0x0560 |
-| `0x1DF` | `shlqbybi` (RR, shift-left quad by (RB>>3)&15 bytes) | Needed in dispatch code 0x0574 |
+| `0x1D4` | `rotqbii` (RI7, immediate bit count) | SPURS workload init loop |
+| `0x1DD` | `shlqbi` (RR, shift-left quad by RB[2:0] bits) | SPURS dispatch code 0x0560 |
+| `0x1DF` | `shlqbybi` (RR, shift-left quad by (RB>>3)&15 bytes) | SPURS dispatch code 0x0574 |
+| `0x1FD` | `lqx` variant (load quad indexed: `LS[(RA+RB)&~15] → RT`) | EDGE geometry processor — loads task descriptor; key fix for DMA |
+| `0x3F8` | `orx` variant (OR across 4 words of RA into RT.u32[0]) | EDGE geometry processor result accumulation |
 | `0x2AE` | `xswd` (extend sign word to doubleword) | Already implemented |
 | `0x2B6` | `fscrrd` (returns 0 for RT) | Already implemented |
 
@@ -331,18 +339,31 @@ This function reads r3 = EDGE task descriptor (geometry data EAs, output buffer,
 **All 15 workload slots** now run 47 instructions each (EDGE "no task" path).
 Total: SPURS kernel (2980) + 15 × EDGE (47 each = 705) = ~3685 SPU insns/cycle.
 
+**EDGE DMA confirmed working (`spurs_test_edge_geometry` in `spu_spurs.cpp`):**
+Calling the geometry processor at LS[0x3108] directly with a synthetic task descriptor produces **8427+ MFC DMA reads** (64 bytes each from 0xA07000) per 500K-instruction run. The processor loops continuously. With real EDGE-format geometry data it would produce vertex shader inputs for RSX rendering.
+
+**EDGE return register setup (required for clean workload return):**
+Three rotmai chains in EDGE's exit path all compute `r0 = Rx >> N`; all must yield r0=0x40 (sentinel LS[0x40]):
+- `gpr[88].u32[0] = 0x80` — `rotmai r0, r88, -1` → 0x40
+- `gpr[19].u32[0] = 0x40` — `rotmai r0, r19, 0` → 0x40
+- `gpr[114].u32[0] = 0x4000` — `rotmai r0, r114, -8` → 0x40
+Without this: saved r0=0 → workload branches to LS[0x0000] instead of LS[0x40], replaying the stop-signal sequence.
+
 **What's needed for actual game rendering:**
-Implement the stop 0x3FFF handler with a real EDGE task descriptor:
-1. When stop 0x3FFF fires (r3=0x01000100, r4=0xADD0), load EDGE task descriptor to LS
-2. Set task descriptor to point to geometry data EAs (from game's data files)
-3. After stop 0x3FFF returns, EDGE geometry processor (LS[0x3108]) runs with r3=descriptor
-4. Geometry processor DMA's geometry data → GPU commands → RSX rendering output
+1. When stop 0x3FFF fires (r3=0x01000100, r4=0xADD0), write a real EDGE task descriptor to LS[0xADD0+]
+2. Descriptor must contain geometry source EAs pointing to actual game geometry data
+3. EDGE geometry processor DMA's geometry → transforms vertices → writes RSX draw commands
+4. RSX FIFO parser (NV4097 handler in `runtime_glue.cpp`) renders the output
 
 Workload 2 (0x14AE80, ~38KB, entry=0x3050) is also EDGE-based with same entry structure.
 
-**New opcodes in dispatch code (0x0560 area):**
+**New opcodes in SPURS dispatch code (0x0560 area):**
 - `shlqbi` (0x1DD, RR): shift-left 128-bit quad by (RB&7) bits. Same pattern as rotqbi but without wrap.
 - `shlqbybi` (0x1DF, RR): shift-left 128-bit quad by (RB>>3)&15 bytes. Same as shlqby but RB>>3.
+
+**New opcodes in EDGE geometry processor (LS[0x3108]+):**
+- `lqx` (0x1FD, RR): load quadword indexed — `LS[(RA+RB) & ~15] → RT`. EDGE loads task descriptor quads by index. Without it, MFC_EAL was 0 and no DMA fired.
+- `orx` (0x3F8, RR): OR-reduce — `RT.u32[0] = RA.u32[0] | RA.u32[1] | RA.u32[2] | RA.u32[3]`. EDGE geometry result accumulation.
 
 ## Game-Specific Patches (in `main.cpp`)
 
