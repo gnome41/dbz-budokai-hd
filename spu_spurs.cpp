@@ -258,16 +258,14 @@ static void spurs_run_workload(int slot_idx) {
                     memset(p, 0, 0x4000);
                     /* Count at offset 0x60 (bit 5 set → AND check passes) */
                     p[0x60] = 0x00; p[0x61] = 0x00; p[0x62] = 0x00; p[0x63] = 0x20;
-                    /* Sentinel pattern gives non-zero PUT EA (0x830CBF3F).
-                     * The PUT redirect in mfc_execute will now copy this output to the
-                     * RSX diagnostic buffer so we can inspect what the geometry processor
-                     * actually writes out. */
+                    /* Sentinel fill at 0x00-0x3F: gives non-zero PUT EA = 0x830CBF3F.
+                     * PUT redirect in mfc_execute maps 0x83XXXXXX → RSX 0xD0101000+.
+                     * Keep this for now while we verify the RSX output data quality. */
                     for (int f = 0; f < 0x40/4; f++) {
                         uint8_t b = (uint8_t)(0x30 + f);
                         p[f*4+0] = b; p[f*4+1] = b; p[f*4+2] = b; p[f*4+3] = b;
                     }
-                    fprintf(stderr, "[WL] slot %d: sentinel fill (PUT redirect active, checking output)\n",
-                            slot_idx);
+                    fprintf(stderr, "[WL] slot %d: sentinel fill + PUT redirect → RSX\n", slot_idx);
                     fflush(stderr);
                 }
 
