@@ -144,8 +144,8 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
 **Outstanding questions for the next iteration:**
-- **Real EDGE geometry data** — EDGE DMA is confirmed working (8427+ MFC reads with synthetic descriptor). Bottleneck: providing a real EDGE task descriptor when stop 0x3FFF fires. Load a descriptor to LS[0xADD0+] pointing to actual game geometry EAs. The geometry processor at LS[0x3108] is ready to receive it and will produce RSX vertex commands.
-- **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`). Investigation confirmed the game writes **zero NV4097 rendering commands** during PPU init — rendering is entirely SPURS/SPU-driven. Visible geometry requires EDGE to produce RSX vertex commands first. Parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94) for when real commands arrive.
+- **Real EDGE geometry data** — EDGE geometry processor is now running end-to-end (scheduler → stop 0x3FFF → LS[0x3108] → batch complete at 0x3188). Bottleneck: src_ea=0xA07000 is all zeros, so no DMA PUTs occur. Need real EDGE-format geometry data at that address. Options: (a) scan game memory for EDGE taskset magic; (b) understand what SPU init task in state 6 was supposed to set up; (c) construct a minimal EDGE geometry buffer manually.
+- **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`) and `rsx_on_edge_write()` is wired to the MFC_PUT hook. Will activate as soon as EDGE writes real RSX commands to 0xD0100000. Parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94).
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
 ### RSX command buffer infrastructure (`runtime_glue.cpp`)
@@ -339,8 +339,27 @@ This function reads r3 = EDGE task descriptor (geometry data EAs, output buffer,
 **All 15 workload slots** now run 47 instructions each (EDGE "no task" path).
 Total: SPURS kernel (2980) + 15 × EDGE (47 each = 705) = ~3685 SPU insns/cycle.
 
-**EDGE DMA confirmed working (`spurs_test_edge_geometry` in `spu_spurs.cpp`):**
-Calling the geometry processor at LS[0x3108] directly with a synthetic task descriptor produces **8427+ MFC DMA reads** (64 bytes each from 0xA07000) per 500K-instruction run. The processor loops continuously. With real EDGE-format geometry data it would produce vertex shader inputs for RSX rendering.
+**EDGE geometry pipeline — now wired end-to-end:**
+
+Full dispatch chain working: SPURS kernel → dispatch slot → EDGE scheduler → stop 0x3FFF → geometry processor → batch complete.
+
+`spurs_run_workload()` stop 0x3FFF handler (two cases):
+- **Scheduler stop** (PC ~0x30FC): writes synthetic task descriptor at LS[r4=0xADD0] (`src_ea=0x70A000, out_ea=0xD0100000`) and redirects PC to geometry processor entry LS[0x3108].
+- **Batch complete stop** (PC ≥ 0x3100, currently 0x3188): detected as geometry processor signalling "batch done" — breaks cleanly.
+
+**Current run trace (slot 0):**
+- EDGE svc 0x3FFF fires at PC=0x30FC → redirect to LS[0x3108]
+- Geometry processor runs ~900K instructions, reading from src_ea 0xA07000 (zeros)
+- stop 0x3FFF at PC=0x3188 → "EDGE geometry batch done" → exit
+- **No DMA PUTs** — geometry processor skips output phase when input is all zeros
+
+**RSX MFC_PUT hook is in place** (`spu_interp.cpp: mfc_execute`): when EDGE writes to 0xD0100000–0xD0200000 (RSX IO region), `rsx_on_edge_write()` is called which invokes `rsx_process_fifo()`. Ready to render as soon as EDGE produces real output.
+
+**What's needed for actual game rendering:**
+The geometry processor reads from 0xA07000 (src_ea 0x70A000 as written in the descriptor, transformed by EDGE's internal descriptor parsing). This address is in BSS (zeros). For DMA PUTs to occur:
+1. Provide non-zero geometry data at the src_ea (requires knowing the EDGE geometry format, or finding real EDGE task descriptors the game sets up during its init/loop)
+2. The game's real EDGE workload setup runs during the game loop (which requires SPURS state 6 SPU init tasks that were bypassed)
+3. Scan game memory for EDGE taskset headers ("EDGE" magic = 0x45444745) after init to find real descriptors
 
 **EDGE return register setup (required for clean workload return):**
 Three rotmai chains in EDGE's exit path all compute `r0 = Rx >> N`; all must yield r0=0x40 (sentinel LS[0x40]):
@@ -348,12 +367,6 @@ Three rotmai chains in EDGE's exit path all compute `r0 = Rx >> N`; all must yie
 - `gpr[19].u32[0] = 0x40` — `rotmai r0, r19, 0` → 0x40
 - `gpr[114].u32[0] = 0x4000` — `rotmai r0, r114, -8` → 0x40
 Without this: saved r0=0 → workload branches to LS[0x0000] instead of LS[0x40], replaying the stop-signal sequence.
-
-**What's needed for actual game rendering:**
-1. When stop 0x3FFF fires (r3=0x01000100, r4=0xADD0), write a real EDGE task descriptor to LS[0xADD0+]
-2. Descriptor must contain geometry source EAs pointing to actual game geometry data
-3. EDGE geometry processor DMA's geometry → transforms vertices → writes RSX draw commands
-4. RSX FIFO parser (NV4097 handler in `runtime_glue.cpp`) renders the output
 
 Workload 2 (0x14AE80, ~38KB, entry=0x3050) is also EDGE-based with same entry structure.
 
