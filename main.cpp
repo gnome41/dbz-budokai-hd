@@ -447,6 +447,8 @@ int main(int argc, char* argv[]) {
 
     printf("Entry point returned. Waiting for game threads...\n");
 
+    /* Hold the window open so the rendered sphere is visible for 3 seconds */
+    Sleep(3000);
 
     g_threads_should_exit = true;  /* signal stub threads (UpdateThread etc.) to exit */
     thread_runtime_join_all();

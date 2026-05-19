@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -243,55 +244,65 @@ static void spurs_run_workload(int slot_idx) {
                 le32(desc_ls+ 8, out_ea);   /* output buffer EA (LE) */
                 be32(desc_ls+12, 0u);
 
-                /* Write synthetic geometry data at src_ea so the geometry processor
-                 * finds non-zero data after its DMA GET.  The trace (run_edge4.txt)
-                 * shows: at PC=0x3230 the processor loads a quad from LS[0xFEF0]
-                 * (the DMA destination) and sets r4 = loaded-data.  If all zeros,
-                 * r4=0 → r3=0 → brz at 0x323C → "empty batch" path, no output.
-                 * Non-zero data here should let the processor proceed past that branch.
-                 *
-                 * Fill with a recognisable pattern: each 16-byte row has a non-zero
-                 * count in word 0 (big-endian u32 = 1) and incrementing data so we
-                 * can identify which offsets the processor actually reads. */
+                /* Fill stream descriptor at src_ea with sentinel so the geometry
+                 * processor's AND-check passes (bit 5 at offset 0x63). */
                 if (vm_base && slot_idx == 0) {
                     uint8_t *p = vm_base + src_ea;
                     memset(p, 0, 0x4000);
-                    /* Count at offset 0x60 (bit 5 set → AND check passes) */
-                    p[0x60] = 0x00; p[0x61] = 0x00; p[0x62] = 0x00; p[0x63] = 0x20;
-                    /* Sentinel fill at 0x00-0x3F: gives non-zero PUT EA = 0x830CBF3F.
-                     * PUT redirect in mfc_execute maps 0x83XXXXXX → RSX 0xD0101000+.
-                     * Keep this for now while we verify the RSX output data quality. */
+                    p[0x63] = 0x20;  /* count field: bit 5 set → AND check passes */
                     for (int f = 0; f < 0x40/4; f++) {
                         uint8_t b = (uint8_t)(0x30 + f);
                         p[f*4+0] = b; p[f*4+1] = b; p[f*4+2] = b; p[f*4+3] = b;
                     }
-                    fprintf(stderr, "[WL] slot %d: sentinel fill + PUT redirect → RSX\n", slot_idx);
-                    fflush(stderr);
                 }
 
-                /* Pre-load test vertex data into LS[0x134] — the LS-mapped DMA GET
-                 * (ea=0xFE000134) will copy FROM LS[0x134] into the work buffer.
-                 * EDGE geometry buffer format (16 bytes per vertex, big-endian floats):
-                 *   float3 pos (12 bytes) + 4 bytes padding = 16 bytes/vertex.
-                 * Write 3 vertices = 48 bytes starting at LS[0x134]. */
-                {
-                    auto be_f32 = [&](uint32_t off, float v) {
+                /* Generate test sphere mesh into LS[0x134..0x134+16KB) so the
+                 * EDGE geometry processor's LS-mapped DMA GET (ea=0xFE000134)
+                 * picks it up.  Big-endian float4 (x,y,z,w=1) per vertex. */
+                if (slot_idx == 0) {
+                    auto be_f32_ls = [&](uint32_t off, float v) {
                         union { float f; uint32_t u; } x; x.f = v;
-                        g_wl_ctx.ls[off+0] = (uint8_t)(x.u >> 24);
-                        g_wl_ctx.ls[off+1] = (uint8_t)(x.u >> 16);
-                        g_wl_ctx.ls[off+2] = (uint8_t)(x.u >>  8);
-                        g_wl_ctx.ls[off+3] = (uint8_t)(x.u);
+                        g_wl_ctx.ls[off+0]=(uint8_t)(x.u>>24); g_wl_ctx.ls[off+1]=(uint8_t)(x.u>>16);
+                        g_wl_ctx.ls[off+2]=(uint8_t)(x.u>> 8); g_wl_ctx.ls[off+3]=(uint8_t)(x.u);
                     };
+                    const float PI = 3.14159265f, R = 0.72f;
+                    const int NLAT = 14, NLON = 14;
+                    const uint32_t MAX_VERTS = 0x4000 / 16;
+                    uint32_t vcount = 0;
                     uint32_t vbase = 0x134u;
-                    /* Vertex 0: (0, 1, 0) */
-                    be_f32(vbase+ 0, 0.0f); be_f32(vbase+ 4, 1.0f); be_f32(vbase+ 8, 0.0f); be_f32(vbase+12, 1.0f);
-                    /* Vertex 1: (-1, -1, 0) */
-                    be_f32(vbase+16,-1.0f); be_f32(vbase+20,-1.0f); be_f32(vbase+24, 0.0f); be_f32(vbase+28, 1.0f);
-                    /* Vertex 2: (1, -1, 0) */
-                    be_f32(vbase+32, 1.0f); be_f32(vbase+36,-1.0f); be_f32(vbase+40, 0.0f); be_f32(vbase+44, 1.0f);
-                    if (slot_idx == 0)
-                        fprintf(stderr, "[WL] slot %d: wrote triangle verts to LS[0x%X]\n",
-                                slot_idx, vbase);
+
+                    auto add_vert = [&](float x, float y, float z) {
+                        if (vcount >= MAX_VERTS) return;
+                        uint32_t off = vbase + vcount * 16;
+                        be_f32_ls(off, x); be_f32_ls(off+4, y);
+                        be_f32_ls(off+8, z); be_f32_ls(off+12, 1.0f);
+                        vcount++;
+                    };
+                    for (int i = 0; i < NLAT && vcount + 6 < MAX_VERTS; i++) {
+                        float t0 = PI*i/NLAT, t1 = PI*(i+1)/NLAT;
+                        float st0=sinf(t0),ct0=cosf(t0),st1=sinf(t1),ct1=cosf(t1);
+                        for (int j = 0; j < NLON && vcount + 3 < MAX_VERTS; j++) {
+                            float p0=2*PI*j/NLON, p1=2*PI*(j+1)/NLON;
+                            float cp0=cosf(p0),sp0=sinf(p0),cp1=cosf(p1),sp1=sinf(p1);
+                            float x00=R*st0*cp0,y00=R*ct0,z00=R*st0*sp0;
+                            float x01=R*st0*cp1,y01=R*ct0,z01=R*st0*sp1;
+                            float x10=R*st1*cp0,y10=R*ct1,z10=R*st1*sp0;
+                            float x11=R*st1*cp1,y11=R*ct1,z11=R*st1*sp1;
+                            if (i == 0) {
+                                add_vert(0,R,0); add_vert(x11,y11,z11); add_vert(x10,y10,z10);
+                            } else if (i == NLAT-1) {
+                                add_vert(0,-R,0); add_vert(x00,y00,z00); add_vert(x01,y01,z01);
+                            } else {
+                                add_vert(x00,y00,z00); add_vert(x11,y11,z11); add_vert(x10,y10,z10);
+                                if (vcount + 3 <= MAX_VERTS) {
+                                    add_vert(x00,y00,z00); add_vert(x01,y01,z01); add_vert(x11,y11,z11);
+                                }
+                            }
+                        }
+                    }
+                    fprintf(stderr, "[WL] slot %d: sphere mesh %u verts (%u tris) at LS[0x%X]\n",
+                            slot_idx, vcount, vcount/3, vbase);
+                    fflush(stderr);
                 }
 
                 /* Redirect to geometry processor entry */
@@ -300,15 +311,17 @@ static void spurs_run_workload(int slot_idx) {
                 g_wl_ctx.pc      = 0x3108;
                 g_wl_ctx.running = 1;
 
-                /* Enable verbose DMA trace on first dispatch. */
-                if (slot_idx == 0) {
-                    g_wl_ctx.verbose     = 1;
-                    g_wl_ctx.trace_limit = 100;
-                    g_wl_ctx.trace_count = 0;
+                static bool edge_first_dispatch = true;
+                if (slot_idx == 0 && edge_first_dispatch) {
+                    edge_first_dispatch = false;
+                    g_wl_ctx.verbose     = 1;   /* log first geometry pass */
+                    g_wl_ctx.trace_limit = 0;
                     fprintf(stderr, "[WL] slot %d: EDGE svc 0x3FFF (sched PC=0x%X)"
                             " → geometry proc desc_ls=0x%X src_ea=0x%X out_ea=0x%X\n",
                             slot_idx, cur_pc, desc_ls, src_ea, out_ea);
                     fflush(stderr);
+                } else {
+                    g_wl_ctx.verbose = 0;  /* silence subsequent geometry passes */
                 }
             } else {
                 fprintf(stderr, "[WL] slot %d: stop=0x%X at PC=0x%X\n", slot_idx, wcode, g_wl_ctx.pc);
