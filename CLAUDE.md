@@ -144,8 +144,9 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
 **Outstanding questions for the next iteration:**
-- **Real EDGE geometry data** — EDGE geometry processor is now running end-to-end (scheduler → stop 0x3FFF → LS[0x3108] → batch complete at 0x3188). Bottleneck: src_ea=0xA07000 is all zeros, so no DMA PUTs occur. Need real EDGE-format geometry data at that address. Options: (a) scan game memory for EDGE taskset magic; (b) understand what SPU init task in state 6 was supposed to set up; (c) construct a minimal EDGE geometry buffer manually.
-- **RSX command buffer parsing** — infrastructure in place (`runtime_glue.cpp: rsx_process_fifo`) and `rsx_on_edge_write()` is wired to the MFC_PUT hook. Will activate as soon as EDGE writes real RSX commands to 0xD0100000. Parser handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820) and NV4097_CLEAR_SURFACE (0x1D94).
+- **Real EDGE task descriptor** — EDGE pipeline fully wired. Output goes to RSX via PUT redirect but data is garbage (sentinel vertices → garbage transform). To get valid RSX draw commands: need a proper EDGE task descriptor at LS[0xADD0] that describes vertex format, output layout, etc. The lqx at LS[0x35FC] reads `r43` from `LS[(r49+r124)&~15]`; writing LE 0xD0100000 at bytes[4..7] of that LS quad gives PUT EA = 0xD0100000 directly (needs tracing r49+r124 with target descriptor content).
+- **Finding real EDGE descriptors** — The game's PPU-side EDGE setup (called from game loop, not func_00012420 init) creates EDGE task descriptors. Scanning ppu_recomp.cpp for calls to EDGE PPU functions would identify where descriptors are built and what vertex data they reference.
+- **RSX command buffer parsing** — infrastructure in place (`rsx_process_fifo` + `rsx_on_edge_write()`). Will activate as soon as geometry output contains valid NV4097 commands. Parser handles 0x1820 and 0x1D94 today; needs NV4097_DRAW_ARRAYS (0x1808) for actual rendering.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
 ### RSX command buffer infrastructure (`runtime_glue.cpp`)
@@ -339,34 +340,51 @@ This function reads r3 = EDGE task descriptor (geometry data EAs, output buffer,
 **All 15 workload slots** now run 47 instructions each (EDGE "no task" path).
 Total: SPURS kernel (2980) + 15 × EDGE (47 each = 705) = ~3685 SPU insns/cycle.
 
-**EDGE geometry pipeline — now wired end-to-end:**
+**EDGE geometry pipeline — fully wired end-to-end:**
 
-Full dispatch chain working: SPURS kernel → dispatch slot → EDGE scheduler → stop 0x3FFF → geometry processor → batch complete.
+Full dispatch: SPURS kernel → slot → EDGE scheduler → stop 0x3FFF → geometry proc → LS→LS GET → vertex processing → DMA PUT → RSX redirect.
 
-`spurs_run_workload()` stop 0x3FFF handler (two cases):
-- **Scheduler stop** (PC ~0x30FC): writes synthetic task descriptor at LS[r4=0xADD0] (`src_ea=0x70A000, out_ea=0xD0100000`) and redirects PC to geometry processor entry LS[0x3108].
-- **Batch complete stop** (PC ≥ 0x3100, currently 0x3188): detected as geometry processor signalling "batch done" — breaks cleanly.
+`spurs_run_workload()` stop 0x3FFF handler:
+- **Scheduler stop** (PC ~0x30FC): writes task descriptor at LS[r4=0xADD0], writes test triangle to LS[0x134], redirects to geometry processor LS[0x3108].
+- **Batch complete stop** (PC ≥ 0x3100): breaks cleanly.
 
-**Current run trace (slot 0):**
-- EDGE svc 0x3FFF fires at PC=0x30FC → redirect to LS[0x3108]
-- Geometry processor runs ~900K instructions, reading from src_ea 0xA07000 (zeros)
-- stop 0x3FFF at PC=0x3188 → "EDGE geometry batch done" → exit
-- **No DMA PUTs** — geometry processor skips output phase when input is all zeros
+**Key EDGE geometry formula discoveries (from SPU register change detectors):**
 
-**RSX MFC_PUT hook is in place** (`spu_interp.cpp: mfc_execute`): when EDGE writes to 0xD0100000–0xD0200000 (RSX IO region), `rsx_on_edge_write()` is called which invokes `rsx_process_fifo()`. Ready to render as soon as EDGE produces real output.
+Vertex source EA path (determines GET):
+- `shlqbyi r61, r75, 4` at ~LS[0x3584]: r61.u32[0] = r75 bytes[4..7] = GET EA
+- GET EA 0xFE000134 → LS-mapped: reads from LS[0x134] (our test triangle ✓)
+- MFC GET from 0xFE000000-0xFEFFFFFF handled as LS→LS DMA (ea-0xFE000000 = LS offset)
 
-**What's needed for actual game rendering:**
-The geometry processor reads from 0xA07000 (src_ea 0x70A000 as written in the descriptor, transformed by EDGE's internal descriptor parsing). This address is in BSS (zeros). For DMA PUTs to occur:
-1. Provide non-zero geometry data at the src_ea (requires knowing the EDGE geometry format, or finding real EDGE task descriptors the game sets up during its init/loop)
-2. The game's real EDGE workload setup runs during the game loop (which requires SPURS state 6 SPU init tasks that were bypassed)
-3. Scan game memory for EDGE taskset headers ("EDGE" magic = 0x45444745) after init to find real descriptors
+Output EA path (determines PUT destination):
+- `lqx r43, r49, r124` at LS[0x35FC] (op11=0x1FD): loads quad from LS[(r49+r124)&~15]
+- `shlqbyi r31, r43, 4` at LS[0x3614] (op11=0x1FF): r31.u32[0] = r43 bytes[4..7] = PUT EA
+- PUT EA = 0x830CBF3F (with sentinel stream data) = some PS3 memory region
+- MFC PUT 0x80000000-0xA0000000 redirect → RSX diagnostic buffer at 0xD0101000+
+- `rsx_on_edge_write()` fires, data written to RSX — but output is garbage vertices
+
+Additional instruction discoveries at key PCs:
+- LS[0x3188]: `ceqbi r21, r22, 0` (op8=0x7E) — byte comparison mask, NOT PUT EA source
+- LS[0x3614]: `shlqbyi r31, r43, 4` (op11=0x1FF) — RA is r43 not r21 (earlier analysis error)
+- LS[0x35FC]: `lqx r43, r49, r124` (op11=0x1FD) — the actual PUT EA loader
+
+**For PUT EA = 0xD0100000 (RSX command buffer):**
+Need r43.u8[4..7] = [0x00, 0x00, 0x10, 0xD0] (LE bytes of 0xD0100000) at time of shlqbyi.
+The lqx at 0x35FC loads from LS[(r49+r124)&~15] — this address is computed from the stream
+descriptor buffer content. Writing LE 0xD0100000 at bytes[4..7] of THAT specific LS quad
+would make PUT EA = 0xD0100000 directly (bypassing the current redirect hack).
+
+**Why output is still garbage:**
+Geometry processor processes sentinel bytes (0x30..0x3F) from stream descriptor at 0xA07000.
+These are not valid EDGE-format geometry. The output at LS[0xBC80] (written via PUT) is
+garbage-transformed garbage. For valid RSX draw commands: needs real EDGE task descriptor
+with proper vertex format info and real vertex data.
 
 **EDGE return register setup (required for clean workload return):**
-Three rotmai chains in EDGE's exit path all compute `r0 = Rx >> N`; all must yield r0=0x40 (sentinel LS[0x40]):
+Three rotmai chains in EDGE's exit path all compute `r0 = Rx >> N`; all must yield r0=0x40:
 - `gpr[88].u32[0] = 0x80` — `rotmai r0, r88, -1` → 0x40
 - `gpr[19].u32[0] = 0x40` — `rotmai r0, r19, 0` → 0x40
 - `gpr[114].u32[0] = 0x4000` — `rotmai r0, r114, -8` → 0x40
-Without this: saved r0=0 → workload branches to LS[0x0000] instead of LS[0x40], replaying the stop-signal sequence.
+Without this: saved r0=0 → workload branches to LS[0x0000] instead of LS[0x40], replaying stop signals.
 
 Workload 2 (0x14AE80, ~38KB, entry=0x3050) is also EDGE-based with same entry structure.
 
