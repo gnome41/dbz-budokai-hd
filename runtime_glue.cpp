@@ -512,6 +512,17 @@ static void rsx_process_fifo(uint32_t put_val) {
     g_rsx_get_ea = put_val;
 }
 
+/* Called by the SPU interpreter when EDGE geometry processor MFC_PUTs into the
+ * RSX IO-mapped region.  Treat the written data as new RSX command buffer content
+ * and advance the parser's GET position to process it. */
+extern "C" void rsx_on_edge_write(uint32_t put_end_ea) {
+    /* put_end_ea is the byte after the last PUT (i.e. new PUT pointer).
+     * Convert to an RSX IO offset and call the FIFO parser. */
+    if (put_end_ea < 0xD0100000u || put_end_ea > 0xD0200000u) return;
+    uint32_t io_off = put_end_ea - 0xD0100000u;
+    rsx_process_fifo(io_off);
+}
+
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE32] guest addr=0x%08X val=0x%08X\n", a, val); fflush(stderr); }
