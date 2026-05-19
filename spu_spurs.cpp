@@ -84,22 +84,6 @@ static void spurs_run_workload(int slot_idx) {
 
         fprintf(stderr, "[WL] ELF loaded from guest 0x%X, entry=0x%X, size=0x%X\n",
                 gaddr, g_wl_ctx.pc, gsz);
-
-        /* Dump instructions around the two key PCs that write MFC_EAL:
-         * PC=0x35B4 (vertex source EA) and PC=0x3644 (vertex output EA).
-         * 32 bytes = 8 instructions around each. */
-        fprintf(stderr, "[EDGE-LS] vertex-src-EA writer region (LS[0x35A0..0x35C0]):\n");
-        for (int i = 0; i < 10; i++) {
-            uint32_t pc = 0x35A0 + i*4;
-            fprintf(stderr, "  LS[0x%04X]: %02X %02X %02X %02X\n", pc,
-                g_wl_ctx.ls[pc], g_wl_ctx.ls[pc+1], g_wl_ctx.ls[pc+2], g_wl_ctx.ls[pc+3]);
-        }
-        fprintf(stderr, "[EDGE-LS] vertex-out-EA writer region (LS[0x3630..0x3660]):\n");
-        for (int i = 0; i < 12; i++) {
-            uint32_t pc = 0x3630 + i*4;
-            fprintf(stderr, "  LS[0x%04X]: %02X %02X %02X %02X\n", pc,
-                g_wl_ctx.ls[pc], g_wl_ctx.ls[pc+1], g_wl_ctx.ls[pc+2], g_wl_ctx.ls[pc+3]);
-        }
         fflush(stderr);
 
         /* Populate the geometry table at LS[0xBC00] with a test entry so the
@@ -274,14 +258,15 @@ static void spurs_run_workload(int slot_idx) {
                     memset(p, 0, 0x4000);
                     /* Count at offset 0x60 (bit 5 set → AND check passes) */
                     p[0x60] = 0x00; p[0x61] = 0x00; p[0x62] = 0x00; p[0x63] = 0x20;
-                    /* Write sentinels at 0x00-0x3F so MFC_EAL is non-zero.
-                     * The @pc annotation on wrch MFC_EAL will tell us which instruction
-                     * computes the vertex source EA — key for finding the field layout. */
+                    /* Sentinel pattern gives non-zero PUT EA (0x830CBF3F).
+                     * The PUT redirect in mfc_execute will now copy this output to the
+                     * RSX diagnostic buffer so we can inspect what the geometry processor
+                     * actually writes out. */
                     for (int f = 0; f < 0x40/4; f++) {
                         uint8_t b = (uint8_t)(0x30 + f);
                         p[f*4+0] = b; p[f*4+1] = b; p[f*4+2] = b; p[f*4+3] = b;
                     }
-                    fprintf(stderr, "[WL] slot %d: sentinels 0x30..0x3F at +0x00..+0x3F (+pc logging)\n",
+                    fprintf(stderr, "[WL] slot %d: sentinel fill (PUT redirect active, checking output)\n",
                             slot_idx);
                     fflush(stderr);
                 }
@@ -317,11 +302,10 @@ static void spurs_run_workload(int slot_idx) {
                 g_wl_ctx.pc      = 0x3108;
                 g_wl_ctx.running = 1;
 
-                /* Enable verbose DMA trace on first dispatch; extend to 400 insns
-                 * so we can see r61 (vertex EAL) and r60 (size) being computed. */
+                /* Enable verbose DMA trace on first dispatch. */
                 if (slot_idx == 0) {
                     g_wl_ctx.verbose     = 1;
-                    g_wl_ctx.trace_limit = 400;
+                    g_wl_ctx.trace_limit = 100;
                     g_wl_ctx.trace_count = 0;
                     fprintf(stderr, "[WL] slot %d: EDGE svc 0x3FFF (sched PC=0x%X)"
                             " → geometry proc desc_ls=0x%X src_ea=0x%X out_ea=0x%X\n",
