@@ -13,10 +13,12 @@ Built on top of the **[ps3recomp](https://github.com/sp00nznet/ps3recomp) SDK** 
 
 | File/Dir | Description |
 |---|---|
-| `main.cpp` | Host entry point: reserves 4 GB guest VA, loads the ELF, applies game-specific patches, calls `_start` |
-| `runtime_glue.cpp` | `vm_base`, `vm_read/write*` helpers, `lv2_syscall` dispatcher, `ps3_indirect_call` |
+| `main.cpp` | Host entry point: reserves 4 GB guest VA, loads the ELF, applies game-specific patches, calls `_start`; Win32 display window thread (1280×720 DIB) |
+| `runtime_glue.cpp` | `vm_base`, `vm_read/write*` helpers, `lv2_syscall` dispatcher, `ps3_indirect_call`; RSX FIFO parser (`rsx_process_fifo`) |
 | `extra_funcs.cpp` | Hand-lifted PPU functions missed by the lifter (C++ ctors/dtors reached via indirect CTR calls) |
 | `stubs.cpp` | Reference template for NID overrides (not compiled; documentation only) |
+| `spu_interp.cpp` | SPU instruction interpreter — covers full SPURS kernel + EDGE geometry processor opcode set |
+| `spu_spurs.cpp` | SPURS/SPU orchestration: loads kernel ELF, LS patches, burst execution loop, EDGE workload dispatch, `spurs_test_edge_geometry()` diagnostic |
 | `recompiled/ppu_recomp.cpp` | **Auto-generated** by `ppu_lifter.py` from `EBOOT.elf` — contains all lifted PPU functions (with manual diagnostic/guard patches) |
 | `recompiled/ppu_recomp.h` | **Auto-generated** — declares `ppu_context`, memory helpers, all `func_XXXXXXXX` prototypes |
 | `config.toml` | Lifter configuration: input ELF, output dir, HLE/LLE module choices |
@@ -88,14 +90,20 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 | Real LV2 sync primitives (semaphore / mutex / condvar / lwmutex / lwcond / event-queue) | ✅ Working |
 | C runtime startup wrapper → game main `func_00012420` | ✅ Working |
 | Game main: sysmodule loads, cellGcmInit, display buffer alloc, full init sequence | ✅ Working (GCM force-succeeded; null RSX backend) |
+| **SPURS SPU kernel** (embedded ELF at 0x10BD00) | ✅ Running — 2980+ instructions/cycle; EDGE workloads dispatched |
+| **EDGE SPU workloads** (Sony EDGE library at 0x142900 + 0x14AE80) | ✅ Running — 15 slots × 47 insns each; EDGE geometry processor functional |
+| **EDGE MFC DMA** | ✅ Confirmed — 8427+ DMA reads (64B each) with synthetic task descriptor |
+| UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub; full audio loop TBD |
+| Win32 display window (1280×720 DIB-backed) | ✅ Working — dark-blue fill; RSX blit path wired for future frames |
 | C++ destructor walker | ✅ Working |
 | Process exits cleanly with no AV / no abort | ✅ Working |
 | **Game loop** | 🔲 Not yet — game main is pure init; actual game loop is SPURS/SPU-driven |
-| Graphics (RSX / cellGcm) | 🔲 Null backend — PUT/GET mirrored, REF discarded |
+| Graphics rendering | 🔲 No draw commands yet — game writes zero NV4097 commands during PPU init; rendering is EDGE→RSX pipeline |
+| EDGE geometry data | 🔲 Next step — provide real EDGE task descriptor when stop 0x3FFF fires |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
 
-Current end-state of a run: SPURS init → state machine 2→21 → 7 worker threads (sdu_yah_size_check ×2 + sub-workers, sdu_yah_all_list_delete + sub-worker, Terminate Thread) run and exit → game main `func_00012420` runs full GCM + display-buffer init → C++ destructor walker → `[RUNTIME] all game threads finished` → clean exit.
+Current end-state of a run: SPURS init → PPU state machine 2→21 → SPURS SPU kernel runs (2980+ insns, dispatches 15 EDGE workload slots; EDGE issues 8427+ DMA reads) → 7 PPU worker threads (sdu_yah_size_check ×2 + sub-workers, sdu_yah_all_list_delete + sub-worker, Terminate Thread) run and exit → game main `func_00012420` runs full GCM + display-buffer init → UpdateThread (bnusCore audio stub) starts → 1280×720 Win32 window visible → C++ destructor walker → `[RUNTIME] all game threads finished` → clean exit.
 
 ### Key patches applied
 
