@@ -172,6 +172,20 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
                 /* Notify RSX parser when EDGE writes into the RSX IO-mapped region */
                 if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u)
                     rsx_on_edge_write(ea32 + sz);
+                /* EDGE diagnostic redirect: PUT to unrecognized PS3 address spaces
+                 * (0x80000000-0x9FFFFFFF = likely RSX local/MMIO or another SPU's LS)
+                 * → redirect to RSX IO command buffer so we can see the output. */
+                if (ea32 >= 0x80000000u && ea32 < 0xA0000000u && ctx->vm_base && sz > 0) {
+                    static uint32_t rsx_diag_ptr = 0xD0101000u; /* past 0x43 PUT area */
+                    if (rsx_diag_ptr + sz <= 0xD0200000u) {
+                        if (ctx->verbose)
+                            fprintf(stderr, "[SPU%d] EDGE-PUT redirect ea=0x%08X → RSX 0x%X\n",
+                                    ctx->id, ea32, rsx_diag_ptr);
+                        memcpy(ctx->vm_base + rsx_diag_ptr, ctx->ls + lsa, sz);
+                        rsx_on_edge_write(rsx_diag_ptr + sz);
+                        rsx_diag_ptr += sz;
+                    }
+                }
             }
             break;
         default:
