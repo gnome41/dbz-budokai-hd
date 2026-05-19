@@ -169,9 +169,12 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
             } else {
                 if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
                     memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
-                /* Notify RSX parser when EDGE writes into the RSX IO-mapped region */
-                if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u)
+                /* Commit data to RSX IO-mapped region and notify the FIFO parser */
+                if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u) {
+                    if (ctx->vm_base)
+                        memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
                     rsx_on_edge_write(ea32 + sz);
+                }
                 /* EDGE diagnostic redirect: PUT to unrecognized PS3 address spaces
                  * (0x80000000-0x9FFFFFFF = likely RSX local/MMIO or another SPU's LS)
                  * → redirect to RSX IO command buffer so we can see the output. */
@@ -318,6 +321,27 @@ void spu_step(spu_ctx_t *ctx) {
     uint32_t pc = ctx->pc & (SPU_LS_SIZE - 1);
 
     /* (Change detectors removed after analysis — see CLAUDE.md for findings.) */
+
+    /* PUT EA fixup for EDGE geometry processor: before lqx at 0x35FC, patch
+     * LS[(r49+r124)&~15].u8[4..7] to LE 0xD0100000 so EDGE writes output to
+     * the RSX command buffer rather than a garbage guest address. */
+    if (pc == 0x35FCu && ctx->id == 2) {
+        uint32_t r49    = ctx->gpr[49].u32[0];
+        uint32_t r124   = ctx->gpr[124].u32[0];
+        uint32_t lsaddr = (r49 + r124) & ~15u & (SPU_LS_SIZE - 1);
+        fprintf(stderr, "[EDGE] lqx@0x35FC r49=0x%X r124=0x%X lsaddr=0x%X"
+                " bytes=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                r49, r124, lsaddr,
+                ctx->ls[lsaddr+0], ctx->ls[lsaddr+1],
+                ctx->ls[lsaddr+2], ctx->ls[lsaddr+3],
+                ctx->ls[lsaddr+4], ctx->ls[lsaddr+5],
+                ctx->ls[lsaddr+6], ctx->ls[lsaddr+7]);
+        ctx->ls[lsaddr+4] = 0x00;
+        ctx->ls[lsaddr+5] = 0x00;
+        ctx->ls[lsaddr+6] = 0x10;
+        ctx->ls[lsaddr+7] = 0xD0;
+        fflush(stderr);
+    }
 
     uint32_t insn = ls_read32(ctx, pc);
     ctx->pc = (pc + 4) & (SPU_LS_SIZE - 1);
