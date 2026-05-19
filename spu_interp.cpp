@@ -517,6 +517,11 @@ void spu_step(spu_ctx_t *ctx) {
         case 0x1C4: { /* lqx RT, RA, RB */
             uint32_t ea = (R[ra].u32[0]+R[rb].u32[0]) & (SPU_LS_SIZE-1) & ~15u;
             ls_read128(ctx, ea, &R[rt]); return; }
+        case 0x1FD: { /* lqx variant 2 (op11=0x1FD) — same semantics as 0x1C4.
+                       * Seen in EDGE SPU library geometry processor at PC=0x31B0.
+                       * Load quadword from LS[RA+RB] into RT. */
+            uint32_t ea = (R[ra].u32[0]+R[rb].u32[0]) & (SPU_LS_SIZE-1) & ~15u;
+            ls_read128(ctx, ea, &R[rt]); return; }
         case 0x144: { /* stqx RT, RA, RB */
             uint32_t ea = (R[ra].u32[0]+R[rb].u32[0]) & (SPU_LS_SIZE-1) & ~15u;
             ls_write128(ctx, ea, &R[rt]); return; }
@@ -561,6 +566,10 @@ void spu_step(spu_ctx_t *ctx) {
         case 0x240: { /* orx  RT, RA (OR across words) */
             uint32_t v = R[ra].u32[0]|R[ra].u32[1]|R[ra].u32[2]|R[ra].u32[3];
             R[rt].u32[0]=v; R[rt].u32[1]=R[rt].u32[2]=R[rt].u32[3]=0; return; }
+        case 0x3F8: { /* orx variant (op11=0x3F8) — seen in EDGE geometry processor.
+                       * Treat as orx (OR across 4 words of RA → RT.u32[0]). */
+            uint32_t v2 = R[ra].u32[0]|R[ra].u32[1]|R[ra].u32[2]|R[ra].u32[3];
+            R[rt].u32[0]=v2; R[rt].u32[1]=R[rt].u32[2]=R[rt].u32[3]=0; return; }
 
         /* Shift/rotate (RR form, shift amount from RB) */
         case 0x05B: { /* shl  RT, RA, RB */

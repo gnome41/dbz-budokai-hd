@@ -455,3 +455,68 @@ extern "C" void spurs_start(void) {
 extern "C" void spurs_verbose_off(void) {
     g_spurs_ctx.verbose = 0;
 }
+
+/* Direct test of EDGE geometry processor at LS[0x3108].
+ * Called after spurs_start() to probe the geometry DMA pattern.
+ * Place a minimal 16-byte task descriptor at LS[0x3000] and see what
+ * DMA addresses the processor requests. */
+extern "C" void spurs_test_edge_geometry(void) {
+    if (!g_wl_ctx_valid) return;  /* workload ELF not loaded */
+
+    fprintf(stderr, "[EDGE-TEST] calling geometry processor at LS[0x3108]\n");
+    fflush(stderr);
+
+    /* Reset the workload context */
+    if (spu_load_elf(&g_wl_ctx, vm_base + GAME_WORKLOAD_1_GADDR,
+                     GAME_WORKLOAD_1_SIZE) != 0) {
+        fprintf(stderr, "[EDGE-TEST] ELF reload failed\n"); return;
+    }
+
+    /* Set PC to geometry processor entry */
+    g_wl_ctx.pc = 0x3108;
+
+    /* Place a 16-byte task descriptor at LS[0x3000]:
+     * bytes 0-3:  some flags  (word 0)
+     * bytes 4-7:  source EA   (word 1 — becomes MFC_EAL after rotqbyi)
+     * bytes 8-11: more data
+     * bytes 12-15: more data
+     * For testing: put the PPU SPURS_CTX_EA as the source EA */
+    uint32_t desc_ea = 0x3000u;
+    uint32_t src_ea  = SPURS_CTX_EA;  /* DMA from 0x70A000 as a test */
+    /* Word 1 (big-endian at desc_ea+4) = src_ea */
+    g_wl_ctx.ls[desc_ea+4] = (src_ea >> 24) & 0xFF;
+    g_wl_ctx.ls[desc_ea+5] = (src_ea >> 16) & 0xFF;
+    g_wl_ctx.ls[desc_ea+6] = (src_ea >>  8) & 0xFF;
+    g_wl_ctx.ls[desc_ea+7] = (src_ea)       & 0xFF;
+
+    /* r3 = descriptor address; r87 = r3 (saved by ori r87, r3, 0) */
+    g_wl_ctx.gpr[3].u32[0]  = desc_ea;
+    g_wl_ctx.gpr[87].u32[0] = desc_ea;
+
+    /* Stack: r1 = 0x2000 (valid area below code at 0x3000) */
+    g_wl_ctx.gpr[1].u32[0] = 0x2000u;
+
+    /* Return: set r0=0x40 (sentinel), use same rotmai pattern */
+    g_wl_ctx.gpr[0].u32[0]   = 0x40;
+    g_wl_ctx.gpr[88].u32[0]  = 0x80;
+    g_wl_ctx.gpr[19].u32[0]  = 0x40;
+    g_wl_ctx.gpr[114].u32[0] = 0x4000;
+    uint8_t s100[4] = {0x00, 0x00, 0x01, 0x00};
+    memcpy(g_wl_ctx.ls + 0x40, s100, 4);
+
+    g_wl_ctx.verbose     = 1;
+    g_wl_ctx.trace_limit = 100;
+    g_wl_ctx.trace_count = 0;
+
+    /* Run up to 500K instructions */
+    uint32_t ran = 0;
+    for (int i = 0; i < 10 && g_wl_ctx.running; i++)
+        ran += spu_run(&g_wl_ctx, 50000);
+
+    /* Handle first stop */
+    if (!g_wl_ctx.running) {
+        fprintf(stderr, "[EDGE-TEST] stopped: stop=0x%X pc=0x%X ran=%u\n",
+                g_wl_ctx.stop_code, g_wl_ctx.pc, ran);
+        fflush(stderr);
+    }
+}
