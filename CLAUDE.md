@@ -158,7 +158,9 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 **src_ea must be outside ELF BSS (0x10000–0x10010000):**
 `src_ea = 0x70C000` (SPURS synthetic area). Previously 0xA07000 was corrupting ELF BSS data, causing SDU threads to exit immediately (regression introduced when workload dispatch first fired).
 
-**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 big-endian vertices from 0xD0100000, projects to screen, fills triangle in BGRA8 framebuffer with solid green, calls `rsx_present_frame()`. First triangle rendered to Win32 window confirmed (640,0)→(0,720)→(1280,720).
+**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 big-endian vertices from 0xD0100000, projects to screen, flat-shades with orange-gold diffuse lighting, writes BGRA8 to framebuffer. Only fires for LS source 0xBC80 (primary vertex output, tag=0). Win32 window holds 3 seconds after game main returns so the rendered image is visible.
+
+**Current test geometry**: UV sphere (NLAT=14, NLON=14) generated in spu_spurs.cpp stop 0x3FFF handler — 1023 vertices (341 triangles) written to LS[0x134..0x5133] (16 KB). EDGE processes all 16 KB passthrough → PUT to 0xD0100000. Rasterizer draws 341 flat-shaded triangles. Visual: shaded sphere centred at screen mid-point (~640×360 area), warm gold-orange tones.
 
 **Outstanding questions for the next iteration:**
 - **Real game vertex data** — test triangle uses synthetic float4 vertices from LS[0x134]. Need to find where the game stores real vertex data and point EDGE's GET EA there. The stream descriptor at 0x70C000 (src_ea) controls what EDGE DMA-GETs.

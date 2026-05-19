@@ -35,7 +35,7 @@
 #endif
 
 /* Forward-declare RSX edge-write notifier from runtime_glue.cpp */
-extern "C" void rsx_on_edge_write(uint32_t put_end_ea);
+extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src);
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -173,7 +173,7 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
                 if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u) {
                     if (ctx->vm_base)
                         memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
-                    rsx_on_edge_write(ea32 + sz);
+                    rsx_on_edge_write(ea32 + sz, lsa);
                 }
                 /* EDGE diagnostic redirect: PUT to unrecognized PS3 address spaces
                  * (0x80000000-0x9FFFFFFF = likely RSX local/MMIO or another SPU's LS)
@@ -185,7 +185,7 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
                             fprintf(stderr, "[SPU%d] EDGE-PUT redirect ea=0x%08X → RSX 0x%X\n",
                                     ctx->id, ea32, rsx_diag_ptr);
                         memcpy(ctx->vm_base + rsx_diag_ptr, ctx->ls + lsa, sz);
-                        rsx_on_edge_write(rsx_diag_ptr + sz);
+                        rsx_on_edge_write(rsx_diag_ptr + sz, lsa);
                         rsx_diag_ptr += sz;
                     }
                 }
@@ -323,24 +323,28 @@ void spu_step(spu_ctx_t *ctx) {
     /* (Change detectors removed after analysis — see CLAUDE.md for findings.) */
 
     /* PUT EA fixup for EDGE geometry processor: before lqx at 0x35FC, patch
-     * LS[(r49+r124)&~15].u8[4..7] to LE 0xD0100000 so EDGE writes output to
-     * the RSX command buffer rather than a garbage guest address. */
+     * LS[(r49+r124)&~15].u8[4..7] to LE 0xD0100000 so EDGE writes to RSX buf. */
     if (pc == 0x35FCu && ctx->id == 2) {
         uint32_t r49    = ctx->gpr[49].u32[0];
         uint32_t r124   = ctx->gpr[124].u32[0];
         uint32_t lsaddr = (r49 + r124) & ~15u & (SPU_LS_SIZE - 1);
-        fprintf(stderr, "[EDGE] lqx@0x35FC r49=0x%X r124=0x%X lsaddr=0x%X"
-                " bytes=%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                r49, r124, lsaddr,
-                ctx->ls[lsaddr+0], ctx->ls[lsaddr+1],
-                ctx->ls[lsaddr+2], ctx->ls[lsaddr+3],
-                ctx->ls[lsaddr+4], ctx->ls[lsaddr+5],
-                ctx->ls[lsaddr+6], ctx->ls[lsaddr+7]);
+        /* Log once so we can see the formula, then stay silent */
+        static bool lqx_logged = false;
+        if (!lqx_logged) {
+            lqx_logged = true;
+            fprintf(stderr, "[EDGE] lqx@0x35FC r49=0x%X r124=0x%X lsaddr=0x%X"
+                    " bytes=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                    r49, r124, lsaddr,
+                    ctx->ls[lsaddr+0], ctx->ls[lsaddr+1],
+                    ctx->ls[lsaddr+2], ctx->ls[lsaddr+3],
+                    ctx->ls[lsaddr+4], ctx->ls[lsaddr+5],
+                    ctx->ls[lsaddr+6], ctx->ls[lsaddr+7]);
+            fflush(stderr);
+        }
         ctx->ls[lsaddr+4] = 0x00;
         ctx->ls[lsaddr+5] = 0x00;
         ctx->ls[lsaddr+6] = 0x10;
         ctx->ls[lsaddr+7] = 0xD0;
-        fflush(stderr);
     }
 
     uint32_t insn = ls_read32(ctx, pc);

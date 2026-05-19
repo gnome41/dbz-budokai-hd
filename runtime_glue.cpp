@@ -518,13 +518,12 @@ static void rsx_process_fifo(uint32_t put_val) {
     g_rsx_get_ea = put_val;
 }
 
-/* Minimal software triangle rasterizer for EDGE geometry output.
- * Reads float4 big-endian vertices from guest EA, projects to framebuffer coords,
- * fills triangles with a solid colour, and presents the frame. */
+/* Soft-rasterize float4 BE vertex soup (every 3 verts = one tri) into framebuf.
+ * Flat shading: diffuse from a fixed overhead-front light + 0.15 ambient.
+ * Colour palette: warm orange-gold, appropriate for a PS3 fighting-game. */
 static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) {
     uint32_t* fb = rsx_framebuf();
-    int W = rsx_fb_width();
-    int H = rsx_fb_height();
+    int W = rsx_fb_width(), H = rsx_fb_height();
     if (!fb || vertex_count < 3 || W <= 0 || H <= 0) return;
 
     auto be_f32 = [](uint32_t ea) -> float {
@@ -534,70 +533,83 @@ static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) 
         return x.f;
     };
 
-    /* Process triangles (every 3 vertices = one tri) */
+    static const float LX=0.408f, LY=0.816f, LZ=0.408f;  /* normalised light */
+
     for (uint32_t tri = 0; tri + 2 < vertex_count; tri += 3) {
-        float sx[3], sy[3];
+        float px[3],py[3],pz[3],pw[3];
         for (int i = 0; i < 3; i++) {
-            uint32_t va = vertex_ea + (tri + i) * 16u;
-            float x = be_f32(va), y = be_f32(va+4), w = be_f32(va+12);
-            if (w == 0.0f) w = 1.0f;
-            sx[i] = (x / w + 1.0f) * (W * 0.5f);
-            sy[i] = (1.0f - y / w) * (H * 0.5f);
+            uint32_t va = vertex_ea + (tri+i)*16u;
+            px[i]=be_f32(va); py[i]=be_f32(va+4); pz[i]=be_f32(va+8); pw[i]=be_f32(va+12);
+        }
+        /* Skip all-zero (degenerate) triangles from padding */
+        if (px[0]==0&&py[0]==0&&pz[0]==0 && px[1]==0&&py[1]==0 && px[2]==0&&py[2]==0) continue;
+
+        float sx[3],sy[3];
+        for (int i = 0; i < 3; i++) {
+            float w = (pw[i]==0.0f) ? 1.0f : pw[i];
+            sx[i] = (px[i]/w + 1.0f) * (W*0.5f);
+            sy[i] = (1.0f - py[i]/w) * (H*0.5f);
         }
 
-        /* Bounding box */
-        int x0 = (int)fmaxf(0.0f, fminf(sx[0], fminf(sx[1], sx[2])));
-        int x1 = (int)fminf((float)(W-1), fmaxf(sx[0], fmaxf(sx[1], sx[2])));
-        int y0 = (int)fmaxf(0.0f, fminf(sy[0], fminf(sy[1], sy[2])));
-        int y1 = (int)fminf((float)(H-1), fmaxf(sy[0], fmaxf(sy[1], sy[2])));
+        /* Face normal → flat diffuse shading */
+        float e1x=px[1]-px[0],e1y=py[1]-py[0],e1z=pz[1]-pz[0];
+        float e2x=px[2]-px[0],e2y=py[2]-py[0],e2z=pz[2]-pz[0];
+        float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+        float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+        if (nl>1e-6f){ nx/=nl; ny/=nl; nz/=nl; }
+        float shade=fmaxf(0.15f, nx*LX + ny*LY + nz*LZ);
 
-        /* Edge function sign for CCW vs CW: just use absolute value test */
-        auto edge = [](float ax,float ay,float bx,float by,float px,float py) {
-            return (bx-ax)*(py-ay) - (by-ay)*(px-ax);
+        uint8_t r=(uint8_t)fminf(255.f, shade*255+40);
+        uint8_t g=(uint8_t)fminf(255.f, shade*160+20);
+        uint8_t b=(uint8_t)fminf(255.f, shade*30);
+        uint32_t color = 0xFF000000u|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+
+        int x0=(int)fmaxf(0.f,fminf(sx[0],fminf(sx[1],sx[2])));
+        int x1=(int)fminf((float)(W-1),fmaxf(sx[0],fmaxf(sx[1],sx[2])));
+        int y0=(int)fmaxf(0.f,fminf(sy[0],fminf(sy[1],sy[2])));
+        int y1=(int)fminf((float)(H-1),fmaxf(sy[0],fmaxf(sy[1],sy[2])));
+        if (x1<x0||y1<y0) continue;
+
+        auto ef=[](float ax,float ay,float bx,float by,float cx,float cy){
+            return (bx-ax)*(cy-ay)-(by-ay)*(cx-ax);
         };
-        float area = edge(sx[0],sy[0],sx[1],sy[1],sx[2],sy[2]);
-        if (fabsf(area) < 0.5f) continue;
+        float area=ef(sx[0],sy[0],sx[1],sy[1],sx[2],sy[2]);
+        if (fabsf(area)<0.5f) continue;
 
-        /* Fill pixels */
-        for (int y = y0; y <= y1; y++) {
-            for (int x = x0; x <= x1; x++) {
-                float px = x + 0.5f, py = y + 0.5f;
-                float w0 = edge(sx[1],sy[1],sx[2],sy[2],px,py);
-                float w1 = edge(sx[2],sy[2],sx[0],sy[0],px,py);
-                float w2 = edge(sx[0],sy[0],sx[1],sy[1],px,py);
-                bool inside = (area > 0) ? (w0>=0&&w1>=0&&w2>=0) : (w0<=0&&w1<=0&&w2<=0);
-                if (inside)
-                    fb[y * W + x] = 0xFF00FF00u; /* BGRA green */
-            }
+        for (int y=y0;y<=y1;y++) for (int x=x0;x<=x1;x++) {
+            float cx=x+0.5f,cy=y+0.5f;
+            float w0=ef(sx[1],sy[1],sx[2],sy[2],cx,cy);
+            float w1=ef(sx[2],sy[2],sx[0],sy[0],cx,cy);
+            float w2=ef(sx[0],sy[0],sx[1],sy[1],cx,cy);
+            bool in=(area>0)?(w0>=0&&w1>=0&&w2>=0):(w0<=0&&w1<=0&&w2<=0);
+            if (in) fb[y*W+x]=color;
         }
-        fprintf(stderr, "[RSX-EDGE] rasterized tri %u: (%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)\n",
-                tri/3, sx[0],sy[0], sx[1],sy[1], sx[2],sy[2]);
-        fflush(stderr);
     }
-    rsx_present_frame();
 }
 
 /* Called by the SPU interpreter when EDGE geometry processor MFC_PUTs into the
- * RSX IO-mapped region.  Read the float4 vertex data and software-rasterize it. */
-extern "C" void rsx_on_edge_write(uint32_t put_end_ea) {
+ * RSX IO-mapped region.  Only process the primary vertex output (LS src 0xBC80).
+ * Other PUTs in the same pass carry auxiliary attribute streams. */
+extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src) {
     if (put_end_ea < 0xD0100000u || put_end_ea > 0xD0200000u) return;
+    if (ls_src != 0xBC80u) return;  /* primary vertex output only */
 
-    /* Only rasterize the first tag-0 PUT per geometry batch (the vertex data).
-     * Subsequent tags write other geometry data (normals, UVs etc.) to the same EA. */
-    static uint32_t last_put_end = 0;
-    if (put_end_ea == last_put_end) return;  /* same batch, skip repeats */
-    last_put_end = put_end_ea;
+    uint32_t vtx_count = (put_end_ea - 0xD0100000u) / 16u;
+    if (vtx_count < 3) return;
 
-    /* Vertex data: float4 (xyz+w) starting at 0xD0100000.
-     * Determine vertex count from the data size minus the header area. */
-    uint32_t data_sz = put_end_ea - 0xD0100000u;
-    uint32_t vtx_count = data_sz / 16u;  /* 16 bytes = sizeof(float4) */
-
-    /* Cap to something reasonable — EDGE passes our 3-vertex test through */
-    if (vtx_count == 0) return;
-    if (vtx_count > 3) vtx_count = 3;  /* test triangle only for now */
+    /* Clear background on first frame */
+    static bool first = true;
+    if (first) {
+        first = false;
+        uint32_t* fb = rsx_framebuf();
+        int W = rsx_fb_width(), H = rsx_fb_height();
+        if (fb) for (int i = 0; i < W*H; i++) fb[i] = 0xFF080810u;
+        fprintf(stderr, "[RSX-EDGE] first frame: %u verts (%u tris)\n", vtx_count, vtx_count/3);
+        fflush(stderr);
+    }
 
     edge_rasterize_triangles(0xD0100000u, vtx_count);
+    rsx_present_frame();
 }
 
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
