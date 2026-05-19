@@ -84,7 +84,50 @@ static void spurs_run_workload(int slot_idx) {
 
         fprintf(stderr, "[WL] ELF loaded from guest 0x%X, entry=0x%X, size=0x%X\n",
                 gaddr, g_wl_ctx.pc, gsz);
+
+        /* Dump instructions around the two key PCs that write MFC_EAL:
+         * PC=0x35B4 (vertex source EA) and PC=0x3644 (vertex output EA).
+         * 32 bytes = 8 instructions around each. */
+        fprintf(stderr, "[EDGE-LS] vertex-src-EA writer region (LS[0x35A0..0x35C0]):\n");
+        for (int i = 0; i < 10; i++) {
+            uint32_t pc = 0x35A0 + i*4;
+            fprintf(stderr, "  LS[0x%04X]: %02X %02X %02X %02X\n", pc,
+                g_wl_ctx.ls[pc], g_wl_ctx.ls[pc+1], g_wl_ctx.ls[pc+2], g_wl_ctx.ls[pc+3]);
+        }
+        fprintf(stderr, "[EDGE-LS] vertex-out-EA writer region (LS[0x3630..0x3660]):\n");
+        for (int i = 0; i < 12; i++) {
+            uint32_t pc = 0x3630 + i*4;
+            fprintf(stderr, "  LS[0x%04X]: %02X %02X %02X %02X\n", pc,
+                g_wl_ctx.ls[pc], g_wl_ctx.ls[pc+1], g_wl_ctx.ls[pc+2], g_wl_ctx.ls[pc+3]);
+        }
         fflush(stderr);
+
+        /* Populate the geometry table at LS[0xBC00] with a test entry so the
+         * geometry processor issues DMA GETs/PUTs to real addresses instead of 0.
+         *
+         * Write a 16-byte sentinel pattern so we can identify the byte layout from
+         * the observed DMA EAs.  Bytes 0-3: 0xAA 0xBB 0xCC 0xDD; bytes 4-7: ...
+         * Reading field as LE: 0xBC00[0..3] = 0xDDCCBBAA; as BE = 0xAABBCCDD.
+         *
+         * After first run, replace with real values once layout is confirmed:
+         *   word at correct offset (LE) = src_ea   → geometry data source
+         *   word at correct offset (LE) = out_ea   → output buffer (RSX)
+         *   word at correct offset (BE) = size      → bytes to DMA
+         */
+        {
+            uint32_t gt = 0xBC00u;  /* geometry table LS base */
+            /* Entry 0 — bytes 0..15 */
+            g_wl_ctx.ls[gt+ 0]=0xAA; g_wl_ctx.ls[gt+ 1]=0xBB;
+            g_wl_ctx.ls[gt+ 2]=0xCC; g_wl_ctx.ls[gt+ 3]=0xDD;  /* sentinel word 0 */
+            g_wl_ctx.ls[gt+ 4]=0x11; g_wl_ctx.ls[gt+ 5]=0x22;
+            g_wl_ctx.ls[gt+ 6]=0x33; g_wl_ctx.ls[gt+ 7]=0x44;  /* sentinel word 1 */
+            g_wl_ctx.ls[gt+ 8]=0x55; g_wl_ctx.ls[gt+ 9]=0x66;
+            g_wl_ctx.ls[gt+10]=0x77; g_wl_ctx.ls[gt+11]=0x88;  /* sentinel word 2 */
+            g_wl_ctx.ls[gt+12]=0x99; g_wl_ctx.ls[gt+13]=0xAA;
+            g_wl_ctx.ls[gt+14]=0xBB; g_wl_ctx.ls[gt+15]=0xCC;  /* sentinel word 3 */
+            fprintf(stderr, "[WL] wrote sentinel pattern to geometry table LS[0x%X]\n", gt);
+            fflush(stderr);
+        }
     } else {
         /* Subsequent slots: try workload 2 for slots 1+, with same register setup.
          * Both workload ELFs have the same entry structure (entry=0x3050). */
@@ -158,12 +201,15 @@ static void spurs_run_workload(int slot_idx) {
                     break;
                 }
                 g_wl_ctx.running = 1;
-                /* Trace next 30 instructions of first restart to understand the code */
+                /* Trace next 30 instructions of first restart to understand the code.
+                 * Keep verbose=1 for slot 0 across all restarts so DMA PUT logging
+                 * is never silenced before we see the geometry processor's output. */
                 if (wl_restart == 0) {
                     g_wl_ctx.trace_limit = 30;
                     g_wl_ctx.trace_count = 0;
                 } else {
                     g_wl_ctx.trace_limit = 0;
+                    if (slot_idx == 0) g_wl_ctx.verbose = 1;  /* keep DMA logging on */
                 }
             } else if (wcode == 0x100) {
                 fprintf(stderr, "[WL] slot %d: workload returned (stop 0x100)\n", slot_idx);
@@ -185,16 +231,23 @@ static void spurs_run_workload(int slot_idx) {
 
                 /* EDGE scheduler stop 0x3FFF: r4 = LS destination for task context.
                  * Write a synthetic task descriptor at LS[r4] and jump to the geometry
-                 * processor at LS[0x3108] so it runs during each SPURS dispatch cycle. */
+                 * processor at LS[0x3108] so it runs during each SPURS dispatch cycle.
+                 *
+                 * Descriptor EA fields are stored LITTLE-ENDIAN: the geometry processor
+                 * reads them with LE byte-ordering.  Use le32() so the desired EA is
+                 * preserved exactly. */
                 uint32_t desc_ls = g_wl_ctx.gpr[4].u32[0];  /* = 0xADD0 */
-                uint32_t src_ea  = 0x70A000u;   /* synthetic source EA (SPURS ctx area) */
+                uint32_t src_ea  = 0xA07000u;   /* DMA GET source (LE in descriptor) */
                 uint32_t out_ea  = 0xD0100000u; /* RSX IO command buffer — geometry output */
 
-                /* 16-byte task descriptor (big-endian words):
-                 *   word 0 (+0x00): flags / task type
-                 *   word 1 (+0x04): source geometry EA (MFC GET address)
-                 *   word 2 (+0x08): output buffer EA   (MFC PUT address for RSX cmds)
-                 *   word 3 (+0x0C): batch size / padding */
+                /* little-endian store helper for descriptor EA fields */
+                auto le32 = [&](uint32_t off, uint32_t v) {
+                    g_wl_ctx.ls[off+0] = (uint8_t)(v);
+                    g_wl_ctx.ls[off+1] = (uint8_t)(v >> 8);
+                    g_wl_ctx.ls[off+2] = (uint8_t)(v >> 16);
+                    g_wl_ctx.ls[off+3] = (uint8_t)(v >> 24);
+                };
+                /* big-endian store for non-EA fields */
                 auto be32 = [&](uint32_t off, uint32_t v) {
                     g_wl_ctx.ls[off+0] = (uint8_t)(v>>24);
                     g_wl_ctx.ls[off+1] = (uint8_t)(v>>16);
@@ -202,9 +255,61 @@ static void spurs_run_workload(int slot_idx) {
                     g_wl_ctx.ls[off+3] = (uint8_t)(v);
                 };
                 be32(desc_ls+ 0, 0u);
-                be32(desc_ls+ 4, src_ea);
-                be32(desc_ls+ 8, out_ea);
+                le32(desc_ls+ 4, src_ea);   /* source geometry EA (LE) */
+                le32(desc_ls+ 8, out_ea);   /* output buffer EA (LE) */
                 be32(desc_ls+12, 0u);
+
+                /* Write synthetic geometry data at src_ea so the geometry processor
+                 * finds non-zero data after its DMA GET.  The trace (run_edge4.txt)
+                 * shows: at PC=0x3230 the processor loads a quad from LS[0xFEF0]
+                 * (the DMA destination) and sets r4 = loaded-data.  If all zeros,
+                 * r4=0 → r3=0 → brz at 0x323C → "empty batch" path, no output.
+                 * Non-zero data here should let the processor proceed past that branch.
+                 *
+                 * Fill with a recognisable pattern: each 16-byte row has a non-zero
+                 * count in word 0 (big-endian u32 = 1) and incrementing data so we
+                 * can identify which offsets the processor actually reads. */
+                if (vm_base && slot_idx == 0) {
+                    uint8_t *p = vm_base + src_ea;
+                    memset(p, 0, 0x4000);
+                    /* Count at offset 0x60 (bit 5 set → AND check passes) */
+                    p[0x60] = 0x00; p[0x61] = 0x00; p[0x62] = 0x00; p[0x63] = 0x20;
+                    /* Write sentinels at 0x00-0x3F so MFC_EAL is non-zero.
+                     * The @pc annotation on wrch MFC_EAL will tell us which instruction
+                     * computes the vertex source EA — key for finding the field layout. */
+                    for (int f = 0; f < 0x40/4; f++) {
+                        uint8_t b = (uint8_t)(0x30 + f);
+                        p[f*4+0] = b; p[f*4+1] = b; p[f*4+2] = b; p[f*4+3] = b;
+                    }
+                    fprintf(stderr, "[WL] slot %d: sentinels 0x30..0x3F at +0x00..+0x3F (+pc logging)\n",
+                            slot_idx);
+                    fflush(stderr);
+                }
+
+                /* Pre-load test vertex data into LS[0x134] — the LS-mapped DMA GET
+                 * (ea=0xFE000134) will copy FROM LS[0x134] into the work buffer.
+                 * EDGE geometry buffer format (16 bytes per vertex, big-endian floats):
+                 *   float3 pos (12 bytes) + 4 bytes padding = 16 bytes/vertex.
+                 * Write 3 vertices = 48 bytes starting at LS[0x134]. */
+                {
+                    auto be_f32 = [&](uint32_t off, float v) {
+                        union { float f; uint32_t u; } x; x.f = v;
+                        g_wl_ctx.ls[off+0] = (uint8_t)(x.u >> 24);
+                        g_wl_ctx.ls[off+1] = (uint8_t)(x.u >> 16);
+                        g_wl_ctx.ls[off+2] = (uint8_t)(x.u >>  8);
+                        g_wl_ctx.ls[off+3] = (uint8_t)(x.u);
+                    };
+                    uint32_t vbase = 0x134u;
+                    /* Vertex 0: (0, 1, 0) */
+                    be_f32(vbase+ 0, 0.0f); be_f32(vbase+ 4, 1.0f); be_f32(vbase+ 8, 0.0f); be_f32(vbase+12, 1.0f);
+                    /* Vertex 1: (-1, -1, 0) */
+                    be_f32(vbase+16,-1.0f); be_f32(vbase+20,-1.0f); be_f32(vbase+24, 0.0f); be_f32(vbase+28, 1.0f);
+                    /* Vertex 2: (1, -1, 0) */
+                    be_f32(vbase+32, 1.0f); be_f32(vbase+36,-1.0f); be_f32(vbase+40, 0.0f); be_f32(vbase+44, 1.0f);
+                    if (slot_idx == 0)
+                        fprintf(stderr, "[WL] slot %d: wrote triangle verts to LS[0x%X]\n",
+                                slot_idx, vbase);
+                }
 
                 /* Redirect to geometry processor entry */
                 g_wl_ctx.gpr[3].u32[0]  = desc_ls;
@@ -212,10 +317,11 @@ static void spurs_run_workload(int slot_idx) {
                 g_wl_ctx.pc      = 0x3108;
                 g_wl_ctx.running = 1;
 
-                /* Enable verbose DMA trace on first dispatch to capture output addresses */
+                /* Enable verbose DMA trace on first dispatch; extend to 400 insns
+                 * so we can see r61 (vertex EAL) and r60 (size) being computed. */
                 if (slot_idx == 0) {
                     g_wl_ctx.verbose     = 1;
-                    g_wl_ctx.trace_limit = 100;
+                    g_wl_ctx.trace_limit = 400;
                     g_wl_ctx.trace_count = 0;
                     fprintf(stderr, "[WL] slot %d: EDGE svc 0x3FFF (sched PC=0x%X)"
                             " → geometry proc desc_ls=0x%X src_ea=0x%X out_ea=0x%X\n",

@@ -119,9 +119,11 @@ static inline uint32_t sign_ext18(uint32_t v) {
 
 /* MFC DMA command codes */
 #define MFC_PUT  0x20
+#define MFC_PUTB 0x22  /* put with barrier, non-snoop */
+#define MFC_PUTF 0x24  /* put with fence, non-snoop   */
 #define MFC_GET  0x40
-#define MFC_GETB 0x41
-#define MFC_PUTB 0x21
+#define MFC_GETB 0x42  /* get with barrier, non-snoop */
+#define MFC_GETF 0x44  /* get with fence, non-snoop   */
 
 /* --------------------------------------------------------------------------
  * DMA
@@ -136,22 +138,41 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
     uint32_t ea32 = (uint32_t)ea;
 
     switch (cmd & 0xFF) {
-        case MFC_GET: case MFC_GETB:
+        case MFC_GET: case MFC_GETB: case MFC_GETF:
             if (ctx->verbose)
                 fprintf(stderr, "[SPU%d] DMA GET  ea=0x%08X ls=0x%05X sz=0x%X tag=%u\n",
                         ctx->id, ea32, lsa, sz, ctx->mfc_tag);
-            if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
+            /* LS-mapped DMA: EDGE maps its own LS into PPU address space at 0xFE000000.
+             * DMA GET from that range copies LS[ea-0xFE000000] → LS[lsa]. */
+            if (ea32 >= 0xFE000000u && ea32 + sz <= 0xFF000000u) {
+                uint32_t ls_src = ea32 - 0xFE000000u;
+                if (ls_src + sz <= SPU_LS_SIZE) {
+                    if (ctx->verbose)
+                        fprintf(stderr, "[SPU%d]   LS→LS GET ls_src=0x%X\n", ctx->id, ls_src);
+                    memcpy(ctx->ls + lsa, ctx->ls + ls_src, sz);
+                }
+            } else if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
                 memcpy(ctx->ls + lsa, ctx->vm_base + ea32, sz);
             break;
-        case MFC_PUT: case MFC_PUTB:
+        case MFC_PUT: case MFC_PUTB: case MFC_PUTF:
             if (ctx->verbose)
                 fprintf(stderr, "[SPU%d] DMA PUT  ea=0x%08X ls=0x%05X sz=0x%X tag=%u\n",
                         ctx->id, ea32, lsa, sz, ctx->mfc_tag);
-            if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
-                memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
-            /* Notify RSX parser when EDGE writes into the RSX IO-mapped region */
-            if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u)
-                rsx_on_edge_write(ea32 + sz);
+            /* LS-mapped DMA: PUT writes from LS[lsa] → LS[ea-0xFE000000]. */
+            if (ea32 >= 0xFE000000u && ea32 + sz <= 0xFF000000u) {
+                uint32_t ls_dst = ea32 - 0xFE000000u;
+                if (ls_dst + sz <= SPU_LS_SIZE) {
+                    if (ctx->verbose)
+                        fprintf(stderr, "[SPU%d]   LS→LS PUT ls_dst=0x%X\n", ctx->id, ls_dst);
+                    memcpy(ctx->ls + ls_dst, ctx->ls + lsa, sz);
+                }
+            } else {
+                if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
+                    memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
+                /* Notify RSX parser when EDGE writes into the RSX IO-mapped region */
+                if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u)
+                    rsx_on_edge_write(ea32 + sz);
+            }
             break;
         default:
             break;
@@ -163,10 +184,22 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
  * -------------------------------------------------------------------------- */
 static void wrch(spu_ctx_t *ctx, uint32_t ch, uint32_t val) {
     switch (ch) {
-        case CH_MFC_LSA:        ctx->mfc_lsa  = val; break;
-        case CH_MFC_EAH:        ctx->mfc_eah  = val; break;
-        case CH_MFC_EAL:        ctx->mfc_eal  = val; break;
-        case CH_MFC_Size:       ctx->mfc_size = val; break;
+        case CH_MFC_LSA:
+            if (ctx->verbose)
+                fprintf(stderr, "[SPU%d] wrch MFC_LSA=0x%X\n", ctx->id, val);
+            ctx->mfc_lsa  = val; break;
+        case CH_MFC_EAH:
+            if (ctx->verbose)
+                fprintf(stderr, "[SPU%d] wrch MFC_EAH=0x%X\n", ctx->id, val);
+            ctx->mfc_eah  = val; break;
+        case CH_MFC_EAL:
+            if (ctx->verbose)
+                fprintf(stderr, "[SPU%d] wrch MFC_EAL=0x%X @pc=0x%X\n", ctx->id, val, ctx->pc);
+            ctx->mfc_eal  = val; break;
+        case CH_MFC_Size:
+            if (ctx->verbose)
+                fprintf(stderr, "[SPU%d] wrch MFC_Size=0x%X\n", ctx->id, val);
+            ctx->mfc_size = val; break;
         case CH_MFC_TagID:      ctx->mfc_tag  = val; break;
         case CH_MFC_Cmd:        mfc_execute(ctx, val); break;
         case CH_MFC_WrTagMask:  ctx->mfc_tagmask = val; break;
@@ -275,14 +308,17 @@ void spu_step(spu_ctx_t *ctx) {
     /* Optional per-instruction trace */
     if (ctx->trace_limit && ctx->trace_count < ctx->trace_limit) {
         ctx->trace_count++;
-        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=%X r2=%X r3=%X r4=%X r8=%X r9=%X r10=%X r11=%X r13=%X r14=%X\n",
+        fprintf(stderr, "[SPU%d:%06llu] PC=0x%04X insn=0x%08X r0=%X r2=%X r3=%X r4=%X r8=%X r9=%X r10=%X r11=%X r13=%X r14=%X r23=%X r24=%X r31=%X r61=%X r60=%X\n",
                 ctx->id, (unsigned long long)ctx->trace_count,
                 pc, insn,
                 ctx->gpr[0].u32[0], ctx->gpr[2].u32[0],
                 ctx->gpr[3].u32[0], ctx->gpr[4].u32[0],
                 ctx->gpr[8].u32[0], ctx->gpr[9].u32[0],
                 ctx->gpr[10].u32[0], ctx->gpr[11].u32[0],
-                ctx->gpr[13].u32[0], ctx->gpr[14].u32[0]);
+                ctx->gpr[13].u32[0], ctx->gpr[14].u32[0],
+                ctx->gpr[23].u32[0], ctx->gpr[24].u32[0],
+                ctx->gpr[31].u32[0],
+                ctx->gpr[61].u32[0], ctx->gpr[60].u32[0]);
         fflush(stderr);
     }
 
