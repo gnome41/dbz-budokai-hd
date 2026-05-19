@@ -221,7 +221,7 @@ static void spurs_run_workload(int slot_idx) {
                  * reads them with LE byte-ordering.  Use le32() so the desired EA is
                  * preserved exactly. */
                 uint32_t desc_ls = g_wl_ctx.gpr[4].u32[0];  /* = 0xADD0 */
-                uint32_t src_ea  = 0xA07000u;   /* DMA GET source (LE in descriptor) */
+                uint32_t src_ea  = 0x70C000u;   /* DMA GET source — synthetic SPURS area (safe, not in ELF BSS) */
                 uint32_t out_ea  = 0xD0100000u; /* RSX IO command buffer — geometry output */
 
                 /* little-endian store helper for descriptor EA fields */

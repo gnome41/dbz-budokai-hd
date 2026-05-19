@@ -143,20 +143,35 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - Calls `func_000510E4` (line 7997) with r3=stack struct containing 0xF2890, r4=0xF2890
 - Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
 
+**EDGE output format (discovered this session):**
+EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands) to the output buffer EA. The MFC PUT writes 16KB (0x4000 bytes) of float4 vertices from LS[0xBC80] to the output EA. The PPU side would normally issue NV4097 draw calls referencing this vertex buffer. Our test triangle passes through EDGE unchanged:
+- Vertex 0: (0,1,0,1) → screen (640, 0) = top center
+- Vertex 1: (-1,-1,0,1) → screen (0, 720) = bottom left
+- Vertex 2: (1,-1,0,1) → screen (1280, 720) = bottom right
+
+**PUT EA formula (now fixed):**
+- `lqx r43, r49, r124` at LS[0x35FC]: lsaddr = (r49+r124)&~15 = 0x3430 (from sentinel bytes 0x34)
+- Original bytes[4..7] at lsaddr: 0x3FBF0C83 → PUT EA = 0x830CBF3F (garbage)
+- Patched bytes[4..7] to {0x00,0x00,0x10,0xD0} → PUT EA = 0xD0100000 ✓
+- Patch applied in `spu_step()` at `pc == 0x35FCu && ctx->id == 2`
+
+**src_ea must be outside ELF BSS (0x10000–0x10010000):**
+`src_ea = 0x70C000` (SPURS synthetic area). Previously 0xA07000 was corrupting ELF BSS data, causing SDU threads to exit immediately (regression introduced when workload dispatch first fired).
+
+**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 big-endian vertices from 0xD0100000, projects to screen, fills triangle in BGRA8 framebuffer with solid green, calls `rsx_present_frame()`. First triangle rendered to Win32 window confirmed (640,0)→(0,720)→(1280,720).
+
 **Outstanding questions for the next iteration:**
-- **Real EDGE task descriptor** — EDGE pipeline fully wired. Output goes to RSX via PUT redirect but data is garbage (sentinel vertices → garbage transform). To get valid RSX draw commands: need a proper EDGE task descriptor at LS[0xADD0] that describes vertex format, output layout, etc. The lqx at LS[0x35FC] reads `r43` from `LS[(r49+r124)&~15]`; writing LE 0xD0100000 at bytes[4..7] of that LS quad gives PUT EA = 0xD0100000 directly (needs tracing r49+r124 with target descriptor content).
-- **Finding real EDGE descriptors** — The game's PPU-side EDGE setup (called from game loop, not func_00012420 init) creates EDGE task descriptors. Scanning ppu_recomp.cpp for calls to EDGE PPU functions would identify where descriptors are built and what vertex data they reference.
-- **RSX command buffer parsing** — infrastructure in place (`rsx_process_fifo` + `rsx_on_edge_write()`). Will activate as soon as geometry output contains valid NV4097 commands. Parser handles 0x1820 and 0x1D94 today; needs NV4097_DRAW_ARRAYS (0x1808) for actual rendering.
+- **Real game vertex data** — test triangle uses synthetic float4 vertices from LS[0x134]. Need to find where the game stores real vertex data and point EDGE's GET EA there. The stream descriptor at 0x70C000 (src_ea) controls what EDGE DMA-GETs.
+- **EDGE stream descriptor format** — the geometry processor reads from 0x70C000 via DMA GET. Count field at byte 0x63 = 0x20; size of DMA GET = 0x4000 (16KB). Real vertex buffer EAs are set in the stream descriptor by the game's PPU-side EDGE setup code.
+- **Finding real EDGE descriptors** — the game's PPU-side EDGE setup (called from game loop, not func_00012420 init) creates EDGE task descriptors. Scanning ppu_recomp.cpp for calls to EDGE PPU functions would identify where descriptors are built and what vertex data they reference.
+- **Advance game loop** — game main (func_00012420) is pure init with no game loop. Actual gameplay logic is SPURS/SPU-driven. To trigger real EDGE usage, the game loop needs to run.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
-### RSX command buffer infrastructure (`runtime_glue.cpp`)
-The RSX FIFO parser (`rsx_process_fifo`) fires on every PUT register write (guest addr 0x10). Parsed registers:
-- `0x1820` NV4097_SET_COLOR_CLEAR_VALUE → stores RGBA8 clear color
-- `0x1D94` NV4097_CLEAR_SURFACE → fills g_framebuf with clear color and calls rsx_present_frame()
-
-The parser tracks RSX IO GET position (g_rsx_get_ea), converts RSX IO offsets to guest EAs via `rsx_io_to_ea()` (small offsets < 0x1000000 map to CMD_BUF=0xD0100000+offset). The GCM command buffer (CMD_BUF=0xD0100000, 1MB) is committed in the guest RSX IO-mapped region.
-
-GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158 → 0x70E000): fields set at BOTH possible layouts (+0x00/+0x04 current/begin AND +0x08/+0x0C current/begin) so either cellGcm version works. End pointer at +0x10 = 0xD01FFFFC. IO size at +0x18, flags at +0x1C.
+### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
+- `rsx_process_fifo`: PPU RSX FIFO parser, fires on PUT register writes (guest addr 0x10). Handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820), NV4097_CLEAR_SURFACE (0x1D94), NV4097_DRAW_ARRAYS (0x1808, logged only).
+- `rsx_on_edge_write(put_end_ea)`: called by SPU interpreter when EDGE PUTs to 0xD0100000-0xD0200000. Invokes `edge_rasterize_triangles` to software-render the vertex batch.
+- `edge_rasterize_triangles(vertex_ea, count)`: reads float4 BE vertices from guest memory, projects to 1280×720 screen, fills with barycentric test, writes BGRA8 to framebuffer.
+- GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158). End pointer at +0x10 = 0xD01FFFFC. IO size at +0x18, flags at +0x1C.
 - Identify the 26 sysPrxForUser NIDs imported by this ELF
 - New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented
 

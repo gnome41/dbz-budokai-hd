@@ -451,6 +451,12 @@ static void rsx_handle(uint32_t method, uint32_t arg) {
             break;
 
         default:
+            /* Log NV4097 vertex array setup methods emitted by the EDGE geometry processor */
+            if ((method & 0xFFFFu) >= 0x1680u && (method & 0xFFFFu) < 0x1800u) {
+                fprintf(stderr, "[RSX] EDGE vertex method 0x%04X arg=0x%08X\n",
+                        method & 0xFFFF, arg);
+                fflush(stderr);
+            }
             break;
     }
 }
@@ -512,15 +518,86 @@ static void rsx_process_fifo(uint32_t put_val) {
     g_rsx_get_ea = put_val;
 }
 
+/* Minimal software triangle rasterizer for EDGE geometry output.
+ * Reads float4 big-endian vertices from guest EA, projects to framebuffer coords,
+ * fills triangles with a solid colour, and presents the frame. */
+static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) {
+    uint32_t* fb = rsx_framebuf();
+    int W = rsx_fb_width();
+    int H = rsx_fb_height();
+    if (!fb || vertex_count < 3 || W <= 0 || H <= 0) return;
+
+    auto be_f32 = [](uint32_t ea) -> float {
+        union { uint32_t u; float f; } x;
+        x.u = ((uint32_t)vm_base[ea  ]<<24)|((uint32_t)vm_base[ea+1]<<16)
+             |((uint32_t)vm_base[ea+2]<< 8)| vm_base[ea+3];
+        return x.f;
+    };
+
+    /* Process triangles (every 3 vertices = one tri) */
+    for (uint32_t tri = 0; tri + 2 < vertex_count; tri += 3) {
+        float sx[3], sy[3];
+        for (int i = 0; i < 3; i++) {
+            uint32_t va = vertex_ea + (tri + i) * 16u;
+            float x = be_f32(va), y = be_f32(va+4), w = be_f32(va+12);
+            if (w == 0.0f) w = 1.0f;
+            sx[i] = (x / w + 1.0f) * (W * 0.5f);
+            sy[i] = (1.0f - y / w) * (H * 0.5f);
+        }
+
+        /* Bounding box */
+        int x0 = (int)fmaxf(0.0f, fminf(sx[0], fminf(sx[1], sx[2])));
+        int x1 = (int)fminf((float)(W-1), fmaxf(sx[0], fmaxf(sx[1], sx[2])));
+        int y0 = (int)fmaxf(0.0f, fminf(sy[0], fminf(sy[1], sy[2])));
+        int y1 = (int)fminf((float)(H-1), fmaxf(sy[0], fmaxf(sy[1], sy[2])));
+
+        /* Edge function sign for CCW vs CW: just use absolute value test */
+        auto edge = [](float ax,float ay,float bx,float by,float px,float py) {
+            return (bx-ax)*(py-ay) - (by-ay)*(px-ax);
+        };
+        float area = edge(sx[0],sy[0],sx[1],sy[1],sx[2],sy[2]);
+        if (fabsf(area) < 0.5f) continue;
+
+        /* Fill pixels */
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                float px = x + 0.5f, py = y + 0.5f;
+                float w0 = edge(sx[1],sy[1],sx[2],sy[2],px,py);
+                float w1 = edge(sx[2],sy[2],sx[0],sy[0],px,py);
+                float w2 = edge(sx[0],sy[0],sx[1],sy[1],px,py);
+                bool inside = (area > 0) ? (w0>=0&&w1>=0&&w2>=0) : (w0<=0&&w1<=0&&w2<=0);
+                if (inside)
+                    fb[y * W + x] = 0xFF00FF00u; /* BGRA green */
+            }
+        }
+        fprintf(stderr, "[RSX-EDGE] rasterized tri %u: (%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)\n",
+                tri/3, sx[0],sy[0], sx[1],sy[1], sx[2],sy[2]);
+        fflush(stderr);
+    }
+    rsx_present_frame();
+}
+
 /* Called by the SPU interpreter when EDGE geometry processor MFC_PUTs into the
- * RSX IO-mapped region.  Treat the written data as new RSX command buffer content
- * and advance the parser's GET position to process it. */
+ * RSX IO-mapped region.  Read the float4 vertex data and software-rasterize it. */
 extern "C" void rsx_on_edge_write(uint32_t put_end_ea) {
-    /* put_end_ea is the byte after the last PUT (i.e. new PUT pointer).
-     * Convert to an RSX IO offset and call the FIFO parser. */
     if (put_end_ea < 0xD0100000u || put_end_ea > 0xD0200000u) return;
-    uint32_t io_off = put_end_ea - 0xD0100000u;
-    rsx_process_fifo(io_off);
+
+    /* Only rasterize the first tag-0 PUT per geometry batch (the vertex data).
+     * Subsequent tags write other geometry data (normals, UVs etc.) to the same EA. */
+    static uint32_t last_put_end = 0;
+    if (put_end_ea == last_put_end) return;  /* same batch, skip repeats */
+    last_put_end = put_end_ea;
+
+    /* Vertex data: float4 (xyz+w) starting at 0xD0100000.
+     * Determine vertex count from the data size minus the header area. */
+    uint32_t data_sz = put_end_ea - 0xD0100000u;
+    uint32_t vtx_count = data_sz / 16u;  /* 16 bytes = sizeof(float4) */
+
+    /* Cap to something reasonable — EDGE passes our 3-vertex test through */
+    if (vtx_count == 0) return;
+    if (vtx_count > 3) vtx_count = 3;  /* test triangle only for now */
+
+    edge_rasterize_triangles(0xD0100000u, vtx_count);
 }
 
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
