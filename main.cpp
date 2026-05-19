@@ -108,6 +108,7 @@ extern "C" void thread_runtime_join_all();
 extern "C" volatile bool g_threads_should_exit;
 extern "C" void spurs_start(void);
 extern "C" void spurs_verbose_off(void);
+extern "C" void spurs_test_edge_geometry(void);
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
 
 #define DRAIN_TRAMPOLINE(ctx) do { \
