@@ -114,6 +114,8 @@ A 1280×720 window opens and displays for about 3 seconds:
 
 The sphere represents EDGE geometry output — the same pipeline the game itself uses for character and stage rendering. Each frame goes through: SPURS kernel dispatch → EDGE SPU geometry library → MFC DMA PUT → software rasterizer → Win32 DIB blit.
 
+![Screenshot of the running application](screenshots/screenshot.png)
+
 ---
 
 ## Architecture overview
