@@ -435,20 +435,27 @@ extern "C" void spurs_start(void) {
         fprintf(stderr, "[SPURS] patched LS[0x17C] with ilh r2,1 (0x%08X)\n", ilh_r2_1);
     }
 
-    /* Patch LS[0x03C0]: replace brhnz r13, 0x298E0 → lnop to force dispatch.
+    /* Patch LS[0x03BC] and LS[0x03C0]: replace both brhnz → lnop to force dispatch.
      *
-     * The `brhnz r13` at 0x03C0 checks if r13.high≠0 → idles.  r13 is
-     * always 0x1F5F0 (from `ila r13, 0x1F5F0` at 0x0308) — upper halfword=1.
-     * The check is a "no workload found" sentinel.  Patching to lnop forces
-     * fall-through so the dispatch code at 0x03C4+ runs and we can trace
-     * what the kernel does when it tries to dispatch a workload. */
+     * The actual brhnz registers (from ELF decode) are r36 at 0x03BC and r33 at 0x03C0
+     * (not r12/r13 as previously documented).  With r79=0, r36.high=0 (falls through
+     * 0x03BC naturally), but r33.high≠0 (needs lnop at 0x03C0).
+     * With r79=1, r36.high becomes 0x00C0≠0 — 0x03BC also branches to idle.
+     * Patch both to lnop for robust forced dispatch regardless of r79. */
     {
-        uint32_t lnop_insn = 0x00200000u;   /* lnop = no-operation (odd pipe) */
+        uint32_t lnop_insn = 0x00200000u;
+        /* Patch 0x03BC (brhnz r36) */
+        g_spurs_ctx.ls[0x3BC] = (uint8_t)(lnop_insn >> 24);
+        g_spurs_ctx.ls[0x3BD] = (uint8_t)(lnop_insn >> 16);
+        g_spurs_ctx.ls[0x3BE] = (uint8_t)(lnop_insn >>  8);
+        g_spurs_ctx.ls[0x3BF] = (uint8_t)(lnop_insn);
+        /* Patch 0x03C0 (brhnz r33) */
         g_spurs_ctx.ls[0x3C0] = (uint8_t)(lnop_insn >> 24);
         g_spurs_ctx.ls[0x3C1] = (uint8_t)(lnop_insn >> 16);
         g_spurs_ctx.ls[0x3C2] = (uint8_t)(lnop_insn >>  8);
         g_spurs_ctx.ls[0x3C3] = (uint8_t)(lnop_insn);
-        fprintf(stderr, "[SPURS] patched LS[0x03C0] brhnz-r13 → lnop (force dispatch)\n");
+        fprintf(stderr, "[SPURS] patched LS[0x03BC] brhnz-r36 → lnop\n");
+        fprintf(stderr, "[SPURS] patched LS[0x03C0] brhnz-r33 → lnop (force dispatch)\n");
     }
 
     /* Set up initial arguments:
@@ -532,7 +539,7 @@ extern "C" void spurs_start(void) {
                 }
 
                 /* End burst when kernel idles in BSS/data regions past the code section.
-                 * 0x298E0: old "no workload" idle; 0x20600+: new "wait for completion" idle.
+                 * 0x298D0/0x298E0: brhnz idle targets; 0x20600+: post-dispatch idle.
                  * Stop the burst at either, so we don't burn restarts on sequential stops. */
                 if (g_spurs_ctx.pc >= 0x29000u || g_spurs_ctx.pc >= 0x20600u) {
                     fprintf(stderr, "[SPURS] kernel post-dispatch idle at PC=0x%X — ending burst\n",
@@ -547,7 +554,7 @@ extern "C" void spurs_start(void) {
                 if (restart == 1) {
                     g_spurs_ctx.trace_limit = 200;
                     g_spurs_ctx.trace_count = 0;
-                    fprintf(stderr, "[SPURS] TRACE dispatch run (200 insns from brhnz)\n");
+                    fprintf(stderr, "[SPURS] TRACE dispatch run (200 insns)\n");
                     fflush(stderr);
                 } else {
                     g_spurs_ctx.trace_limit = 0;
