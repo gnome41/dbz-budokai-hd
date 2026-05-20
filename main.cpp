@@ -109,6 +109,7 @@ extern "C" volatile bool g_threads_should_exit;
 extern "C" void spurs_start(void);
 extern "C" void spurs_verbose_off(void);
 extern "C" void spurs_test_edge_geometry(void);
+extern "C" void rsx_load_launch_background(const char* afs_path);
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
 
 #define DRAIN_TRAMPOLINE(ctx) do { \
@@ -398,6 +399,8 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     CreateThread(nullptr, 0, window_thread_proc, nullptr, 0, nullptr);
     Sleep(200);  /* Let window open before game starts */
+    /* Load background texture from game disc (LAUNCH/data.afs entry 15: 2048×1024 BGRA8). */
+    rsx_load_launch_background("..\\BLES01658\\PS3_GAME\\USRDIR\\LAUNCH\\data.afs");
 #endif
 
     printf("Entering recompiled entry point...\n");
