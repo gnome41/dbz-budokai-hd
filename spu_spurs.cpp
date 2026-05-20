@@ -50,6 +50,9 @@ extern "C" volatile bool g_threads_should_exit;
 static spu_ctx_t g_spurs_ctx;
 static int       g_spurs_started = 0;
 
+/* Forward declaration for RSX edge-write callback (runtime_glue.cpp) */
+extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src);
+
 /* ---- Game workload runner ------------------------------------------------ */
 /* Loaded lazily on first dispatch.  One shared context reused per slot since
  * we run workloads synchronously during the diagnostic burst. */
@@ -312,6 +315,28 @@ static void spurs_run_workload(int slot_idx) {
                     if (sphere_frame == 1)
                         fprintf(stderr, "[WL] slot %d: sphere mesh %u verts (%u tris) animated\n",
                                 slot_idx, vcount, vcount/3);
+                }
+
+                /* Passthrough: copy sphere vertices to EDGE output buffer and
+                 * commit directly to guest RSX memory, then trigger rendering.
+                 * The FP transform ops (op11=0x1E4/1E5/1F8 etc.) are UNIMPL so
+                 * EDGE's own vertex stores leave garbage and the DMA PUT fires
+                 * with size=0.  We bypass this by doing the copy+render here. */
+                if (slot_idx == 0) {
+                    uint32_t verts = 0u;
+                    /* Count non-zero float4 vertices in our sphere buffer */
+                    for (uint32_t i = 0; i < 1024u; i++) {
+                        uint32_t off = 0x134u + i*16u;
+                        if (g_wl_ctx.ls[off+0]||g_wl_ctx.ls[off+1]||
+                            g_wl_ctx.ls[off+2]||g_wl_ctx.ls[off+3]) verts = i+1;
+                    }
+                    if (verts < 3) verts = 3;
+                    /* Copy to both EDGE LS output buf and guest RSX IO region */
+                    memcpy(g_wl_ctx.ls + 0xBC80u, g_wl_ctx.ls + 0x134u, verts*16u);
+                    if (vm_base) {
+                        memcpy(vm_base + 0xD0100000u, g_wl_ctx.ls + 0x134u, verts*16u);
+                        rsx_on_edge_write(0xD0100000u + verts*16u, 0xBC80u);
+                    }
                 }
 
                 /* Redirect to geometry processor entry */

@@ -523,6 +523,52 @@ static float* g_z_buf    = nullptr;
 static int    g_z_buf_sz = 0;
 static uint32_t g_frame_no = 0;
 
+/* Background texture from LAUNCH/data.afs entry 15 (2048×1024 BGRA8). */
+static uint8_t* g_bg_pixels = nullptr;
+static int      g_bg_w = 0, g_bg_h = 0;
+
+extern "C" void rsx_load_launch_background(const char* afs_path) {
+    FILE* f = fopen(afs_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[BG] cannot open '%s' (background skipped)\n", afs_path);
+        fflush(stderr);
+        return;
+    }
+    char magic[4]; fread(magic, 1, 4, f);
+    if (magic[0]!='A'||magic[1]!='F'||magic[2]!='S') {
+        fprintf(stderr, "[BG] bad magic in '%s'\n", afs_path);
+        fclose(f); return;
+    }
+    /* Entry 15: AFS directory at offset 8 + 15*8 = 128 bytes. */
+    fseek(f, 8 + 15*8, SEEK_SET);
+    uint32_t entry_off = 0, entry_sz = 0;
+    fread(&entry_off, 4, 1, f);
+    fread(&entry_sz,  4, 1, f);
+
+    /* Entry 15 layout: 0xE0-byte #A3T header, then 2048×1024 BGRA8 pixel data. */
+    const uint32_t HDR_SZ = 0xE0u;
+    const int TEX_W = 2048, TEX_H = 1024;
+    if (entry_sz <= HDR_SZ) {
+        fprintf(stderr, "[BG] entry 15 too small (%u)\n", entry_sz);
+        fclose(f); return;
+    }
+    uint32_t pixel_sz = entry_sz - HDR_SZ;
+    uint8_t* pix = new uint8_t[pixel_sz];
+    fseek(f, (long)(entry_off + HDR_SZ), SEEK_SET);
+    size_t got = fread(pix, 1, pixel_sz, f);
+    fclose(f);
+    if (got != pixel_sz) {
+        fprintf(stderr, "[BG] short read %zu/%u\n", got, pixel_sz);
+        delete[] pix; return;
+    }
+    delete[] g_bg_pixels;
+    g_bg_pixels = pix;
+    g_bg_w = TEX_W; g_bg_h = TEX_H;
+    fprintf(stderr, "[BG] loaded LAUNCH background %dx%d BGRA8 (%u bytes) from '%s'\n",
+            TEX_W, TEX_H, pixel_sz, afs_path);
+    fflush(stderr);
+}
+
 static void frame_begin(int W, int H) {
     int n = W * H;
     if (g_z_buf_sz < n) {
@@ -530,10 +576,24 @@ static void frame_begin(int W, int H) {
         g_z_buf = new float[n];
         g_z_buf_sz = n;
     }
-    /* Dark blue background + clear z */
     uint32_t* fb = rsx_framebuf();
-    uint32_t bg = 0xFF080810u;
-    for (int i = 0; i < n; i++) { fb[i] = bg; g_z_buf[i] = 2.0f; }
+    if (g_bg_pixels && g_bg_w > 0 && g_bg_h > 0) {
+        /* Scale background to screen (nearest-neighbour, BGRA8→BGRA8, alpha forced opaque). */
+        for (int dy = 0; dy < H; dy++) {
+            int sy = dy * g_bg_h / H;
+            const uint8_t* row = g_bg_pixels + sy * g_bg_w * 4;
+            uint32_t* dst = fb + dy * W;
+            for (int dx = 0; dx < W; dx++) {
+                int sx = dx * g_bg_w / W;
+                const uint8_t* p = row + sx * 4;
+                dst[dx] = 0xFF000000u | ((uint32_t)p[2]<<16) | ((uint32_t)p[1]<<8) | p[0];
+            }
+        }
+    } else {
+        uint32_t bg = 0xFF080810u;
+        for (int i = 0; i < n; i++) fb[i] = bg;
+    }
+    for (int i = 0; i < n; i++) g_z_buf[i] = 2.0f;
 }
 
 /* Soft-rasterize float4 BE vertex soup with depth buffer + specular shading. */

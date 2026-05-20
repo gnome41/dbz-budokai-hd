@@ -323,22 +323,24 @@ void spu_step(spu_ctx_t *ctx) {
     /* (Change detectors removed after analysis — see CLAUDE.md for findings.) */
 
     /* PUT EA fixup for EDGE geometry processor: before lqx at 0x35FC, patch
-     * LS[(r49+r124)&~15].u8[4..7] to LE 0xD0100000 so EDGE writes to RSX buf. */
+     * LS[(r49+r124)&~15].u8[4..7] to LE 0xD0100000 so EDGE writes to RSX buf.
+     * Guard: if r49/r124 are 0 (FP UNIMPLs zeroed them) use descriptor base 0xADD0
+     * to avoid corrupting the stop-signal area at LS[0..63]. */
     if (pc == 0x35FCu && ctx->id == 2) {
         uint32_t r49    = ctx->gpr[49].u32[0];
         uint32_t r124   = ctx->gpr[124].u32[0];
         uint32_t lsaddr = (r49 + r124) & ~15u & (SPU_LS_SIZE - 1);
-        /* Log once so we can see the formula, then stay silent */
+        if (lsaddr < 0x80u) {
+            /* Registers were zeroed by unimplemented FP ops — fall back to descriptor. */
+            lsaddr = 0xADD0u;
+            ctx->gpr[49].u32[0]  = lsaddr;
+            ctx->gpr[124].u32[0] = 0;
+        }
         static bool lqx_logged = false;
         if (!lqx_logged) {
             lqx_logged = true;
-            fprintf(stderr, "[EDGE] lqx@0x35FC r49=0x%X r124=0x%X lsaddr=0x%X"
-                    " bytes=%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                    r49, r124, lsaddr,
-                    ctx->ls[lsaddr+0], ctx->ls[lsaddr+1],
-                    ctx->ls[lsaddr+2], ctx->ls[lsaddr+3],
-                    ctx->ls[lsaddr+4], ctx->ls[lsaddr+5],
-                    ctx->ls[lsaddr+6], ctx->ls[lsaddr+7]);
+            fprintf(stderr, "[EDGE] lqx@0x35FC r49=0x%X r124=0x%X lsaddr=0x%X\n",
+                    r49, r124, lsaddr);
             fflush(stderr);
         }
         ctx->ls[lsaddr+4] = 0x00;
