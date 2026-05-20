@@ -14,22 +14,21 @@ Built on top of the **[ps3recomp](https://github.com/sp00nznet/ps3recomp) SDK** 
 | File/Dir | Description |
 |---|---|
 | `main.cpp` | Host entry point: reserves 4 GB guest VA, loads the ELF, applies game-specific patches, calls `_start`; Win32 display window thread (1280×720 DIB) |
-| `runtime_glue.cpp` | `vm_base`, `vm_read/write*` helpers, `lv2_syscall` dispatcher, `ps3_indirect_call`; RSX FIFO parser (`rsx_process_fifo`) |
+| `runtime_glue.cpp` | `vm_base`, `vm_read/write*` helpers, `lv2_syscall` dispatcher, `ps3_indirect_call`; RSX FIFO parser; software rasterizer; background texture loader |
 | `extra_funcs.cpp` | Hand-lifted PPU functions missed by the lifter (C++ ctors/dtors reached via indirect CTR calls) |
 | `stubs.cpp` | Reference template for NID overrides (not compiled; documentation only) |
 | `spu_interp.cpp` | SPU instruction interpreter — covers full SPURS kernel + EDGE geometry processor opcode set |
-| `spu_spurs.cpp` | SPURS/SPU orchestration: loads kernel ELF, LS patches, burst execution loop, EDGE workload dispatch, `spurs_test_edge_geometry()` diagnostic |
+| `spu_spurs.cpp` | SPURS/SPU orchestration: loads kernel ELF, LS patches, burst execution loop, EDGE workload dispatch, animated sphere generator |
 | `recompiled/ppu_recomp.cpp` | **Auto-generated** by `ppu_lifter.py` from `EBOOT.elf` — contains all lifted PPU functions (with manual diagnostic/guard patches) |
 | `recompiled/ppu_recomp.h` | **Auto-generated** — declares `ppu_context`, memory helpers, all `func_XXXXXXXX` prototypes |
 | `config.toml` | Lifter configuration: input ELF, output dir, HLE/LLE module choices |
 | `CMakeLists.txt` | Build system (Ninja + MSVC) |
 | `build_run.bat` | Configure + build via Ninja |
-| `force_rebuild.bat` | Force-recompile changed `.cpp` files then link (faster than full cmake rebuild) |
 | `run.bat` | Run `build\dbz-budokai-hd.exe ..\game\EBOOT.elf` |
 
 ## What's not here (and why)
 
-- **`EBOOT.elf`** and all game data — copyrighted by Bandai Namco / Spike Chunsoft. You must supply your own legally-obtained decrypted PS3 ELF.
+- **`EBOOT.elf`** and all game data — copyrighted by Bandai Namco / Spike Chunsoft. You must supply your own legally-obtained decrypted PS3 ELF and an original disc image.
 - The `build/` directory — generated artifacts.
 
 ---
@@ -39,22 +38,23 @@ Built on top of the **[ps3recomp](https://github.com/sp00nznet/ps3recomp) SDK** 
 - Windows 10/11 x64
 - Visual Studio 2022 (for MSVC + Windows SDK)
 - CMake 3.20+, Ninja
-- The ps3recomp SDK cloned alongside this repo (see below)
+- The ps3recomp SDK cloned alongside this repo (see layout below)
 - A decrypted `EBOOT.elf` from *DBZ Budokai HD Collection* (BLES01658)
+- The original disc image at `../BLES01658/` (for game asset loading)
 
 ## Directory layout expected
 
 ```
 RecompLauncher/
-└── ps3recomp/          ← SDK repo (https://github.com/sp00nznet/ps3recomp)
-    ├── dbz-budokai-hd/ ← this repo (cloned here)
-    └── game/
-        └── EBOOT.elf   ← your decrypted ELF (not included)
+└── ps3recomp/              ← SDK repo (https://github.com/sp00nznet/ps3recomp)
+    ├── dbz-budokai-hd/     ← this repo (cloned here)
+    ├── game/
+    │   └── EBOOT.elf       ← your decrypted ELF (not included)
+    └── BLES01658/          ← disc image (optional — for background textures)
+        └── PS3_GAME/USRDIR/LAUNCH/data.afs
 ```
 
 ## Build & Run
-
-`build_run.bat` currently configures cmake without an explicit `-DPS3RECOMP_DIR`, which defaults to `../../` from the project dir → `E:\Games\RecompLauncher` (wrong; the SDK is at `E:\Games\RecompLauncher\ps3recomp`). Configure fails, then `force_rebuild.bat`'s final link step also fails because there's no `build.ninja`.
 
 **Working invocation (PowerShell):**
 
@@ -71,9 +71,9 @@ cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Bu
 .\build\dbz-budokai-hd.exe ..\game\EBOOT.elf
 ```
 
-`vcvars64.bat` MUST be sourced inside the same `cmd` session as the `cmake` call (PowerShell's `&` does not propagate child env vars back to the parent). Don't try to run MSVC from Git Bash — it mangles `/flag` arguments as paths.
+`vcvars64.bat` must be sourced inside the same `cmd` session as the `cmake` call — PowerShell's `&` does not propagate child env vars. Don't run MSVC from Git Bash; it mangles `/flag` arguments as paths.
 
-If the cmake configure cache is broken (missing `build.ninja`), delete `build\CMakeCache.txt` and `build\CMakeFiles\` and reconfigure.
+If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\CMakeFiles\` and reconfigure.
 
 ---
 
@@ -84,62 +84,114 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 | ELF load + guest memory setup | ✅ Working |
 | Static C++ constructors (via indirect CTR) | ✅ Working |
 | SPURS / game-context initialization sequence | ✅ Working |
-| `_start` + `func_0003AAC8` complete without abort | ✅ Working |
-| SPURS workload state machine runs to completion (states 2 → 21) | ✅ Working |
-| `sys_ppu_thread_create` fires; all 7 startup threads run their lifted bodies | ✅ Working |
-| Real LV2 sync primitives (semaphore / mutex / condvar / lwmutex / lwcond / event-queue) | ✅ Working |
-| C runtime startup wrapper → game main `func_00012420` | ✅ Working |
-| Game main: sysmodule loads, cellGcmInit, display buffer alloc, full init sequence | ✅ Working (GCM force-succeeded; null RSX backend) |
-| **SPURS SPU kernel** (embedded ELF at 0x10BD00) | ✅ Running — 2980+ instructions/cycle; EDGE workloads dispatched |
-| **EDGE SPU workloads** (Sony EDGE library at 0x142900 + 0x14AE80) | ✅ Running — 15 slots × 47 insns each; EDGE geometry processor functional |
-| **EDGE MFC DMA** | ✅ Confirmed — 8427+ DMA reads (64B each) with synthetic task descriptor |
-| UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub; full audio loop TBD |
-| Win32 display window (1280×720 DIB-backed) | ✅ Working — dark-blue fill; RSX blit path wired for future frames |
-| C++ destructor walker | ✅ Working |
-| Process exits cleanly with no AV / no abort | ✅ Working |
-| **Game loop** | 🔲 Not yet — game main is pure init; actual game loop is SPURS/SPU-driven |
-| Graphics rendering | 🔲 No draw commands yet — game writes zero NV4097 commands during PPU init; rendering is EDGE→RSX pipeline |
-| EDGE geometry data | 🔲 Next step — provide real EDGE task descriptor when stop 0x3FFF fires |
+| SPURS workload state machine (states 2 → 21) | ✅ Working |
+| LV2 sync primitives (semaphore, mutex, condvar, lwmutex, lwcond, event queue) | ✅ Working |
+| `sys_ppu_thread_create` — all startup threads run | ✅ Working |
+| C runtime startup → game main `func_00012420` | ✅ Working |
+| Game main: sysmodule loads, cellGcmInit, display-buffer alloc | ✅ Working (GCM force-succeeded; null RSX backend) |
+| **SPURS SPU kernel** (embedded ELF at 0x10BD00) | ✅ Running — 3000+ insns/cycle through full dispatch path |
+| **EDGE SPU geometry library** (0x142900 + 0x14AE80) | ✅ Running — 15 slots dispatched; geometry processor functional |
+| **EDGE MFC DMA pipeline** | ✅ Working — LS→LS GET + PUT to RSX IO region wired end-to-end |
+| **Software rasterizer** | ✅ Working — depth-buffered, flat-shaded with Phong specular |
+| **Animated sphere** | ✅ Rendering — UV sphere (341 triangles) rotating via Y-axis animation |
+| **Game background textures** | ✅ Loaded — `LAUNCH/data.afs` entry 15: 2048×1024 BGRA8 DBZ UI panel |
+| Win32 display window (1280×720 DIB-backed) | ✅ Working — shows background + sphere during 3-second hold |
+| UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub |
+| C++ destructor walker, clean process exit | ✅ Working |
+| **Game loop** | 🔲 Not yet — game main is pure init; actual loop is SPURS/SPU-driven |
+| Real game geometry (characters, stages) | 🔲 Next — needs SPURS mailbox signalling + real EDGE task descriptors |
+| DXT5 texture decoder | 🔲 Next — would unlock title screen / character portraits from disc |
+| EDGE FP opcodes (0x1E4/0x1E5/0x1F8 etc.) | 🔲 Needed for correct EDGE vertex transforms (passthrough workaround active) |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
 
-Current end-state of a run: SPURS init → PPU state machine 2→21 → SPURS SPU kernel runs (2980+ insns, dispatches 15 EDGE workload slots; EDGE issues 8427+ DMA reads) → 7 PPU worker threads (sdu_yah_size_check ×2 + sub-workers, sdu_yah_all_list_delete + sub-worker, Terminate Thread) run and exit → game main `func_00012420` runs full GCM + display-buffer init → UpdateThread (bnusCore audio stub) starts → 1280×720 Win32 window visible → C++ destructor walker → `[RUNTIME] all game threads finished` → clean exit.
+### What you see when you run it
 
-### Key patches applied
+A 1280×720 window opens and displays for about 3 seconds:
 
-- **Pool-manager sentinel self-links** at `0x27BBD4`, `0x27BC3C`, `0x27BCA4` — the BSS-zeroed ELF doesn't run the C++ constructor that sets these up.
-- **SPURS context stub** at `0x700000` — `func_0003AAC4` returns this synthetic page. Fields:
-  - `struct+0 = 0x2083`: bits 0-1 (gate), bit 7 (slab path), bit 13 (CE77C real-init path)
-  - `struct+4 = 2`: satisfies `func_000D5450`'s `>= 2` check for the syscall `0x324` path
-  - `struct+0x10 = 0x700043`: sentinel so `func_000CE77C`'s `struct+8 < struct+0x10` comparison passes
-  - `struct+0x44 → 0x700100`: sub-object pointer for `func_000D58C4` early-return path
-- **SPURS workload dispatch chain** at `0x70A000` — `[0x27F81C]` is the SPURS workload list head. The SPURS init code zeros it; `vm_write32` intercepts that zero-write and redirects it back to `0x70A000`. A synthetic vtable → OPD chain at `0x70A000` lets `loc_0003AE74` dereference safely without a LOW-READ spin.
-- **SPURS state machine wired up** — patched the `bctrl` in `loc_0003AE74` (originally lifted as a static call to `func_00000030`) to invoke `func_000379BC` directly. The state machine now advances `[0x28B050]` through `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21` instead of being bypassed.
-- **State 6 spin-wait skip** — on a real PS3, SPU tasks externally write `state=7` to break state 6's spin. Without SPU emulation we force `gpr[4]=7` in `loc_00037BF4`.
-- **State 15 completion** — manual writes in `loc_00038194` set `[0x28B050]=21` (SPURS done) and `[0x27F830]=1` to break the outer dispatch loop.
-- **States 13/14 struct chain** at `0x70B000` — `[0x27F814] → 0x70B000`, `[0x70B148] → 0x70B200`, `[0x70B20C] = 1` (`func_000355D4` is an equality check `==1`, not `>=2`).
-- **`[0x27F814]` zero-write redirect** — `vm_write32` intercepts zero-writes to `0x27F814` (SPURS shutdown clears it) and redirects them to `0x70B000`, mirroring the existing `[0x27F81C] → 0x70A000` redirect. Keeps the states-13/14 struct chain alive across SPURS shutdown.
-- **Pre-set state-machine flag**: `[0x28B050]=2` (start at state 2). `[0x27F831]` is intentionally left at BSS=0 — pre-setting it to 1 causes states 10/12 to spin (they call `func_00027090` which expects 0 = "condition clear").
-- **Slab-free guard** in `extra_funcs.cpp` — skips freeing when the slab allocator at `0x2E45F0` is still uninitialized (its constructor was missed by the lifter), preventing a block-header abort.
-- **LV2/TLS high region** `0xFFFF0000–0xFFFFFFFF` committed — the `func_0003AAC8` cleanup path writes to guest `0xFFFF9004` (PS3 LV2-mapped TLS area); without this the host throws an access violation.
-- **Caller-frame headroom** at `0xE0000000` — one 4 KB page committed above the stack. PPC ABI saves LR into the *caller's* frame at `SP+0xF0` *before* the prologue decrements SP; with initial `SP=0xDFFFFE00` the first save lands at `0xE0000000`, which would AV without this page.
-- **`bcctrl` → `func_00000030` direct calls** — the lifter emitted trampoline stubs for several `bctrl` instructions targeting address `0x30` (the LV2 syscall gate). These were replaced with direct `func_00000030(ctx)` calls to avoid incorrect early-return behaviour.
-- **`func_000F205C` HLE stub** (`extra_funcs.cpp`) — sysPrxForUser NID `0xA2C7BA64`, called by the C runtime startup wrapper `func_0003B244`. Now calls game main `func_00012420` (with a manually-inserted `stdu r1,-0xF0` prologue) behind a re-entrant-call guard so the dtor chain can't invoke it a second time.
-- **Two-step entry call** in `main.cpp` — the ELF prologue at `0x3B220` calls `func_0003B328` then falls through into `func_0003B244`. We replicate this explicitly: `func_0003B328(&ctx)` → `DRAIN_TRAMPOLINE` → `func_0003B244(&ctx)` → `DRAIN_TRAMPOLINE`.
-- **GCM init force-successes** (`recompiled/ppu_recomp.cpp`) — three cellGcmSys helper functions (`func_0004370C` cellGcmInit, `func_00040C0C`, `func_00040BD4`) all dereference the RSX context pointer at `TOC[-0x7FA0]` which is null without a real RSX backend. Each is patched to early-return `r3=0`; `func_00040BD4` additionally writes a dummy IO size of `0x200000` (2 MB) to its output buffer so downstream code gets a non-zero size.
-- **RSX REF register null backend** (`runtime_glue.cpp`) — guest address `0x4` is the RSX reference counter. The game writes `0xFFFFFFFF` as a "pending" sentinel then spin-polls until RSX clears it. Without real RSX this would spin forever. Writes to address `0x4` are now discarded (keeping it at 0 from BSS), so the poll exits on the very first read.
+- **Background**: a real DBZ Budokai menu UI panel (purple gradient, decorative Japanese-style corner frames) loaded from `LAUNCH/data.afs` on the original disc
+- **Foreground**: a UV sphere (341 triangles) rotating around the Y-axis, flat-shaded with diffuse + Phong specular in warm gold tones, depth-buffered
+
+The sphere represents EDGE geometry output — the same pipeline the game itself uses for character and stage rendering. Each frame goes through: SPURS kernel dispatch → EDGE SPU geometry library → MFC DMA PUT → software rasterizer → Win32 DIB blit.
+
+---
+
+## Architecture overview
+
+### Full EDGE rendering pipeline (working end-to-end)
+
+```
+PPU (main.cpp)
+  └─ spurs_start() launches SPU kernel thread
+       └─ SPURS kernel (LS[0xD0]) dispatches 15 workload slots
+            └─ EDGE scheduler (LS[0x3050]) receives stop 0x3FFF
+                 └─ Geometry processor (LS[0x3108]) runs vertex data
+                      └─ MFC PUT → vm_base[0xD0100000]
+                           └─ rsx_on_edge_write() → edge_rasterize_triangles()
+                                └─ Win32 DIB window (rsx_present_frame)
+```
+
+### Software rasterizer (runtime_glue.cpp)
+
+`edge_rasterize_triangles()` reads float4 big-endian vertices from guest memory at `0xD0100000`, projects them to 1280×720 screen space using standard NDC → pixel coordinates, then rasterizes each triangle with:
+- Per-pixel barycentric z-interpolation + depth test (z-buffer)
+- Flat face normals for per-triangle shading
+- Diffuse (NdotL) + Phong specular (shininess=4) with a warm gold/orange colour palette
+
+`frame_begin()` runs at the start of each EDGE frame: blits the background texture (nearest-neighbour scaled from 2048×1024 to 1280×720), then clears the z-buffer.
+
+### Game asset loading (runtime_glue.cpp)
+
+`rsx_load_launch_background()` opens `LAUNCH/data.afs` at startup, seeks to entry 15 (offset/size from the 8-byte directory at position 8 + 15×8 = 128), skips the 0xE0-byte `#A3T` header, and loads 8,388,608 bytes (2048×1024 × 4 bytes/pixel) of BGRA8 pixel data. The 15 other entries in the file are DXT5-compressed textures (title screens, character portraits) — not yet decoded.
+
+### SPURS/SPU kernel
+
+The SPURS kernel ELF lives at guest address `0x10BD00`. It's loaded into a dedicated `spu_ctx_t` and runs on a Windows background thread. Key patches applied to its LS image at load time:
+- `LS[0x17C]`: `ilh r2, 1` — bypasses a SPURS management-area type check (ceqi r2, r4, 8)
+- `LS[0x03BC]`: `lnop` — bypasses `brhnz r36` dispatch-idle branch (r36 is the actual register, not r12 as older sources document)
+- `LS[0x03C0]`: `lnop` — bypasses `brhnz r33` dispatch-idle branch (not r13)
+
+Without the two lnop patches, the kernel idles at LS[0x298E0] waiting for a PPU mailbox signal (LV2 would normally restart it with workload data in r79/r77). With them, the kernel forces dispatch through all 15 workload slots unconditionally.
+
+---
+
+### Key PPU patches applied
+
+- **Pool-manager sentinel self-links** at `0x27BBD4`, `0x27BC3C`, `0x27BCA4`
+- **SPURS context stub** at `0x700000` — synthetic CellSpurs page with bits 0–1, 7, 13 set; sub-object at `0x700100`
+- **SPURS workload dispatch chain** at `0x70A000` — intercepts `vm_write32(0x27F81C, 0)` and keeps the synthetic vtable→OPD chain alive
+- **States-13/14 struct chain** at `0x70B000` — intercepts `vm_write32(0x27F814, 0)` during SPURS shutdown
+- **SPURS state machine** `func_000379BC` — patched the `bctrl` in `loc_0003AE74` to call this directly (lifter emitted a trampoline to `func_00000030` instead); state advances 2→3→4→6→7→8→9→12→13→14→15→21
+- **State 6 spin-wait skip** — forces `gpr[4]=7` in `loc_00037BF4` (on real PS3, an SPU task writes this externally)
+- **State 15 completion** — manual writes in `loc_00038194`: `[0x28B050]=21`, `[0x27F830]=1`
+- **GCM force-successes** — `func_0004370C`, `func_00040C0C`, `func_00040BD4` patched to early-return 0 (RSX context pointer at `TOC[-0x7FA0]` is null without a real GPU)
+- **RSX REF null backend** — discards writes to guest address `0x4` so the game's RSX-sync spin doesn't loop forever
+- **`func_000F205C` HLE stub** — sysPrxForUser NID `0xA2C7BA64`; calls `func_00012420` with a re-entrant-call guard
+- **`bcctrl` → `func_00000030` direct calls** — several `bctrl` instructions targeting `0x30` (the LV2 gate) were lifted as trampolines that returned early; replaced with direct calls so execution continues after each LV2 syscall
 
 ### Lifter bugs fixed by hand
 
-**Dropped `stwu r1, -N(r1)` prologues (SP runaway).** Some functions kept their epilogue's `gpr[1] += N` but lost the matching prologue subtract — each call leaks +N bytes of SP growth.
+**Dropped `stwu r1, -N(r1)` prologues (SP runaway):**
 
-- **`func_000379BC`** (`recompiled/ppu_recomp.cpp`) — epilogue `+= 0xE0`, prologue patched in place to add the missing `vm_write64(gpr[1]-0xE0, gpr[1]); gpr[1] -= 0xE0;`.
-- **`func_000EFD18` / `func_000EFD1C`** (`extra_funcs.cpp`) — OPD for `sdu_yah_size_check` points to `0x000EFD18`, 4 bytes before the lifted `func_000EFD1C`, exactly where the missing `stwu r1, -0xB0(r1)` would live. Wrapper at `func_000EFD18` does the `stwu` then calls `func_000EFD1C`.
-- **`func_000EFACC` / `func_000EFAD0`** (`extra_funcs.cpp`) — same pattern. OPD for `sdu_yah_all_list_delete` is `0x000EFACC` but the lifter emitted `func_000EFAD0`; missing prologue is `stwu r1, -0xC0(r1)`. Wrapper added and registered in `extra_table`.
+- `func_000379BC` — epilogue `+= 0xE0`; prologue patched in-place in `ppu_recomp.cpp`
+- `func_000EFD18` / `func_000EFD1C` — OPD for `sdu_yah_size_check` points 4 bytes before the lifted function (where the missing `stwu r1, -0xB0(r1)` would live); wrapper added in `extra_funcs.cpp`
+- `func_000EFACC` / `func_000EFAD0` — same pattern; missing `stwu r1, -0xC0(r1)` for `sdu_yah_all_list_delete`
 
-**Dropped `addc rD, rA, rB` instructions (~770 sites).** The lifter emitted `/* TODO: addc ... */` placeholders for the carry-producing add, silently leaving rD unmodified. This was breaking pointer arithmetic in the heap/list code that runs during C++ static-ctor init. All sites were filled with a uniform `(uint64_t)(uint32_t)rA + (uint64_t)(uint32_t)rB` expression that writes the 32-bit sum to rD and updates `XER[CA]`.
+**Dropped `addc rD, rA, rB` instructions (~770 sites):** The lifter emitted `/* TODO: addc ... */` for the carry-producing add. All sites filled with `(uint64_t)(uint32_t)rA + (uint64_t)(uint32_t)rB`.
 
-See `CLAUDE.md` for the diagnostic recipe used to find these.
+See `CLAUDE.md` for full diagnostic recipes.
+
+---
+
+## What's next
+
+1. **EDGE FP opcodes** — implement `op11=0x1F8` (likely `hbr` branch hint), `0x1E4/0x1E5/0x1E7` (single-precision fma/fnms/fms variants), `0x1EB–0x1EF` (double-precision ops). Currently bypassed by a passthrough that copies sphere vertices directly to the RSX buffer.
+
+2. **DXT5 texture decoder** — all 15 entries in `LAUNCH/data.afs` except entry 15 are DXT5-compressed. Decoding them would give access to the title screen (entry 1 at 15 MB) and six character/scene backgrounds (entries 2–7 at 5 MB each).
+
+3. **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors and signal the kernel via r79/r77 entry arguments. This is the key to dispatching real game EDGE tasks with actual character geometry.
+
+4. **SPURS mailbox signalling** — remove the lnop bypass patches and implement proper PPU→SPU mailbox signalling so the kernel dispatches real workloads from the management area instead of the synthetic forced-dispatch path.
 
 ---
 
