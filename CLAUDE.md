@@ -162,11 +162,19 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 
 **Current test geometry**: UV sphere (NLAT=14, NLON=14) generated in spu_spurs.cpp stop 0x3FFF handler — 1023 vertices (341 triangles) written to LS[0x134..0x5133] (16 KB). EDGE processes all 16 KB passthrough → PUT to 0xD0100000. Rasterizer draws 341 flat-shaded triangles. Visual: shaded sphere centred at screen mid-point (~640×360 area), warm gold-orange tones.
 
+**Architecture findings (confirmed this session):**
+
+**No PPU game loop**: `func_00012420` (full code read) is pure init. After cellGcmInit + display buffer allocation it returns — no game loop. The actual rendering cycle is SPURS-driven on the SPU side.
+
+**SPURS mailbox mechanism**: The SPURS kernel idles at LS[0x298E0] (stop-0 in BSS) waiting for LV2 to restart it. On real PS3, LV2 detects the stop, checks the workload queue, updates kernel registers, and restarts from entry 0xD0. The kernel does NOT DMA the management area at 0x70A000 in our run — our lnop bypass at LS[0x03C0] forces dispatch without real workload data (r79=0 → sort loop sees no workloads → dispatch via stop-signal chain is hollow). To dispatch real game workloads: remove lnop patch, implement PPU→SPU mailbox signaling (populate `g_spurs_ctx.gpr` with workload data and restart from 0xD0 with r79≠0).
+
+**AFS game data**: LAUNCH/data.afs has 16 entries: entry 0 = `nusc` scene config (camera angles, placement); entries 1-15 = `#A3T` textures. No polygon mesh data in the launcher pack. Game geometry is in DBZ1/data_en.afs (~350MB) and DBZ3/data_cmn.afs (~325MB), only accessible when the game loop loads assets via cellFs.
+
+**NID stubs all return 0**: func_00012420's full call tree has no cellSpursAddWorkload or cellEdgeGeomAddJob calls — the game's SPURS workload registration only happens via the SPURS state machine (func_000379BC, states 2→21). Real game EDGE tasks are submitted from the game loop (not the init path we run).
+
 **Outstanding questions for the next iteration:**
-- **Real game vertex data** — test triangle uses synthetic float4 vertices from LS[0x134]. Need to find where the game stores real vertex data and point EDGE's GET EA there. The stream descriptor at 0x70C000 (src_ea) controls what EDGE DMA-GETs.
-- **EDGE stream descriptor format** — the geometry processor reads from 0x70C000 via DMA GET. Count field at byte 0x63 = 0x20; size of DMA GET = 0x4000 (16KB). Real vertex buffer EAs are set in the stream descriptor by the game's PPU-side EDGE setup code.
-- **Finding real EDGE descriptors** — the game's PPU-side EDGE setup (called from game loop, not func_00012420 init) creates EDGE task descriptors. Scanning ppu_recomp.cpp for calls to EDGE PPU functions would identify where descriptors are built and what vertex data they reference.
-- **Advance game loop** — game main (func_00012420) is pure init with no game loop. Actual gameplay logic is SPURS/SPU-driven. To trigger real EDGE usage, the game loop needs to run.
+- **SPURS mailbox signaling** — to dispatch real game workloads, implement `cellSpursAddWorkload` HLE that populates the SPU management area and signals the kernel via inbound mailbox. The kernel entry expects r79/r77 set by LV2 to indicate pending workloads.
+- **SPURS management area format** — need to decode which DMA the kernel issues from entry 0xD0 and what offsets it reads. This tells us how to structure the management area so the kernel sees real workloads.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
 ### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
