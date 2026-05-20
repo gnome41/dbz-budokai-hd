@@ -722,6 +722,13 @@ void spu_step(spu_ctx_t *ctx) {
             spu_reg_t t; memset(&t,0,16);
             for (uint32_t i=0; i+sh<16; i++) t.u8[i]=R[ra].u8[i+sh];
             R[rt]=t; return; }
+        case 0x1D6: { /* rotqbyi RT, RA, I7 — rotate 128-bit quad LEFT by (I7&15) bytes */
+            int cnt = (int)(F_I7(insn) & 0xF);  /* bytes 0-15 */
+            if (cnt == 0) { R[rt] = R[ra]; return; }
+            spu_reg_t tmp;
+            for (int i = 0; i < 16; i++)
+                tmp.u8[i] = R[ra].u8[(i + 16 - cnt) % 16];
+            R[rt] = tmp; return; }
         case 0x1D4: { /* rotqbii RT, RA, I7 — rotate 128-bit quad LEFT by (I7&7) bits */
             int sh = F_I7(insn) & 7;
             if (!sh) { R[rt]=R[ra]; return; }
@@ -866,6 +873,73 @@ void spu_step(spu_ctx_t *ctx) {
         case 0x3B6: { /* fscrwr RT, RA: write FPSCR (ignore) */
             return; }
 
+        /* Float convert int ↔ float (RI7 format: scale = 2^I7, I7 is 7-bit signed) */
+        case 0x1E0: { /* cuflt RT, RA, I7 — unsigned int → float: RT[i] = RA.u32[i] * 2^(-I7) */
+            int sc = (int)(F_I7(insn) & 0x7F); if (sc & 0x40) sc -= 128;
+            for (int i=0;i<4;i++) R[rt].f32[i] = (float)R[ra].u32[i] * ldexpf(1.0f, -sc);
+            return; }
+        case 0x1E1: { /* csflt variant (convert signed fixed-point to float, extended range) */
+            int sc = (int)(F_I7(insn) & 0x7F); if (sc & 0x40) sc -= 128;
+            for (int i=0;i<4;i++) R[rt].f32[i] = (float)R[ra].s32[i] * ldexpf(1.0f, -sc);
+            return; }
+        case 0x1E2: { /* csflt RT, RA, I7 — signed int → float: RT[i] = RA.s32[i] * 2^(-I7) */
+            int sc = (int)(F_I7(insn) & 0x7F); if (sc & 0x40) sc -= 128;
+            for (int i=0;i<4;i++) R[rt].f32[i] = (float)R[ra].s32[i] * ldexpf(1.0f, -sc);
+            return; }
+        case 0x1E4: { /* cfltu RT, RA, I7 — float → unsigned int: RT[i] = clamp(trunc(RA[i]*2^I7), 0, UINT32_MAX) */
+            int sc = (int)(F_I7(insn) & 0x7F); if (sc & 0x40) sc -= 128;
+            for (int i=0;i<4;i++) {
+                double v = (double)R[ra].f32[i] * ldexp(1.0, sc);
+                R[rt].u32[i] = v >= 4294967295.0 ? 0xFFFFFFFFu : v < 0.0 ? 0u : (uint32_t)v;
+            } return; }
+        case 0x1E5: { /* cflts RT, RA, I7 — float → signed int: RT[i] = clamp(trunc(RA[i]*2^I7), INT32_MIN, INT32_MAX) */
+            int sc = (int)(F_I7(insn) & 0x7F); if (sc & 0x40) sc -= 128;
+            for (int i=0;i<4;i++) {
+                double v = (double)R[ra].f32[i] * ldexp(1.0, sc);
+                R[rt].s32[i] = v >= 2147483647.0 ? 0x7FFFFFFF : v <= -2147483648.0 ? (int32_t)0x80000000 : (int32_t)v;
+            } return; }
+        case 0x1E7: { /* cflts variant (float → signed int, extended range) */
+            int sc = (int)(F_I7(insn) & 0x7F); if (sc & 0x40) sc -= 128;
+            for (int i=0;i<4;i++) {
+                double v = (double)R[ra].f32[i] * ldexp(1.0, sc);
+                R[rt].s32[i] = v >= 2147483647.0 ? 0x7FFFFFFF : v <= -2147483648.0 ? (int32_t)0x80000000 : (int32_t)v;
+            } return; }
+
+        /* Double-precision float ops used by EDGE geometry processor.
+         * fesd: extend 4x f32 to 2x f64 (low two words → two doubles).
+         * frds: round 2x f64 to 4x f32 (each double → one f32, zero pad). */
+        case 0x1ED: { /* fesd RT, RA — float extend single to double */
+            double d0 = (double)R[ra].f32[0];
+            double d1 = (double)R[ra].f32[2];
+            memcpy(&R[rt].u32[0], &d0, 8);  /* store f64 in first 8 bytes */
+            memcpy(&R[rt].u32[2], &d1, 8);  /* store f64 in last 8 bytes */
+            return; }
+        case 0x1EE: { /* frds RT, RA — float round double to single */
+            double d0, d1;
+            memcpy(&d0, &R[ra].u32[0], 8);
+            memcpy(&d1, &R[ra].u32[2], 8);
+            R[rt].f32[0] = (float)d0; R[rt].f32[1] = 0.0f;
+            R[rt].f32[2] = (float)d1; R[rt].f32[3] = 0.0f;
+            return; }
+        case 0x1EB: { /* fesd variant / double-precision op — extend or convert */
+            double d0 = (double)R[ra].f32[1], d1 = (double)R[ra].f32[3];
+            memcpy(&R[rt].u32[0], &d0, 8);
+            memcpy(&R[rt].u32[2], &d1, 8);
+            return; }
+        case 0x1EC: { /* frds variant / double-precision op — round or convert */
+            double d0, d1;
+            memcpy(&d0, &R[ra].u32[0], 8); memcpy(&d1, &R[ra].u32[2], 8);
+            R[rt].f32[0] = 0.0f; R[rt].f32[1] = (float)d0;
+            R[rt].f32[2] = 0.0f; R[rt].f32[3] = (float)d1;
+            return; }
+        case 0x1EF: { /* dfceq — double float compare equal */
+            double d0a, d1a, d0b, d1b;
+            memcpy(&d0a, &R[ra].u32[0], 8); memcpy(&d1a, &R[ra].u32[2], 8);
+            memcpy(&d0b, &R[rb].u32[0], 8); memcpy(&d1b, &R[rb].u32[2], 8);
+            R[rt].u32[0] = R[rt].u32[1] = (d0a == d0b) ? ~0u : 0u;
+            R[rt].u32[2] = R[rt].u32[3] = (d1a == d1b) ? ~0u : 0u;
+            return; }
+
         /* Stop/nop */
         case 0x000: { /* stop */
             ctx->stop_code = (insn >> 0) & 0x3FFF;
@@ -875,6 +949,8 @@ void spu_step(spu_ctx_t *ctx) {
         case 0x002: { /* sync */ return; }
         case 0x003: { /* dsync*/ return; }
         case 0x1AC: { /* hbr  */ return; }
+        case 0x1F8: { /* hbrr (hint for branch relative) */ return; }
+        case 0x1F9: { /* hbrp (hint for branch program)  */ return; }
     }
 
     /* Fallback: unknown instruction */
