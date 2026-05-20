@@ -99,353 +99,108 @@ Each game thread gets a 1 MB guest stack committed on demand (bump-allocated dow
 ### Trampoline Pattern
 Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_TRAMPOLINE(ctx)` after any call in `extra_funcs.cpp`.
 
-## Current Status (last verified working state)
+## Current Status
 
-**The program runs cleanly through its full startup → shutdown lifecycle with no AV, no abort, no spin.** Verified end-state (8 threads run, including the UpdateThread audio stub):
+**Full lifecycle runs cleanly** (8 threads, no AV, no spin):
+1. `func_0003B328`: SPURS init + global ctors; state machine advances 2→3→4→6→7→8→9→12→13→14→15→21
+2. Four SDU threads spawn sub-workers, join, exit
+3. `func_0003B244` → `func_000F205C` → game main `func_00012420`:
+   - Loads sysmodules, force-succeeds GCM init, allocates display buffers, returns (pure init, no game loop)
+   - `func_000510E4`: pre-patches OPD at `[TOC[-0x6158]]=0x27BBF8` → (0xD3020, 0x16A0F8), spawns UpdateThread via syscall 44
+4. `func_000D3020` (UpdateThread): 16 ms idle loop on `g_threads_should_exit`
+5. C++ destructor walker fires; program exits cleanly after 5-second window hold
 
-1. SPURS init runs (`func_0003B328`/`func_0003AAC4`/`func_0003AAC8`).
-2. SPURS workload state machine advances `2 → 3 → 4 → 6 → 7 → 8 → 9 → 12 → 13 → 14 → 15 → 21`.
-3. Four original SPURS-spawned threads start; each spawns a sub-worker via `func_000F10FC`/`func_000F16DC`:
-   - Thread 1: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289590`) → spawns worker @ `0x000EFE30` → joins it → exits
-   - Thread 2: `sdu_yah_size_check` @ `0x000EFD18` (arg `0x289B90`) → spawns worker @ `0x000EFE30` → joins it → exits
-   - Thread 3: `sdu_yah_all_list_delete` @ `0x000EFACC` → spawns worker @ `0x000EFBE8` → exits
-   - Thread 4: `Terminate Thread` @ `0x00039E20` → exits immediately (no pending requests)
-4. Three sub-worker threads run and return (stubs).
-5. C runtime wrapper (`func_0003B244` → `func_000F205C`) calls game main `func_00012420`.
-   - `func_000510E4` (now implemented) creates Thread 8: UpdateThread (bnusCore audio stub at 0xD3020).
-6. Game main passes all GCM init checks (force-succeeded), runs through RSX sync (RSX REF null backend), and executes its full initialization sequence.
-7. C++ destructor walker fires; `[RUNTIME] all game threads finished` — program exits cleanly.
+**Game main is pure init** (`func_00012420`): no game loop. Real rendering is SPURS/SPU-driven. NID stubs return 0; no cellSpursAddWorkload calls in the init path. Real EDGE tasks come from the game loop (unreachable currently).
 
-**Game main `func_00012420` architecture:**
-- Called from `func_0003B2BC → func_0003B244 → func_000F205C` (within func_0003B328's lifecycle)
-- Loads sysmodules (func_000F0E9C — NID stubs returning 0)
-- Calls `cellGcmInit` (`func_0004370C`, force-succeeded), `func_00040C0C`, `func_00040BD4` (all force-succeeded with null RSX context)
-- Allocates display buffers (slab bump guard + `func_000D908C`)
-- Calls `func_0004BE54` (display buffer setup) and `func_00012258` (init helper, zero-stub)
-- Returns after completing init — there is NO game loop in `func_00012420`
+**Rendering** (dedicated thread at ~30fps):
+- `render_thread_proc` in `main.cpp`: calls `spurs_render_sphere_tick()` + Sleep(33); started after background load
+- Sphere vertex buffer at `vm_base+0xD0180000`; EDGE writes its own output to `0xD0100000` (separate, no conflict)
+- `rsx_on_edge_write(put_end_ea, 0xBC80)`: range `> 0xD0180000 && <= 0xD0200000`; `vertex_base = put_end_ea - vtx_count*16`; depth `z > g_z_buf` (init -2.0f); calls `frame_begin` (background blit, z-buf clear) + `edge_rasterize_triangles`
+- EDGE MFC PUT to 0xD0100000 calls memcpy only — `rsx_on_edge_write` removed from SPU PUT handler to prevent framebuffer corruption
 
-**`func_00012258` (0x12258, zero-stub):** reads/initializes game state at 0x243AF0-0x27BDB4, ends with `memset(0x243C18, 0, 0x100)`. Pure initialization helper, not the game loop.
+**AFS textures** (LAUNCH/data.afs, 16 entries decoded by `load_a3t_entry()`):
+- Entry 15: A8R8G8B8-LN, 2048×1024 — tournament stage BG (slot 0)
+- Entries 1–4: A8R8G8B8-LN or R5G6B5-LN, 2048×1024 — publisher intro screens (slots 1–4)
+- Entries 12,13: A8R8G8B8 swizzled (0x85), 512×512 — character portraits (corner overlays)
+- Entries 2–7: R5G6B5-LN, 2048×1024 — character-select stage art (not all loaded)
+- `load_a3t_entry()`: scans header bytes 0x18..0xC0 for CellGcmTexture struct; pixel data at `gcm_off+0x68`; Morton de-swizzle for format byte with bit 5 clear
 
-**Why the game doesn't actually run gameplay:** All 7 PS3 threads are SDU management threads. The `UpdateThread` is a bnusCore audio management thread (NOT the main game loop); the actual game loop is SPURS/SPU-driven and requires SPU emulation. `func_000510E4` (zero-stub at line 453, called from game main) is supposed to register a callback that eventually creates the UpdateThread via `func_000B8790`. Since it's a stub, the audio thread is never started.
-
-**Win32 display window:** A `window_thread_proc` thread is launched from `main()` 200ms before the game entry point. It creates a 1280×720 DIB-backed window ("DBZ Budokai HD – PS3 Static Recompilation") with a dark-blue initial fill. `rsx_present_frame()` (exported from `main.cpp`) invalidates the window on each RSX frame. The framebuffer pointer (`g_framebuf`, BGRA) is accessible from `runtime_glue.cpp` for future RSX blit.
-
-**UpdateThread (bnusCore audio) — now running:**
-- Thread name: `"UpdateThread"` (string at 0xF5C38); entry code at 0xD3020 (`func_000D3020` stub in `extra_funcs.cpp`)
-- `func_000510E4` (ppu_recomp.cpp line 453): implemented — pre-patches OPD at `[TOC[-0x6158]]=0x27BBF8` to (code=0xD3020, toc=0x16A0F8), then calls sys_ppu_thread_create (syscall 44) directly, bypassing the event port callback chain
-- `func_000D3020` stub: 16 ms idle loop on `g_threads_should_exit` flag (in runtime_glue.cpp); main() sets flag before `thread_runtime_join_all()`
-- The event port chain (func_000B8790 → func_000B8794 → syscall 130 → func_000B89BC → func_000D2F90) is not used; func_000D2F90's OPD pre-patch is also done inside func_000510E4 now
-
-**LV2 syscall gate fix:** `func_00000030` now forwards to `lv2_syscall`. Address `0x30 → lv2_gate` in `extra_table`. 604 CTR-setting + `func_00000030` patterns mass-replaced with `ps3_indirect_call`.
-
-**Game main `func_00012420` structure (line 7950):**
-- Loads sysmodules via `func_000F0E9C` (IDs 0x17 and 0xE) — returns 0 (stub), continues
-- Calls `func_000510E4` (line 7997) with r3=stack struct containing 0xF2890, r4=0xF2890
-- Falls through to GCM init, 164K×64-byte slab allocs, display buffer setup, then returns
-
-**EDGE output format (discovered this session):**
-EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands) to the output buffer EA. The MFC PUT writes 16KB (0x4000 bytes) of float4 vertices from LS[0xBC80] to the output EA. The PPU side would normally issue NV4097 draw calls referencing this vertex buffer. Our test triangle passes through EDGE unchanged:
-- Vertex 0: (0,1,0,1) → screen (640, 0) = top center
-- Vertex 1: (-1,-1,0,1) → screen (0, 720) = bottom left
-- Vertex 2: (1,-1,0,1) → screen (1280, 720) = bottom right
-
-**PUT EA formula (now fixed):**
-- `lqx r43, r49, r124` at LS[0x35FC]: lsaddr = (r49+r124)&~15 = 0x3430 (from sentinel bytes 0x34)
-- Original bytes[4..7] at lsaddr: 0x3FBF0C83 → PUT EA = 0x830CBF3F (garbage)
-- Patched bytes[4..7] to {0x00,0x00,0x10,0xD0} → PUT EA = 0xD0100000 ✓
-- Patch applied in `spu_step()` at `pc == 0x35FCu && ctx->id == 2`
-
-**src_ea must be outside ELF BSS (0x10000–0x10010000):**
-`src_ea = 0x70C000` (SPURS synthetic area). Previously 0xA07000 was corrupting ELF BSS data, causing SDU threads to exit immediately (regression introduced when workload dispatch first fired).
-
-**Dedicated render thread** (`main.cpp`, `render_thread_proc`): calls `spurs_render_sphere_tick()` at ~30fps (Sleep(33)) independently of SPURS dispatch timing. Started after `rsx_load_launch_background()` so it animates throughout the entire game lifecycle. `spurs_render_sphere_tick` is `extern "C"` in `spu_spurs.cpp`.
-
-**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 BE vertices from the render-thread vertex buffer at **0xD0180000** (separate from EDGE's 0xD0100000). Range check: `put_end_ea > 0xD0180000 && <= 0xD0200000`. Vertex base = `put_end_ea - vtx_count*16`. Depth test: `z_pixel > g_z_buf` (larger z = closer; init -2.0f). Only fires for LS source 0xBC80. Win32 window holds **5 seconds** after `sys_process_exit`.
-
-**EDGE DMA PUT (spu_interp.cpp)**: `rsx_on_edge_write` call removed from the SPU MFC PUT handler — EDGE still writes geometry to 0xD0100000 (memcpy kept) but the render thread owns the rasterizer. Prevents EDGE from clearing the framebuffer mid-frame.
-
-**Current test geometry**: UV sphere (NLAT=14, NLON=14 = 341 triangles) generated per-frame in `spurs_render_sphere_tick()`, written to `vm_base+0xD0180000`. Animates at ~30fps. Background cycles through 5 AFS entries every 5 render frames (~1 s per background).
-
-**Architecture findings (confirmed this session):**
-
-**No PPU game loop**: `func_00012420` (full code read) is pure init. After cellGcmInit + display buffer allocation it returns — no game loop. The actual rendering cycle is SPURS-driven on the SPU side.
-
-**SPURS mailbox mechanism**: The SPURS kernel idles at LS[0x298E0] (stop-0 in BSS) waiting for LV2 to restart it. On real PS3, LV2 detects the stop, checks the workload queue, updates kernel registers, and restarts from entry 0xD0. The kernel does NOT DMA the management area at 0x70A000 in our run — our lnop bypass at LS[0x03C0] forces dispatch without real workload data (r79=0 → sort loop sees no workloads → dispatch via stop-signal chain is hollow). To dispatch real game workloads: remove lnop patch, implement PPU→SPU mailbox signaling (populate `g_spurs_ctx.gpr` with workload data and restart from 0xD0 with r79≠0).
-
-**AFS game data**: LAUNCH/data.afs has 16 entries: entry 0 = `nusc` scene config; entries 1-15 = `#A3T` textures. Texture formats (NOT DXT5 as previously assumed):
-- Entry 15: A8R8G8B8-LN (0xA5), 2048×1024, linear — tournament stage background, loaded as main BG
-- Entries 2–7: R5G6B5-LN (0xA4), 2048×1024, linear — character-select stage art
-- Entries 8,9,10,14: A8R8G8B8-LN (0xA5), various sizes — UI elements
-- Entries 12,13: A8R8G8B8 swizzled (0x85), 512×512 — character group portraits, Morton Z-order; loaded as corner overlays
-- Entry 1: A8R8G8B8-LN (0xA5), 2048×1024, extended header at +0x118
-
-`load_a3t_entry()` in `runtime_glue.cpp`: generic decoder — scans for `CellGcmTexture` struct (format byte scan 0x18..0xC0), pixel data at `gcm_off + 0x68`. Swizzled textures (format byte bit 5 clear) de-swizzled with Morton-code bit-spread. No polygon mesh data in this AFS; game geometry is in DBZ1/data_en.afs and DBZ3/data_cmn.afs, only accessible from the game loop via cellFs.
-
-**NID stubs all return 0**: func_00012420's full call tree has no cellSpursAddWorkload or cellEdgeGeomAddJob calls — the game's SPURS workload registration only happens via the SPURS state machine (func_000379BC, states 2→21). Real game EDGE tasks are submitted from the game loop (not the init path we run).
+**Other key notes:**
+- `func_00000030` → `lv2_syscall` in `extra_table`; 604 CTR+`func_00000030` patterns replaced with `ps3_indirect_call`
+- `sys_0x324` (syscall 804) seen during init — currently returns 0
+- GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158)
 
 **Outstanding next steps:**
-- **SPURS mailbox signaling** — to dispatch real game workloads, implement `cellSpursAddWorkload` HLE that populates the SPU management area and signals the kernel via inbound mailbox. The kernel entry expects r79/r77 set by LV2 to indicate pending workloads. Remove lnop patches at LS[0x03BC]/[0x03C0] to enable real dispatch (registers are r36/r33 respectively, not r12/r13).
-- **SPURS management area format** — the kernel does NOT DMA the management area at 0x70A000 during our burst run. r79/r77 must be pre-populated via the kernel entry arguments. The management area IS used to set up priority/sort tables (LS[0x1F5B0..0x1F62F]) during kernel ELF initialization.
-- Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
+- **SPURS mailbox signaling**: remove lnop patches at LS[0x03BC]/[0x03C0] (brhnz r36/r33), implement PPU→SPU mailbox — restart kernel with r79/r77 populated to enable real workload dispatch
+- **SPURS management area**: kernel needs r79/r77 pre-populated at entry; management area at 0x70A000 sets up LS priority/sort tables (LS[0x1F5B0..0x1F62F]) but doesn't DMA at runtime
+- `func_000D3020`: implement real bnusCore audio loop (currently 16 ms sleep stub)
 
 ### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
-- `rsx_process_fifo`: PPU RSX FIFO parser, fires on PUT register writes (guest addr 0x10). Handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820), NV4097_CLEAR_SURFACE (0x1D94), NV4097_DRAW_ARRAYS (0x1808, logged only).
-- `rsx_on_edge_write(put_end_ea, ls_src)`: called exclusively by the **render thread** (not the SPU interpreter). Accepts vertex data at `0xD0180000+`; computes `vertex_base = put_end_ea - vtx_count*16`, invokes `frame_begin` + `edge_rasterize_triangles`.
-- `edge_rasterize_triangles(vertex_ea, count)`: reads float4 BE vertices from `vm_base[vertex_ea]`, projects to 1280×720 screen (orthographic, NDC→pixel), fills with per-pixel barycentric test, writes BGRA8 to framebuffer. Depth test: `z_pixel > g_z_buf` (init -2.0f).
-- GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158). End pointer at +0x10 = 0xD01FFFFC. IO size at +0x18, flags at +0x1C.
-- New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented (returns 0)
+- `rsx_process_fifo`: PPU RSX FIFO parser on PUT register writes (guest addr 0x10). Handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820), NV4097_CLEAR_SURFACE (0x1D94), NV4097_DRAW_ARRAYS (0x1808).
+- `rsx_on_edge_write(put_end_ea, ls_src)`: render thread only; `frame_begin` + `edge_rasterize_triangles(vertex_base, vtx_count)`.
+- `edge_rasterize_triangles`: orthographic NDC→pixel, per-pixel barycentric + depth, BGRA8 output.
 
-## SPU Interpreter (`spu_interp.cpp`) — Current State
+## SPU Interpreter (`spu_interp.cpp`)
 
-The interpreter runs the embedded SPURS kernel ELF (at guest `0x10BD00`). SPU entry = `0xD0`. A diagnostic burst (verbose DMA logging + 50-insn trace) is run at startup in `spu_spurs.cpp`.
+All opcodes needed by SPURS kernel + EDGE geometry processor are implemented (zero UNIMPL messages).
 
-### Opcode fixes applied (verified against trace output)
+### Completed opcode fixes
 
-| op11 | Correct mnemonic | Was | Fix |
-|------|-----------------|-----|-----|
-| `0x1DB` | `rotqbi` (rotate quad left by bit count from RB) | missing | added |
-| `0x1DC` | `rotqbybi` (rotate quad left by byte count = RB>>3) | UNIMPL | added — key fix for ceqi path |
-| `0x1D4` | `rotqbii` (rotate quad left by bit count immediate, RI7) | UNIMPL | added — required for workload init loop |
-| `0x1FC` | `rotqby` (rotate quad by byte count from RB) | wrongly labelled rotqbybi | corrected |
-| `0x07F` | `shlqbyi` (shift left quad by byte immediate) | no-op | implemented |
-| `0x1F8`, `0x17F` | `.word` (not valid opcodes) | wrongly implemented | removed |
-| `0x1DD` | `shlqbi` (shift left quad by RB[2:0] bits) | UNIMPL | added — SPURS dispatch code 0x0560 |
-| `0x1DF` | `shlqbybi` (shift left quad by (RB>>3)&15 bytes) | UNIMPL | added — SPURS dispatch code 0x0574 |
-| `0x1FD` | `lqx` variant (load quad indexed: LS[(RA+RB)&~15]→RT) | UNIMPL | added — EDGE geometry; key fix for DMA (without it MFC_EAL=0) |
-| `0x3F8` | `orx` variant (OR across 4 words of RA into RT.u32[0]) | UNIMPL | added — EDGE geometry result accumulation |
+| op11 | Mnemonic | Note |
+|------|----------|------|
+| `0x1D4` | `rotqbii` RI7 | SPURS workload init loop |
+| `0x1D6` | `rotqbyi` RI7 | EDGE geometry |
+| `0x1DB` | `rotqbi` RR | added |
+| `0x1DC` | `rotqbybi` RR | ceqi dispatch path |
+| `0x1FC` | `rotqby` RR | was mislabelled |
+| `0x07F` | `shlqbyi` RI7 | was no-op |
+| `0x1DD` | `shlqbi` RR | SPURS 0x0560 |
+| `0x1DF` | `shlqbybi` RR | SPURS 0x0574 |
+| `0x1E0–0x1E2` | `cuflt`/`csflt` RI7 | EDGE vertex pack |
+| `0x1E4–0x1E7` | `cfltu`/`cflts` RI7 | EDGE vertex unpack |
+| `0x1EB–0x1EF` | `fesd`/`frds`/`dfceq` | EDGE double-precision |
+| `0x1F8`,`0x1F9` | `hbrr`/`hbrp` (nop) | EDGE branch hints |
+| `0x1FD` | `lqx` RR — `LS[(RA+RB)&~15]→RT` | EDGE task descriptor load; without it MFC_EAL=0 |
+| `0x3F8` | `orx` RR — OR-reduce RA into RT.u32[0] | EDGE result accumulation |
 
-Note: comment in code claimed `rotqbii = 0x1FB` — this is WRONG. Actual kernel uses `0x1D4`.
+### SPURS kernel dispatch — key facts
 
-### ceqi fix: Option B — patch LS[0x17C] with `ilh r2, 1`
+**LS patches applied at load time** (`spu_spurs.cpp`):
+- `LS[0x17C]` = `ilh r2, 1` (0x40000082) — forces dispatch branch at 0x184 (ceqi check can't pass naturally)
+- `LS[0x03BC]` = `lnop` — bypasses `brhnz r36` (register is r36, NOT r12)
+- `LS[0x03C0]` = `lnop` — bypasses `brhnz r33` (register is r33, NOT r13)
 
-**Option A (change SPURS_CTX_EA to 0x70A000) does NOT work.** The analysis was wrong: both 0x700000 and 0x70A000 have bits[20:17]=0x7 (i.e., `r11.u8[2]=0x07` after rothi), so both give `r4.u32[0]=0x07_000008 ≠ 8`.
-
-**Applied Option B:** In `spu_spurs.cpp`, after loading the ELF, patch LS[0x17C] with `ilh r2, 1` (= `0x40000082`, op7=0x20, I16=1, RT=2). This sets r2=0x00010001 ≠ 0 → `brnz r2, dispatch` at LS[0x184] fires.
-
-### SPURS kernel execution flow — verified working
-
-Entry path: **0xD0** → 34 instructions → `stop 0` at LS[0x154] (first idle) → restart from LS[0x158]:
-
+**Dispatch check (LS[0x0390–0x03C4])**:
 ```
-0x168: rothi   r11, r3, 12      ; r11 = rotated halfwords of SPURS_CTX_EA
-0x170: a       r3, r3, r12      ; r3 = EA + r12
-0x178: rotqbybi r4, r11, r3     ; r4 = r11 rotated by (r3>>3)&15 bytes
-0x17C: [patched to ilh r2, 1]   ; force r2=1 → dispatch branch fires
-0x184: brnz    r2, 0x0280       ; jumps to dispatch path ← branch now taken
+rotmahi r12, r79, 239    ; r12 = r79>>17 (workload-found bitmask)
+selb r42, r41, r14, r12  ; blend workload ID using r12
+selb r42, r11, r43, r13  ; blend using r13 → r42 = dispatch target
+brhnz r12, 0x298D0       ; [lnop'd] idle if r12.high≠0
+brhnz r13, 0x298E0       ; [lnop'd] idle if r13.high≠0 — ALWAYS taken without patch
+; dispatch workload r42  ; reached when both lnop patches allow fall-through
 ```
+With r79=0, r13=0x1F5F0 → high halfword=1 → both brhnz need lnop to force dispatch.
 
-Dispatch path (LS[0x0280]–LS[0x02DC]):
-- Initialization loop (16 iterations): initializes workload descriptors using `rotqbii r8, r4, 5` to compute slot offsets (r8 = counter × 32)
-- Loads workload status flags from LS into registers
-- `ila r13, 0x1F5F0` at LS[0x0308]: loads the workload availability address into r13
+**For real mailbox dispatch**: populate r79/r77 before kernel entry so the sort loop finds actual workloads and r13 gets updated to a valid workload ID (high halfword=0).
 
-Key dispatch check at LS[0x03C0]:
-- `brhnz r13, 0x298E0` — branches to "no work" idle if r13.u32[0] high halfword ≠ 0
-- r13 = 0x1F5F0 (loaded by ila, high halfword=1) → always branches when no workloads registered
-- **Kernel correctly identifies "no work available"** and branches to LS[0x298E0]
-
-### "No work" idle state at LS[0x298E0]
-
-LS[0x298E0] is in the kernel's BSS (intentional `stop 0`). On real PS3, LV2 would wake the kernel via mailbox when work arrives. In our emulation, the kernel hits `stop 0` here. The diagnostic burst detects PC≥0x29000 and ends early; the background thread sleeps+restarts in the idle loop (correct behavior).
-
-**Total verified execution: 2837 instructions** from entry through dispatch check to idle stop.
-
-### Scan loop algorithm (fully analyzed via disassembly + trace)
-
-The dispatch path (LS[0x0280]–LS[0x03C0]) executes in three phases:
-
-**Phase 1 (0x0280–0x0308): Setup**
-- Saves registers, r81=SPURS_CTX_EA (0x70A000), r10=0 (counter)
-- r14=0x1F5B0 (sort order table), r13=0x1F5F0 (priority table / "no workload" sentinel)
-- `ila r13, 0x1F5F0` at 0x0308 — sets r13 as BOTH the priority table base AND the no-workload marker
-
-**Phase 2 (0x030C–0x038C): 64-iteration workload priority sort loop**
-- r10 = 0..63, terminates at `ceqi r9, r10, 64` / `brz r9, 0x310`
-- Each iteration reads from sort table at LS[r10+r14=0x1F5B0] and priority table at LS[r10+r13=0x1F5F0]
-- `stqx r20, r10, r11` builds a sorted dispatch table at LS[r10+r11] (LS[0x0C41C+])
-- r20 = workload ready bitmask (derived from r79/r77 = DMA'd management area data = 0 currently)
-
-**Phase 3 (0x0390–0x03C0): Dispatch check**
-```
-0x0394: rotmahi r12, r79, 239   ; r12 = r79>>17 per halfword (workload found indicator)
-0x03B4: selb r42, r41, r14, r12 ; blend workload IDs using r12 mask
-0x03B8: selb r42, r11, r43, r13 ; blend using r13 mask → r42 = dispatch target
-0x03BC: brhnz r12, 0x298D0      ; if r12.high≠0 → idle (stop 0)
-0x03C0: brhnz r13, 0x298E0      ; if r13.high≠0 → idle (stop 0)  ← ALWAYS taken
-0x03C4+: dispatch workload r42  ; only reached when both r12.high=0 AND r13.high=0
-```
-
-**Why dispatch never happens (currently):**
-- r79 = 0 (no DMA from management area — kernel never issues MFC DMA commands)
-- r13 = 0x1F5F0 (set by `ila`, never updated to a workload ID because r79=0)
-- r13.u32[0] >> 16 = 1 ≠ 0 → `brhnz r13, 0x298E0` always branches to idle
-
-**Root cause:** The kernel waits for a PPU mailbox signal (`rdch CH_SPU_RdInMbox`). LV2 would:
-1. Receive the stop-0 exception at LS[0x298E0]
-2. Check PPU signal queue → find pending workload → restart kernel with r79/r77 populated
-3. On restart, r79 ≠ 0 → sort loop finds workload → dispatch
-
-**What's needed for SPU dispatch:**
-1. `cellSpursAddWorkload` HLE populates CellSpurs struct at 0x70A000 with descriptors
-2. PPU signals kernel: `ctx->inbound_mbox = info; ctx->inbound_mbox_count = 1;`
-3. Kernel restarts with management area data → r79/r77 populated → workload dispatched
-
-### LS data structures (from analysis)
-| LS Address | Contents |
+**LS data structures**:
+| Address | Contents |
 |---|---|
-| `0x1F5B0..0x1F5EF` | Sort order permutation table (64 bytes, values 0x00–0x3F) |
-| `0x1F5F0..0x1F62F` | Priority lookup table (values 0x08–0x53) |
-| `0x1F630..0x1F64F` | Shift-mask table (0xFFFF, 0x7FFF, ..., 0x0001) |
-| `0x0C41C..0x0C45B` | Sorted dispatch table built by sort loop (64 workload slots) |
+| `0x1F5B0..0x1F5EF` | Sort order permutation table (64 bytes, 0x00–0x3F) |
+| `0x1F5F0..0x1F62F` | Priority lookup table |
+| `0x0C41C..0x0C45B` | Sorted dispatch table (64 workload slots) |
 
-### All UNIMPL instructions resolved (SPURS dispatch + EDGE geometry + FP/conversion)
-| op11 | Instruction | Notes |
-|------|-------------|-------|
-| `0x1D4` | `rotqbii` (RI7, immediate bit count) | SPURS workload init loop |
-| `0x1D6` | `rotqbyi` (RI7, rotate quad left by I7&15 bytes) | EDGE geometry processor |
-| `0x1DD` | `shlqbi` (RR, shift-left quad by RB[2:0] bits) | SPURS dispatch code 0x0560 |
-| `0x1DF` | `shlqbybi` (RR, shift-left quad by (RB>>3)&15 bytes) | SPURS dispatch code 0x0574 |
-| `0x1E0` | `cuflt` (RI7, unsigned int → float, scale 2^-I7) | EDGE vertex pack |
-| `0x1E1` | `csflt` variant (RI7, signed int → float) | EDGE vertex pack |
-| `0x1E2` | `csflt` (RI7, signed int → float, scale 2^-I7) | EDGE vertex pack |
-| `0x1E4` | `cfltu` (RI7, float → unsigned int, scale 2^I7) | EDGE vertex unpack |
-| `0x1E5` | `cflts` (RI7, float → signed int, scale 2^I7) | EDGE vertex unpack |
-| `0x1E7` | `cflts` variant (RI7) | EDGE vertex unpack |
-| `0x1EB` | `fesd` variant (f32 pair → f64, odd elements) | EDGE double-precision |
-| `0x1EC` | `frds` variant (f64 pair → f32, into odd positions) | EDGE double-precision |
-| `0x1ED` | `fesd` (float extend single to double, even elements) | EDGE double-precision |
-| `0x1EE` | `frds` (float round double to single) | EDGE double-precision |
-| `0x1EF` | `dfceq` (double float compare equal) | EDGE double-precision |
-| `0x1F8` | `hbrr` (hint for branch relative — nop) | EDGE branch hint |
-| `0x1F9` | `hbrp` (hint for branch program — nop) | EDGE branch hint |
-| `0x1FD` | `lqx` variant (load quad indexed: `LS[(RA+RB)&~15] → RT`) | EDGE geometry processor — loads task descriptor; key fix for DMA |
-| `0x3F8` | `orx` variant (OR across 4 words of RA into RT.u32[0]) | EDGE geometry processor result accumulation |
-| `0x2AE` | `xswd` (extend sign word to doubleword) | Already implemented |
-| `0x2B6` | `fscrrd` (returns 0 for RT) | Already implemented |
+**Workload 1 (0x142900) = Sony EDGE SPU library** (entry=0x3050):
+- Issues `stop 0x3FFF` from LS[0x30FC]: r3=0x1000100 (task code), r4=0xADD0 (context LS addr)
+- `spurs_run_workload()` handles: writes descriptor at LS[0xADD0], redirects to geometry processor LS[0x3108]
+- EDGE geometry processor: LS→LS GET from 0xFE000000+offset, DMA PUT to output EA; `lqx` at LS[0x35FC] loads PUT EA from stream descriptor
+- Workload 2 (0x14AE80): also EDGE-based, same entry structure
 
-**Zero UNIMPL messages** on full game run (all opcodes hit by SPURS kernel + EDGE geometry processor are now implemented).
-
-### SPURS kernel dispatch: current verified flow (2980 instructions)
-
-1. Entry (0xD0, 34 insns) → stop-0 at LS[0x154] (first idle)
-2. Dispatch path from LS[0x158]:
-   - ceqi patch (ilh r2,1 at 0x17C) → brnz fires → dispatch branch at 0x280
-   - 64-iteration sort loop (0x310-0x38C): builds priority table in LS
-   - brhnz r13 patch (lnop at 0x03C0) → forces dispatch code at 0x03C4+
-   - Dispatch code (0x03C4-0x06XX): processes workload descriptors from LS
-3. Dispatch signals (15 × stop-0 at LS[0x04..0x3C]):
-   - Each stop-0 at LS[0x04], [0x08], ..., [0x3C] = one SPURS workload dispatch signal
-   - On real PS3: LV2 intercepts each and starts the SPU workload thread
-   - In our emulation: burst loop restarts each time (workload thread not started)
-4. Return via stop-0x100 at LS[0x40] → restart from entry 0xD0
-5. 20 instructions from 0xD0 → stop-0 at LS[0x20614] (post-dispatch idle)
-6. Burst ends: kernel correctly waiting for workloads to complete
-
-**Workload execution (now running for slot 0):**
-`spurs_run_workload()` loads workload 1 (guest 0x142900) on first dispatch signal.
-
-Workload 1 ELF: entry=0x3050, code LS[0x3000-0xB3DF], BSS LS[0xB800-0x3D97F] (200KB+).
-
-Workload lifecycle (63 total instructions):
-1. Entry pass (30 insns, 0x3050-0x30C4): standard SPURS framework init → stop-0
-2. Setup pass (13 insns, 0x30C8-0x30F8):
-   - `ila r4, 0xADD0` (LS destination addr)
-   - `ilh r3, 0x0100` then rotmai → r3=0x1000100 (SPURS service code)
-   - `stop 0x3FFF` ← LV2 task context load request
-3. Post-service (3 insns): branches to LS[0x0000] → executes LS[0x04..0x3C] stop signals
-4. 15×stop-0 at LS[0x04..0x3C]: workload dispatches its OWN 15 sub-workloads
-5. stop-0x100 at LS[0x40]: workload returns
-
-**Multi-level SPURS hierarchy:**
-```
-SPURS kernel (0x10BD00)  → 15 dispatch signals (LS[0x04..0x3C])
-  └── Workload 1 (0x142900)  → stop 0x3FFF (context load r3=0x1000100,r4=0xADD0)
-        └── 15 more dispatch signals (LS[0x04..0x3C])
-              └── Sub-workloads (actual game code, not yet identified)
-```
-
-**stop 0x3FFF = SPURS task context load.** Parameters:
-- r3=0x1000100: task type/encoding (bits[24]=1, bits[8]=1, likely task ID or size)
-- r4=0xADD0: LS address for LV2 to DMA the task's saved context
-
-On real PS3: LV2 finds the task's code/state from the SPURS taskset and DMA's it to LS[0xADD0]. On first run, provides default initial state (the actual game code). Without implementing this, workload jumps to LS[0x0000] and runs through stop-signal sequence (correct "no task available" behavior).
-
-**Identity of workload 1 (0x142900): Sony EDGE SPU library**
-LS[0xADD0] contains: `"EDGE ASSERTION FAILURE: %s(%d)\n"` — confirms this is Sony SCEE's EDGE library, a graphics/geometry processing SPU framework used by many PS3 games.
-
-**stop 0x3FFF = EDGE task scheduler callback.** When EDGE's SPU scheduler calls stop 0x3FFF:
-- r3=0x01000100: EDGE function/task code (0x0100 = some EDGE task ID)
-- r4=0xADD0: LS context address (points to the assertion string = an EDGE internal table entry)
-On real PS3: EDGE's PPU-side task manager handles this, loading the next EDGE sub-task into LS.
-
-**EDGE geometry processor at LS[0x3108]:**
-```
-ila  r85, 0xBC00          ; r85 = geometry table at LS[0xBC00]
-ori  r87, r3, 0           ; r87 = task descriptor arg (from caller's r3)
-ilh  r88, 0x1             ; r88 = 1 (some mode flag)
-rdch r81, SPU_RdMachStat  ; read machine status
-ila  r2, 0x3180; bi r2    ; jump to main processing loop at LS[0x3180]
-```
-This function reads r3 = EDGE task descriptor (geometry data EAs, output buffer, etc.)
-
-**All 15 workload slots** now run 47 instructions each (EDGE "no task" path).
-Total: SPURS kernel (2980) + 15 × EDGE (47 each = 705) = ~3685 SPU insns/cycle.
-
-**EDGE geometry pipeline — fully wired end-to-end:**
-
-Full dispatch: SPURS kernel → slot → EDGE scheduler → stop 0x3FFF → geometry proc → LS→LS GET → vertex processing → DMA PUT → RSX redirect.
-
-`spurs_run_workload()` stop 0x3FFF handler:
-- **Scheduler stop** (PC ~0x30FC): writes task descriptor at LS[r4=0xADD0], writes test triangle to LS[0x134], redirects to geometry processor LS[0x3108].
-- **Batch complete stop** (PC ≥ 0x3100): breaks cleanly.
-
-**Key EDGE geometry formula discoveries (from SPU register change detectors):**
-
-Vertex source EA path (determines GET):
-- `shlqbyi r61, r75, 4` at ~LS[0x3584]: r61.u32[0] = r75 bytes[4..7] = GET EA
-- GET EA 0xFE000134 → LS-mapped: reads from LS[0x134] (our test triangle ✓)
-- MFC GET from 0xFE000000-0xFEFFFFFF handled as LS→LS DMA (ea-0xFE000000 = LS offset)
-
-Output EA path (determines PUT destination):
-- `lqx r43, r49, r124` at LS[0x35FC] (op11=0x1FD): loads quad from LS[(r49+r124)&~15]
-- `shlqbyi r31, r43, 4` at LS[0x3614] (op11=0x1FF): r31.u32[0] = r43 bytes[4..7] = PUT EA
-- PUT EA = 0x830CBF3F (with sentinel stream data) = some PS3 memory region
-- MFC PUT 0x80000000-0xA0000000 redirect → RSX diagnostic buffer at 0xD0101000+
-- `rsx_on_edge_write()` fires, data written to RSX — but output is garbage vertices
-
-Additional instruction discoveries at key PCs:
-- LS[0x3188]: `ceqbi r21, r22, 0` (op8=0x7E) — byte comparison mask, NOT PUT EA source
-- LS[0x3614]: `shlqbyi r31, r43, 4` (op11=0x1FF) — RA is r43 not r21 (earlier analysis error)
-- LS[0x35FC]: `lqx r43, r49, r124` (op11=0x1FD) — the actual PUT EA loader
-
-**For PUT EA = 0xD0100000 (RSX command buffer):**
-Need r43.u8[4..7] = [0x00, 0x00, 0x10, 0xD0] (LE bytes of 0xD0100000) at time of shlqbyi.
-The lqx at 0x35FC loads from LS[(r49+r124)&~15] — this address is computed from the stream
-descriptor buffer content. Writing LE 0xD0100000 at bytes[4..7] of THAT specific LS quad
-would make PUT EA = 0xD0100000 directly (bypassing the current redirect hack).
-
-**Why output is still garbage:**
-Geometry processor processes sentinel bytes (0x30..0x3F) from stream descriptor at 0xA07000.
-These are not valid EDGE-format geometry. The output at LS[0xBC80] (written via PUT) is
-garbage-transformed garbage. For valid RSX draw commands: needs real EDGE task descriptor
-with proper vertex format info and real vertex data.
-
-**EDGE return register setup (required for clean workload return):**
-Three rotmai chains in EDGE's exit path all compute `r0 = Rx >> N`; all must yield r0=0x40:
-- `gpr[88].u32[0] = 0x80` — `rotmai r0, r88, -1` → 0x40
-- `gpr[19].u32[0] = 0x40` — `rotmai r0, r19, 0` → 0x40
-- `gpr[114].u32[0] = 0x4000` — `rotmai r0, r114, -8` → 0x40
-Without this: saved r0=0 → workload branches to LS[0x0000] instead of LS[0x40], replaying stop signals.
-
-Workload 2 (0x14AE80, ~38KB, entry=0x3050) is also EDGE-based with same entry structure.
-
-**New opcodes in SPURS dispatch code (0x0560 area):**
-- `shlqbi` (0x1DD, RR): shift-left 128-bit quad by (RB&7) bits. Same pattern as rotqbi but without wrap.
-- `shlqbybi` (0x1DF, RR): shift-left 128-bit quad by (RB>>3)&15 bytes. Same as shlqby but RB>>3.
-
-**New opcodes in EDGE geometry processor (LS[0x3108]+):**
-- `lqx` (0x1FD, RR): load quadword indexed — `LS[(RA+RB) & ~15] → RT`. EDGE loads task descriptor quads by index. Without it, MFC_EAL was 0 and no DMA fired.
-- `orx` (0x3F8, RR): OR-reduce — `RT.u32[0] = RA.u32[0] | RA.u32[1] | RA.u32[2] | RA.u32[3]`. EDGE geometry result accumulation.
+**EDGE return register values** (required for clean workload exit — set in `spurs_run_workload`):
+- `gpr[88]=0x80` → `rotmai r0, r88, -1` → r0=0x40
+- `gpr[19]=0x40` → `rotmai r0, r19, 0` → r0=0x40
+- `gpr[114]=0x4000` → `rotmai r0, r114, -8` → r0=0x40
+Without these, r0=0 → workload branches to LS[0x0000] → replays stop signals indefinitely.
 
 ## Game-Specific Patches (in `main.cpp`)
 
