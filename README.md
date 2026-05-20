@@ -122,38 +122,48 @@ The sphere animates at ~30fps from a dedicated render thread that runs independe
 
 ## Architecture overview
 
-### Full EDGE rendering pipeline (working end-to-end)
+### Rendering architecture
+
+Two independent threads write to the 1280×720 DIB framebuffer:
 
 ```
-PPU (main.cpp)
-  └─ spurs_start() launches SPU kernel thread
-       └─ SPURS kernel (LS[0xD0]) dispatches 15 workload slots
-            └─ EDGE scheduler (LS[0x3050]) receives stop 0x3FFF
-                 └─ Geometry processor (LS[0x3108]) runs vertex data
-                      └─ MFC PUT → vm_base[0xD0100000]
-                           └─ rsx_on_edge_write() → edge_rasterize_triangles()
-                                └─ Win32 DIB window (rsx_present_frame)
+main.cpp (render_thread_proc, ~30fps)
+  └─ spurs_render_sphere_tick()
+       └─ writes float4 BE vertices → vm_base[0xD0180000]
+            └─ rsx_on_edge_write() → frame_begin() + edge_rasterize_triangles()
+                 └─ rsx_present_frame() → Win32 DIB blit
+
+main.cpp (PPU thread)
+  └─ spurs_start() → SPURS kernel thread
+       └─ SPURS kernel dispatches 15 workload slots
+            └─ EDGE geometry processor runs, MFC PUT → vm_base[0xD0100000]
+                 (EDGE output stored in memory but does not trigger rendering)
 ```
 
 ### Software rasterizer (runtime_glue.cpp)
 
-`edge_rasterize_triangles()` reads float4 big-endian vertices from guest memory at `0xD0100000`, projects them to 1280×720 screen space using standard NDC → pixel coordinates, then rasterizes each triangle with:
-- Per-pixel barycentric z-interpolation + depth test (z-buffer)
+`edge_rasterize_triangles()` reads float4 big-endian vertices from the render-thread vertex buffer at `0xD0180000`, projects them to 1280×720 screen space using standard NDC → pixel coordinates, then rasterizes each triangle with:
+- Per-pixel barycentric z-interpolation + depth test (`z > z_buf`; init -2.0f; larger z = nearer)
 - Flat face normals for per-triangle shading
-- Diffuse (NdotL) + Phong specular (shininess=4) with a warm gold/orange colour palette
+- Diffuse (NdotL) + Phong specular with a warm orange-gold colour palette
 
-`frame_begin()` runs at the start of each EDGE frame: blits the background texture (nearest-neighbour scaled from 2048×1024 to 1280×720), then clears the z-buffer.
+`frame_begin()` runs at the start of each render frame: blits the current background texture (nearest-neighbour scaled to 1280×720), draws corner overlays, then clears the z-buffer.
 
 ### Game asset loading (runtime_glue.cpp)
 
 `load_a3t_entry()` is a generic `#A3T` texture decoder: it scans each entry's header for the embedded `CellGcmTexture` struct (located at `gcm_off + 0x68` bytes from the entry start), reads the format byte to determine R5G6B5 (0xA4/0x84) or A8R8G8B8 (0xA5/0x85), and converts to host BGRA8. Textures with bit 5 of the format byte clear (no LN flag) are stored in Z-order (Morton swizzle) and are de-swizzled using a bit-spread interleave before display.
 
-`rsx_load_launch_background()` loads three textures on startup:
-- **Entry 15** (2048×1024, A8R8G8B8-LN): the DBZ Budokai tournament stage — used as fullscreen background
-- **Entry 12** (512×512, A8R8G8B8 swizzled): DBZ character group portrait — displayed as 256×256 overlay in the bottom-left corner
-- **Entry 13** (512×512, A8R8G8B8 swizzled): second character group portrait — displayed in the bottom-right corner
+`rsx_load_launch_background()` loads 7 textures on startup into two pools:
 
-The 16 entries in `LAUNCH/data.afs`: entry 0 is a `nusc` scene config; entries 1–14 are `#A3T` textures in R5G6B5 or A8R8G8B8 (not DXT5 as previously assumed); entry 15 is A8R8G8B8 BGRA8.
+**Background pool** (5 entries, cycle every 5 render frames):
+- **Entry 15** (2048×1024, A8R8G8B8-LN): DBZ Budokai tournament stage — slot 0
+- **Entries 1–4** (2048×1024, A8R8G8B8-LN / R5G6B5-LN): game intro screens (Bandai, Namco, publisher logos) — slots 1–4
+
+**Overlay pool** (2 entries, always displayed):
+- **Entry 12** (512×512, A8R8G8B8 swizzled): DBZ character group portrait — bottom-left, 256×256
+- **Entry 13** (512×512, A8R8G8B8 swizzled): second character group portrait — bottom-right, 256×256
+
+The 16 entries in `LAUNCH/data.afs`: entry 0 is a `nusc` scene config; entries 1–14 are `#A3T` textures in R5G6B5 or A8R8G8B8; entry 15 is A8R8G8B8-LN. None are DXT5.
 
 ### SPURS/SPU kernel
 

@@ -43,7 +43,7 @@ If the cmake configure cache is broken (missing `build.ninja`), delete `build\CM
 | `extra_funcs.cpp` | Hand-lifted PPU functions missed by the lifter (ctors/dtors reached only via indirect calls); same `void func_XXXXXXXX(ppu_context*)` signature |
 | `stubs.cpp` | Reference template for NID overrides/module hooks — not compiled; kept as documentation |
 | `spu_interp.cpp` | SPU instruction interpreter — all opcodes for SPURS kernel + EDGE geometry processor, including lqx (0x1FD), orx (0x3F8), shlqbi (0x1DD), shlqbybi (0x1DF) |
-| `spu_spurs.cpp` | SPURS/SPU orchestration: loads kernel ELF, patches LS, runs SPU burst loop, dispatches EDGE workloads, `spurs_test_edge_geometry()` diagnostic |
+| `spu_spurs.cpp` | SPURS/SPU orchestration: loads kernel ELF, patches LS, runs SPU burst loop, dispatches EDGE workloads; `spurs_render_sphere_tick()` generates the animated UV sphere per frame |
 | `recompiled/ppu_recomp.cpp` | **Auto-generated base** — but does receive targeted manual patches (e.g. `bcctrl` trampoline fixups, guard insertions). Document any manual edits clearly with comments. |
 | `recompiled/ppu_recomp.h` | **Auto-generated** — declares `ppu_context`, memory helpers, all `func_XXXXXXXX` prototypes |
 | `config.toml` | Lifter config: input ELF path, output dir, HLE/LLE module choices, memory/threading/graphics/audio settings |
@@ -183,19 +183,17 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 
 **NID stubs all return 0**: func_00012420's full call tree has no cellSpursAddWorkload or cellEdgeGeomAddJob calls — the game's SPURS workload registration only happens via the SPURS state machine (func_000379BC, states 2→21). Real game EDGE tasks are submitted from the game loop (not the init path we run).
 
-**Outstanding questions for the next iteration:**
-- **SPURS dispatch registers (corrected)** — CLAUDE.md previously said brhnz r12/r13 at LS[0x03BC]/[0x03C0]. From ELF decode and trace analysis, the actual registers are r36 (at 0x03BC) and r33 (at 0x03C0). Both are patched to lnop. With r79=0: r36.high=0 (falls through naturally), r33.high≠0 (needs lnop at 0x03C0). With r79=1: r36.high=0x00C0≠0 (needs lnop at 0x03BC too) — r79=1 breaks the single-lnop approach. Currently patching both 0x03BC and 0x03C0 to lnop, keeping r79=0.
-- **SPURS mailbox signaling** — to dispatch real game workloads, implement `cellSpursAddWorkload` HLE that populates the SPU management area and signals the kernel via inbound mailbox. The kernel entry expects r79/r77 set by LV2 to indicate pending workloads. With both brhnz patched, r79≠0 also enables r42 (dispatch target) to be computed via selb from real workload data — but the selb output format is not yet understood.
-- **SPURS management area format** — the kernel does NOT DMA the management area at 0x70A000 during our burst run. r79/r77 must be pre-populated via the kernel entry arguments, not DMA. The management area IS used to set up priority/sort tables (LS[0x1F5B0..0x1F62F]) but only during kernel ELF initialization.
+**Outstanding next steps:**
+- **SPURS mailbox signaling** — to dispatch real game workloads, implement `cellSpursAddWorkload` HLE that populates the SPU management area and signals the kernel via inbound mailbox. The kernel entry expects r79/r77 set by LV2 to indicate pending workloads. Remove lnop patches at LS[0x03BC]/[0x03C0] to enable real dispatch (registers are r36/r33 respectively, not r12/r13).
+- **SPURS management area format** — the kernel does NOT DMA the management area at 0x70A000 during our burst run. r79/r77 must be pre-populated via the kernel entry arguments. The management area IS used to set up priority/sort tables (LS[0x1F5B0..0x1F62F]) during kernel ELF initialization.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
 ### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
 - `rsx_process_fifo`: PPU RSX FIFO parser, fires on PUT register writes (guest addr 0x10). Handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820), NV4097_CLEAR_SURFACE (0x1D94), NV4097_DRAW_ARRAYS (0x1808, logged only).
-- `rsx_on_edge_write(put_end_ea)`: called by SPU interpreter when EDGE PUTs to 0xD0100000-0xD0200000. Invokes `edge_rasterize_triangles` to software-render the vertex batch.
-- `edge_rasterize_triangles(vertex_ea, count)`: reads float4 BE vertices from guest memory, projects to 1280×720 screen, fills with barycentric test, writes BGRA8 to framebuffer.
+- `rsx_on_edge_write(put_end_ea, ls_src)`: called exclusively by the **render thread** (not the SPU interpreter). Accepts vertex data at `0xD0180000+`; computes `vertex_base = put_end_ea - vtx_count*16`, invokes `frame_begin` + `edge_rasterize_triangles`.
+- `edge_rasterize_triangles(vertex_ea, count)`: reads float4 BE vertices from `vm_base[vertex_ea]`, projects to 1280×720 screen (orthographic, NDC→pixel), fills with per-pixel barycentric test, writes BGRA8 to framebuffer. Depth test: `z_pixel > g_z_buf` (init -2.0f).
 - GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158). End pointer at +0x10 = 0xD01FFFFC. IO size at +0x18, flags at +0x1C.
-- Identify the 26 sysPrxForUser NIDs imported by this ELF
-- New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented
+- New syscall `sys_0x324` (0x324 = 804) seen during init — currently unimplemented (returns 0)
 
 ## SPU Interpreter (`spu_interp.cpp`) — Current State
 
