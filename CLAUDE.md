@@ -173,8 +173,9 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 **NID stubs all return 0**: func_00012420's full call tree has no cellSpursAddWorkload or cellEdgeGeomAddJob calls — the game's SPURS workload registration only happens via the SPURS state machine (func_000379BC, states 2→21). Real game EDGE tasks are submitted from the game loop (not the init path we run).
 
 **Outstanding questions for the next iteration:**
-- **SPURS mailbox signaling** — to dispatch real game workloads, implement `cellSpursAddWorkload` HLE that populates the SPU management area and signals the kernel via inbound mailbox. The kernel entry expects r79/r77 set by LV2 to indicate pending workloads.
-- **SPURS management area format** — need to decode which DMA the kernel issues from entry 0xD0 and what offsets it reads. This tells us how to structure the management area so the kernel sees real workloads.
+- **SPURS dispatch registers (corrected)** — CLAUDE.md previously said brhnz r12/r13 at LS[0x03BC]/[0x03C0]. From ELF decode and trace analysis, the actual registers are r36 (at 0x03BC) and r33 (at 0x03C0). Both are patched to lnop. With r79=0: r36.high=0 (falls through naturally), r33.high≠0 (needs lnop at 0x03C0). With r79=1: r36.high=0x00C0≠0 (needs lnop at 0x03BC too) — r79=1 breaks the single-lnop approach. Currently patching both 0x03BC and 0x03C0 to lnop, keeping r79=0.
+- **SPURS mailbox signaling** — to dispatch real game workloads, implement `cellSpursAddWorkload` HLE that populates the SPU management area and signals the kernel via inbound mailbox. The kernel entry expects r79/r77 set by LV2 to indicate pending workloads. With both brhnz patched, r79≠0 also enables r42 (dispatch target) to be computed via selb from real workload data — but the selb output format is not yet understood.
+- **SPURS management area format** — the kernel does NOT DMA the management area at 0x70A000 during our burst run. r79/r77 must be pre-populated via the kernel entry arguments, not DMA. The management area IS used to set up priority/sort tables (LS[0x1F5B0..0x1F62F]) but only during kernel ELF initialization.
 - Implement a real bnusCore audio loop in `func_000D3020` (currently a 16 ms sleep stub)
 
 ### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
