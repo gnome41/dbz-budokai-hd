@@ -112,6 +112,13 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 
 **Game main is pure init** (`func_00012420`): no game loop. Real rendering is SPURS/SPU-driven. NID stubs return 0; no cellSpursAddWorkload calls in the init path. Real EDGE tasks come from the game loop (unreachable currently).
 
+**Game loop architecture** (event-driven, not reachable yet):
+- No single "game loop" function. The game is entirely event-driven via SPURS callbacks + sys_event_queue
+- Thread 4 "Terminate Thread" (func_00039E24 @ 0x39E20): processes a linked list at [0x28B08C]; exits immediately because BSS=0 (no pending callbacks queued)
+- func_000129B0 (@ 0x129B0): in OPD table but never started in our run; likely a game subsystem initializer
+- func_000510E4: was supposed to connect event port (func_000B8790 → syscall 130 → func_000B89BC → func_000D2F90 chain) so UpdateThread receives VSYNC-driven events. We bypass this and create UpdateThread directly.
+- **Root cause**: without the event port infrastructure + real cellGcm VSYNC, the game has no mechanism to submit rendering work or advance game state.
+
 **Rendering** (dedicated thread at ~30fps):
 - `render_thread_proc` in `main.cpp`: calls `spurs_render_sphere_tick()` + Sleep(33); started after background load
 - Sphere vertex buffer at `vm_base+0xD0180000`; EDGE writes its own output to `0xD0100000` (separate, no conflict)
@@ -131,8 +138,9 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158)
 
 **Outstanding next steps:**
-- **SPURS mailbox signaling**: remove lnop patches at LS[0x03BC]/[0x03C0] (brhnz r36/r33), implement PPU→SPU mailbox — restart kernel with r79/r77 populated to enable real workload dispatch
-- **SPURS management area**: kernel needs r79/r77 pre-populated at entry; management area at 0x70A000 sets up LS priority/sort tables (LS[0x1F5B0..0x1F62F]) but doesn't DMA at runtime
+- **SPURS mailbox signaling**: lnop at LS[0x03BC] is permanent (r36 always non-zero). For real dispatch: need r79 format that sets r33.high=0 without breaking selb r42 computation. Both lnop patches must stay.
+- **Event port infrastructure** (high impact): implement sys_event_port_connect_local + event queue properly so func_000510E4's real callback chain fires. This would allow the game's VSYNC-driven update loop to run.
+- **cellSpursAddWorkload HLE**: needed to register real game workloads; only callable from the game loop (unreachable without event port).
 - `func_000D3020`: implement real bnusCore audio loop (currently 16 ms sleep stub)
 
 ### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
@@ -181,7 +189,15 @@ brhnz r13, 0x298E0       ; [lnop'd] idle if r13.high≠0 — ALWAYS taken withou
 ```
 With r79=0, r13=0x1F5F0 → high halfword=1 → both brhnz need lnop to force dispatch.
 
-**For real mailbox dispatch**: populate r79/r77 before kernel entry so the sort loop finds actual workloads and r13 gets updated to a valid workload ID (high halfword=0).
+**Empirical findings from diagnostic run (r79=0, first dispatch check):**
+- r33=0x3F000000, r36=0x00C00F00 — BOTH high halfwords non-zero → BOTH lnop patches needed
+- The CLAUDE.md note "r36.high=0 with r79=0" was WRONG; r36 is non-zero regardless of r79
+- r33=0x3F000000 encodes "no workload selected" (sort table slot 63 sentinel in packed format)
+- sort_table LS[0x1F5B0]: 00 01 08 10 09 02 03 0A... (priority order; slot 0 highest priority)
+- prio_table LS[0x1F5F0]: 08 10 13 16 1A 1B 1D 22... (priority weights)
+- With r79=0x80000000 (probe): selb r42 computation produces wrong dispatch target — BREAKS things
+
+**For real mailbox dispatch**: need r79 in format that makes sort loop set r33.high=0 (workload found) while NOT breaking r42 selb computation. Both lnop patches still required (r36 permanently non-zero). Requires real workload descriptors in management area at 0x70A000.
 
 **LS data structures**:
 | Address | Contents |
