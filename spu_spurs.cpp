@@ -256,10 +256,12 @@ static void spurs_run_workload(int slot_idx) {
                     }
                 }
 
-                /* Generate test sphere mesh into LS[0x134..0x134+16KB) so the
-                 * EDGE geometry processor's LS-mapped DMA GET (ea=0xFE000134)
-                 * picks it up.  Big-endian float4 (x,y,z,w=1) per vertex. */
+                /* Generate animated sphere into LS[0x134..0x134+16KB).
+                 * Rotates around Y-axis each dispatch cycle (frame counter). */
                 if (slot_idx == 0) {
+                    static uint32_t sphere_frame = 0;
+                    sphere_frame++;
+
                     auto be_f32_ls = [&](uint32_t off, float v) {
                         union { float f; uint32_t u; } x; x.f = v;
                         g_wl_ctx.ls[off+0]=(uint8_t)(x.u>>24); g_wl_ctx.ls[off+1]=(uint8_t)(x.u>>16);
@@ -271,11 +273,18 @@ static void spurs_run_workload(int slot_idx) {
                     uint32_t vcount = 0;
                     uint32_t vbase = 0x134u;
 
+                    /* Y-axis rotation: ~2 degrees per dispatch cycle */
+                    float angle = sphere_frame * (PI / 90.0f);
+                    float ca = cosf(angle), sa = sinf(angle);
+
                     auto add_vert = [&](float x, float y, float z) {
                         if (vcount >= MAX_VERTS) return;
+                        /* Apply Y-axis rotation */
+                        float rx = x*ca - z*sa;
+                        float rz = x*sa + z*ca;
                         uint32_t off = vbase + vcount * 16;
-                        be_f32_ls(off, x); be_f32_ls(off+4, y);
-                        be_f32_ls(off+8, z); be_f32_ls(off+12, 1.0f);
+                        be_f32_ls(off, rx); be_f32_ls(off+4, y);
+                        be_f32_ls(off+8, rz); be_f32_ls(off+12, 1.0f);
                         vcount++;
                     };
                     for (int i = 0; i < NLAT && vcount + 6 < MAX_VERTS; i++) {
@@ -300,9 +309,9 @@ static void spurs_run_workload(int slot_idx) {
                             }
                         }
                     }
-                    fprintf(stderr, "[WL] slot %d: sphere mesh %u verts (%u tris) at LS[0x%X]\n",
-                            slot_idx, vcount, vcount/3, vbase);
-                    fflush(stderr);
+                    if (sphere_frame == 1)
+                        fprintf(stderr, "[WL] slot %d: sphere mesh %u verts (%u tris) animated\n",
+                                slot_idx, vcount, vcount/3);
                 }
 
                 /* Redirect to geometry processor entry */
@@ -336,24 +345,57 @@ static void spurs_run_workload(int slot_idx) {
 }
 
 /* ---- SPURS kernel thread ------------------------------------------------ */
-static DWORD WINAPI spurs_kernel_thread(LPVOID) {
-    fprintf(stderr, "[SPURS] kernel thread starting (insn limit=unlimited)\n");
-    fflush(stderr);
+static uint32_t g_spurs_entry_pc = 0;  /* saved entry PC for background restarts */
 
-    /* Batch: run up to 1M instructions at a time, checking exit flag */
+static DWORD WINAPI spurs_kernel_thread(LPVOID) {
+    /* Continuously dispatch SPURS workloads.  Handles:
+     * stop-0 at LS[0x04..0x3C] = dispatch signal → run workload
+     * stop-0x100              = kernel returned  → restart from entry
+     * stop-0 at BSS idle       = no-work idle    → restart from entry
+     * Other stops              = real halt, exit */
     while (!g_threads_should_exit) {
         if (!g_spurs_ctx.running) {
             uint32_t code = g_spurs_ctx.stop_code;
-            fprintf(stderr, "[SPURS] kernel stopped (stop_code=0x%X insns=%llu)\n",
-                    code, (unsigned long long)g_spurs_ctx.insn_count);
-            fflush(stderr);
-            /* Stopped waiting for mailbox — yield and retry */
+            uint32_t pc   = g_spurs_ctx.pc;
+
             if (code == 0) {
-                Sleep(1);
-                /* Restart from current PC (rdch blocking case) */
+                if (pc >= 0x04u && pc <= 0x3Cu) {
+                    /* Dispatch signal: run workload for this slot */
+                    int slot = (int)((pc - 0x04u) / 4u);
+                    spurs_run_workload(slot);
+                    g_spurs_ctx.running = 1;
+                } else if (pc >= 0x20000u || code == 0x100) {
+                    /* BSS idle or return: restart from entry for next cycle */
+                    if (g_spurs_entry_pc) {
+                        g_spurs_ctx.pc = g_spurs_entry_pc;
+                        g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
+                        g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;
+                        g_spurs_ctx.gpr[4].u32[0] = 0;
+                        g_spurs_ctx.gpr[0].u32[0] = 0x40;
+                        uint8_t s[4] = {0x00, 0x00, 0x01, 0x00};
+                        memcpy(g_spurs_ctx.ls + 0x40, s, 4);
+                    }
+                    g_spurs_ctx.running = 1;
+                    /* Throttle: ~60 dispatch cycles per second */
+                    Sleep(1);
+                } else {
+                    /* Dispatch path stop or intermediate yield */
+                    g_spurs_ctx.running = 1;
+                }
+            } else if (code == 0x100) {
+                /* Kernel returned → restart */
+                if (g_spurs_entry_pc) {
+                    g_spurs_ctx.pc = g_spurs_entry_pc;
+                    g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
+                    g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;
+                    g_spurs_ctx.gpr[4].u32[0] = 0;
+                    g_spurs_ctx.gpr[0].u32[0] = 0x40;
+                    uint8_t s[4] = {0x00, 0x00, 0x01, 0x00};
+                    memcpy(g_spurs_ctx.ls + 0x40, s, 4);
+                }
                 g_spurs_ctx.running = 1;
             } else {
-                break;  /* real stop instruction */
+                break;  /* real stop — exit */
             }
         }
         spu_run(&g_spurs_ctx, 100000);
@@ -399,6 +441,7 @@ extern "C" void spurs_start(void) {
     }
 
     uint32_t entry_pc = g_spurs_ctx.pc;
+    g_spurs_entry_pc  = entry_pc;  /* save for background thread restarts */
     fprintf(stderr, "[SPURS] kernel ELF loaded from guest 0x%X, entry PC=0x%X\n",
             SPURS_KERNEL_A_GADDR, entry_pc);
     fflush(stderr);
