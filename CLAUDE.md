@@ -158,9 +158,13 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 **src_ea must be outside ELF BSS (0x10000–0x10010000):**
 `src_ea = 0x70C000` (SPURS synthetic area). Previously 0xA07000 was corrupting ELF BSS data, causing SDU threads to exit immediately (regression introduced when workload dispatch first fired).
 
-**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 big-endian vertices from 0xD0100000, projects to screen, flat-shades with orange-gold diffuse lighting, writes BGRA8 to framebuffer. Only fires for LS source 0xBC80 (primary vertex output, tag=0). Win32 window holds **5 seconds** after `sys_process_exit` fires (via `setjmp` catch in `main.cpp` — the old `Sleep(3000)` at line 454 was unreachable because `longjmp` bypassed it).
+**Dedicated render thread** (`main.cpp`, `render_thread_proc`): calls `spurs_render_sphere_tick()` at ~30fps (Sleep(33)) independently of SPURS dispatch timing. Started after `rsx_load_launch_background()` so it animates throughout the entire game lifecycle. `spurs_render_sphere_tick` is `extern "C"` in `spu_spurs.cpp`.
 
-**Current test geometry**: UV sphere (NLAT=14, NLON=14) generated in spu_spurs.cpp stop 0x3FFF handler — 1023 vertices (341 triangles) written to LS[0x134..0x5133] (16 KB). EDGE processes all 16 KB passthrough → PUT to 0xD0100000. Rasterizer draws 341 flat-shaded triangles. Visual: shaded sphere centred at screen mid-point (~640×360 area), warm gold-orange tones.
+**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 BE vertices from the render-thread vertex buffer at **0xD0180000** (separate from EDGE's 0xD0100000). Range check: `put_end_ea > 0xD0180000 && <= 0xD0200000`. Vertex base = `put_end_ea - vtx_count*16`. Depth test: `z_pixel > g_z_buf` (larger z = closer; init -2.0f). Only fires for LS source 0xBC80. Win32 window holds **5 seconds** after `sys_process_exit`.
+
+**EDGE DMA PUT (spu_interp.cpp)**: `rsx_on_edge_write` call removed from the SPU MFC PUT handler — EDGE still writes geometry to 0xD0100000 (memcpy kept) but the render thread owns the rasterizer. Prevents EDGE from clearing the framebuffer mid-frame.
+
+**Current test geometry**: UV sphere (NLAT=14, NLON=14 = 341 triangles) generated per-frame in `spurs_render_sphere_tick()`, written to `vm_base+0xD0180000`. Animates at ~30fps. Background cycles through 5 AFS entries every 5 render frames (~1 s per background).
 
 **Architecture findings (confirmed this session):**
 

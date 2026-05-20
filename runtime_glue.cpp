@@ -523,15 +523,24 @@ static float* g_z_buf    = nullptr;
 static int    g_z_buf_sz = 0;
 static uint32_t g_frame_no = 0;
 
-/* Background texture from LAUNCH/data.afs entry 15 (2048×1024 BGRA8). */
-static uint8_t* g_bg_pixels = nullptr;
-static int      g_bg_w = 0, g_bg_h = 0;
+/* Background textures — up to 8 loaded, cycled on a 4-second timer. */
+static const int    BG_SLOTS = 8;
+static uint8_t*     g_bg_pool[BG_SLOTS] = {};
+static int          g_bg_pool_w[BG_SLOTS] = {};
+static int          g_bg_pool_h[BG_SLOTS] = {};
+static int          g_bg_count = 0;
+static int          g_bg_current = 0;
 
 /* Overlay textures: entries 12 and 13 (512×512 A8R8G8B8, game logo/title art). */
 static uint8_t* g_overlay1_pixels = nullptr;
 static int      g_overlay1_w = 0, g_overlay1_h = 0;
 static uint8_t* g_overlay2_pixels = nullptr;
 static int      g_overlay2_w = 0, g_overlay2_h = 0;
+
+/* Legacy aliases used by the background blit path in frame_begin(). */
+static inline uint8_t* bg_pixels()   { return g_bg_pool[g_bg_current]; }
+static inline int      bg_w()        { return g_bg_pool_w[g_bg_current]; }
+static inline int      bg_h()        { return g_bg_pool_h[g_bg_current]; }
 
 /* Morton-code helpers for de-swizzling PS3 "SZ" (non-linear) textures.
  * GCM format bytes WITHOUT bit 0x20 (the LN flag) store pixels in Z-order:
@@ -564,16 +573,19 @@ static bool load_a3t_entry(const char* afs_path, int entry_idx,
     fread(&entry_sz,  4, 1, f);
 
     fseek(f, (long)entry_off, SEEK_SET);
-    uint8_t hdr[0xE0];
-    if (fread(hdr, 1, 0xE0, f) != 0xE0) { fclose(f); return false; }
+    uint8_t hdr[0x200];  /* large enough for any observed header variant (entry 1 at +0x118) */
+    uint32_t hdr_read = (uint32_t)fread(hdr, 1, sizeof(hdr), f);
+    if (hdr_read < 0xE0) { fclose(f); return false; }
     if (hdr[0]!='#'||hdr[1]!='A'||hdr[2]!='3'||hdr[3]!='T') { fclose(f); return false; }
 
-    /* Scan header for CellGcmTexture struct (format + mipmap + dim=2 + power-of-2 dims). */
+    /* Scan header for CellGcmTexture struct (format + mipmap + dim=2 + power-of-2 dims).
+     * Some entries have the struct at higher offsets (e.g. entry 1 at +0x118). */
     static const uint8_t VALID_FMT[] = {0x84, 0x85, 0xA4, 0xA5};
     int gcm_off = -1;
     uint8_t fmt_byte = 0;
     int tex_w = 0, tex_h = 0;
-    for (int i = 0x18; i <= 0xC0; i++) {
+    int scan_end = (int)hdr_read - 24;
+    for (int i = 0x18; i <= scan_end; i++) {
         uint8_t fmt = hdr[i];
         bool ok = false;
         for (uint8_t v : VALID_FMT) if (fmt == v) { ok = true; break; }
@@ -637,22 +649,28 @@ static bool load_a3t_entry(const char* afs_path, int entry_idx,
 }
 
 extern "C" void rsx_load_launch_background(const char* afs_path) {
-    /* Entry 15: 2048×1024 A8R8G8B8 — the DBZ launcher menu panel. */
-    if (load_a3t_entry(afs_path, 15, &g_bg_pixels, &g_bg_w, &g_bg_h)) {
-        fprintf(stderr, "[BG] loaded entry 15 %dx%d BGRA8 from '%s'\n",
-                g_bg_w, g_bg_h, afs_path);
-    } else {
-        fprintf(stderr, "[BG] cannot load entry 15 from '%s' (background skipped)\n", afs_path);
+    /* Load background pool: entry 15 (tournament stage), entry 1 (title art),
+     * entries 2-4 (character stage backgrounds). Cycle through them every 4 s. */
+    static const int BG_ENTRIES[] = {15, 1, 2, 3, 4};
+    g_bg_count = 0;
+    for (int i = 0; i < (int)(sizeof(BG_ENTRIES)/sizeof(BG_ENTRIES[0])); i++) {
+        if (g_bg_count >= BG_SLOTS) break;
+        int slot = g_bg_count;
+        if (load_a3t_entry(afs_path, BG_ENTRIES[i],
+                           &g_bg_pool[slot], &g_bg_pool_w[slot], &g_bg_pool_h[slot])) {
+            fprintf(stderr, "[BG] loaded entry %d %dx%d BGRA8 (slot %d)\n",
+                    BG_ENTRIES[i], g_bg_pool_w[slot], g_bg_pool_h[slot], slot);
+            g_bg_count++;
+        }
     }
-    /* Entries 12 & 13: 512×512 A8R8G8B8 — game title/logo art with alpha. */
-    if (load_a3t_entry(afs_path, 12, &g_overlay1_pixels, &g_overlay1_w, &g_overlay1_h)) {
-        fprintf(stderr, "[BG] loaded entry 12 %dx%d BGRA8 overlay\n",
-                g_overlay1_w, g_overlay1_h);
-    }
-    if (load_a3t_entry(afs_path, 13, &g_overlay2_pixels, &g_overlay2_w, &g_overlay2_h)) {
-        fprintf(stderr, "[BG] loaded entry 13 %dx%d BGRA8 overlay\n",
-                g_overlay2_w, g_overlay2_h);
-    }
+    if (g_bg_count == 0)
+        fprintf(stderr, "[BG] no backgrounds loaded from '%s'\n", afs_path);
+
+    /* Entries 12 & 13: 512×512 swizzled A8R8G8B8 — character group portrait overlays. */
+    if (load_a3t_entry(afs_path, 12, &g_overlay1_pixels, &g_overlay1_w, &g_overlay1_h))
+        fprintf(stderr, "[BG] loaded entry 12 %dx%d overlay\n", g_overlay1_w, g_overlay1_h);
+    if (load_a3t_entry(afs_path, 13, &g_overlay2_pixels, &g_overlay2_w, &g_overlay2_h))
+        fprintf(stderr, "[BG] loaded entry 13 %dx%d overlay\n", g_overlay2_w, g_overlay2_h);
     fflush(stderr);
 }
 
@@ -696,14 +714,21 @@ static void frame_begin(int W, int H) {
         g_z_buf_sz = n;
     }
     uint32_t* fb = rsx_framebuf();
-    if (g_bg_pixels && g_bg_w > 0 && g_bg_h > 0) {
-        /* Scale background to screen (nearest-neighbour, BGRA8→BGRA8, alpha forced opaque). */
+
+    /* Cycle backgrounds every 5 EDGE frames (matches ~3-5 s at actual dispatch rate). */
+    if (g_bg_count > 1)
+        g_bg_current = (int)((g_frame_no / 5) % (uint32_t)g_bg_count);
+
+    const uint8_t* bg = bg_pixels();
+    int bw = bg_w(), bh = bg_h();
+    if (bg && bw > 0 && bh > 0) {
+        /* Scale background to screen (nearest-neighbour, BGRA8→BGRA8). */
         for (int dy = 0; dy < H; dy++) {
-            int sy = dy * g_bg_h / H;
-            const uint8_t* row = g_bg_pixels + sy * g_bg_w * 4;
+            int sy = dy * bh / H;
+            const uint8_t* row = bg + sy * bw * 4;
             uint32_t* dst = fb + dy * W;
             for (int dx = 0; dx < W; dx++) {
-                int sx = dx * g_bg_w / W;
+                int sx = dx * bw / W;
                 const uint8_t* p = row + sx * 4;
                 dst[dx] = 0xFF000000u | ((uint32_t)p[2]<<16) | ((uint32_t)p[1]<<8) | p[0];
             }
@@ -720,7 +745,7 @@ static void frame_begin(int W, int H) {
     if (g_overlay2_pixels && g_overlay2_w > 0)
         blit_overlay(fb, W, H, g_overlay2_pixels, g_overlay2_w, g_overlay2_h,
                      W - OVL_SIZE, H - OVL_SIZE, OVL_SIZE, OVL_SIZE);
-    for (int i = 0; i < n; i++) g_z_buf[i] = 2.0f;
+    for (int i = 0; i < n; i++) g_z_buf[i] = -2.0f;  /* init to far (depth test: larger z wins) */
 }
 
 /* Soft-rasterize float4 BE vertex soup with depth buffer + specular shading. */
@@ -764,11 +789,12 @@ static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) 
         /* Simple specular: reflect view direction (0,0,1) around normal */
         float spec_base = fmaxf(0.0f, 2.0f*(nx*LX+ny*LY+nz*LZ)*nz - LZ);
         float spec = spec_base*spec_base*spec_base*spec_base;
-        float shade = fmaxf(0.12f, diff*0.8f + spec*0.6f);
+        /* Dragon Ball orange-gold: warm amber base, bright orange in full light, warm specular */
+        float shade = fmaxf(0.28f, diff*0.72f + spec*0.5f);
 
-        uint8_t r=(uint8_t)fminf(255.f, shade*240 + spec*80 + 10);
-        uint8_t g=(uint8_t)fminf(255.f, shade*140 + 10);
-        uint8_t b=(uint8_t)fminf(255.f, shade*20  + spec*120);
+        uint8_t r=(uint8_t)fminf(255.f, shade*215 + spec*220 + 40);
+        uint8_t g=(uint8_t)fminf(255.f, shade*100 + spec*180 + 18);
+        uint8_t b=(uint8_t)fminf(255.f, shade*8   + spec*60  + 2);
         uint32_t color = 0xFF000000u|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
 
         int x0=(int)fmaxf(0.f,fminf(sx[0],fminf(sx[1],sx[2])));
@@ -793,7 +819,7 @@ static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) 
             if (!in) continue;
             float z_pixel = (b0*sz[0]+b1*sz[1]+b2*sz[2]) * inv_area;
             int idx = y*W+x;
-            if (z_pixel < g_z_buf[idx]) {
+            if (z_pixel > g_z_buf[idx]) {  /* larger z = closer to viewer (viewer at +z) */
                 g_z_buf[idx] = z_pixel;
                 fb[idx] = color;
             }
@@ -804,17 +830,18 @@ static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) 
 /* Called by the SPU interpreter when EDGE geometry processor MFC_PUTs into the
  * RSX IO-mapped region.  Only process the primary vertex output (LS src 0xBC80). */
 extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src) {
-    if (put_end_ea < 0xD0100000u || put_end_ea > 0xD0200000u) return;
+    /* Render-thread sphere vertex buffer lives at 0xD0180000 (separate from EDGE's 0xD0100000) */
+    if (put_end_ea <= 0xD0180000u || put_end_ea > 0xD0200000u) return;
     if (ls_src != 0xBC80u) return;
 
-    uint32_t vtx_count = (put_end_ea - 0xD0100000u) / 16u;
+    uint32_t vtx_count = (put_end_ea - 0xD0180000u) / 16u;
     if (vtx_count < 3) return;
 
     int W = rsx_fb_width(), H = rsx_fb_height();
-    frame_begin(W, H);  /* clear fb + z-buf each frame */
+    frame_begin(W, H);
     g_frame_no++;
 
-    edge_rasterize_triangles(0xD0100000u, vtx_count);
+    edge_rasterize_triangles(put_end_ea - vtx_count * 16u, vtx_count);
     rsx_present_frame();
 }
 

@@ -110,6 +110,16 @@ extern "C" void spurs_start(void);
 extern "C" void spurs_verbose_off(void);
 extern "C" void spurs_test_edge_geometry(void);
 extern "C" void rsx_load_launch_background(const char* afs_path);
+extern "C" void spurs_render_sphere_tick(void);
+
+/* Dedicated render thread: drives sphere animation at ~30fps independent of SPURS dispatch rate. */
+static DWORD WINAPI render_thread_proc(LPVOID) {
+    while (!g_threads_should_exit) {
+        spurs_render_sphere_tick();
+        Sleep(33);
+    }
+    return 0;
+}
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
 
 #define DRAIN_TRAMPOLINE(ctx) do { \
@@ -401,6 +411,8 @@ int main(int argc, char* argv[]) {
     Sleep(200);  /* Let window open before game starts */
     /* Load background texture from game disc (LAUNCH/data.afs entry 15: 2048×1024 BGRA8). */
     rsx_load_launch_background("..\\BLES01658\\PS3_GAME\\USRDIR\\LAUNCH\\data.afs");
+    /* Start sphere render thread now so it animates during the long SPURS init. */
+    CreateThread(nullptr, 0, render_thread_proc, nullptr, 0, nullptr);
 #endif
 
     printf("Entering recompiled entry point...\n");
@@ -452,9 +464,6 @@ int main(int argc, char* argv[]) {
 #endif
 
     printf("Entry point returned. Waiting for game threads...\n");
-
-    /* Hold the window open so the rendered sphere is visible for 3 seconds */
-    Sleep(3000);
 
     g_threads_should_exit = true;  /* signal stub threads (UpdateThread etc.) to exit */
     thread_runtime_join_all();

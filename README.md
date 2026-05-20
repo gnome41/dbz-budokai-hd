@@ -93,10 +93,11 @@ If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\
 | **EDGE SPU geometry library** (0x142900 + 0x14AE80) | ✅ Running — 15 slots dispatched; geometry processor functional |
 | **EDGE MFC DMA pipeline** | ✅ Working — LS→LS GET + PUT to RSX IO region wired end-to-end |
 | **Software rasterizer** | ✅ Working — depth-buffered, flat-shaded with Phong specular |
-| **Animated sphere** | ✅ Rendering — UV sphere (341 triangles) rotating via Y-axis animation |
+| **Animated sphere** | ✅ Rendering — UV sphere (341 triangles) rotating at 30fps via dedicated render thread |
+| **Background cycling** | ✅ Working — cycles through 5 AFS backgrounds every 5 render frames (~1 s intervals) |
 | **Game background textures** | ✅ Loaded — generic `#A3T` decoder; entry 15: 2048×1024 stage background; entries 12+13: 512×512 character art overlays |
 | **SPU FP/conversion opcodes** | ✅ Complete — cuflt/csflt/cfltu/cflts, fesd/frds, rotqbyi, hbrr/hbrp; zero UNIMPL messages |
-| Win32 display window (1280×720 DIB-backed) | ✅ Working — shows background + sphere + overlays; 5-second hold after game exit |
+| Win32 display window (1280×720 DIB-backed) | ✅ Working — animated sphere + cycling backgrounds + overlays; 5-second hold after game exit |
 | UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub |
 | C++ destructor walker, clean process exit | ✅ Working |
 | **Game loop** | 🔲 Not yet — game main is pure init; actual loop is SPURS/SPU-driven |
@@ -107,13 +108,13 @@ If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\
 
 ### What you see when you run it
 
-A 1280×720 window opens and holds for 5 seconds:
+A 1280×720 window opens, animates for roughly 10–15 seconds, then holds for 5 seconds:
 
-- **Background**: a real DBZ Budokai tournament stage (golden temple columns, blue sky) decoded from `LAUNCH/data.afs` entry 15 on the original disc
+- **Background cycling**: 5 AFS intro screens (Bandai, Namco, SCEE, Spike Chunsoft logos + DBZ tournament stage) cycling every ~1 second
 - **Bottom corners**: DBZ character group portrait art (entries 12 and 13, 512×512 de-swizzled BGRA8) alpha-blended as overlays
-- **Centre**: a UV sphere (341 triangles) rotating around the Y-axis, flat-shaded with diffuse + Phong specular, depth-buffered
+- **Centre-right**: a UV sphere (341 triangles) rotating continuously around the Y-axis, flat-shaded with diffuse + Phong specular, depth-buffered, warm orange-gold palette
 
-The sphere represents EDGE geometry output — the same pipeline the game itself uses for character and stage rendering. Each frame goes through: SPURS kernel dispatch → EDGE SPU geometry library → MFC DMA PUT → software rasterizer → Win32 DIB blit.
+The sphere animates at ~30fps from a dedicated render thread that runs independently of the SPURS dispatch cycle. The sphere represents EDGE geometry output — the same pipeline the game itself uses for character and stage rendering.
 
 ![Screenshot of the running application](screenshots/screenshot.png)
 

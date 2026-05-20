@@ -169,25 +169,11 @@ static void mfc_execute(spu_ctx_t *ctx, uint32_t cmd) {
             } else {
                 if (ctx->vm_base && ea32 >= 0x10000 && ea32 + sz < 0x40000000u)
                     memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
-                /* Commit data to RSX IO-mapped region and notify the FIFO parser */
+                /* Commit EDGE geometry output to RSX IO region (render thread reads at 0xD0180000+) */
                 if (ea32 >= 0xD0100000u && ea32 + sz <= 0xD0200000u) {
                     if (ctx->vm_base)
                         memcpy(ctx->vm_base + ea32, ctx->ls + lsa, sz);
-                    rsx_on_edge_write(ea32 + sz, lsa);
-                }
-                /* EDGE diagnostic redirect: PUT to unrecognized PS3 address spaces
-                 * (0x80000000-0x9FFFFFFF = likely RSX local/MMIO or another SPU's LS)
-                 * → redirect to RSX IO command buffer so we can see the output. */
-                if (ea32 >= 0x80000000u && ea32 < 0xA0000000u && ctx->vm_base && sz > 0) {
-                    static uint32_t rsx_diag_ptr = 0xD0101000u; /* past 0x43 PUT area */
-                    if (rsx_diag_ptr + sz <= 0xD0200000u) {
-                        if (ctx->verbose)
-                            fprintf(stderr, "[SPU%d] EDGE-PUT redirect ea=0x%08X → RSX 0x%X\n",
-                                    ctx->id, ea32, rsx_diag_ptr);
-                        memcpy(ctx->vm_base + rsx_diag_ptr, ctx->ls + lsa, sz);
-                        rsx_on_edge_write(rsx_diag_ptr + sz, lsa);
-                        rsx_diag_ptr += sz;
-                    }
+                    /* rsx_on_edge_write not called here — render thread owns the rasterizer */
                 }
             }
             break;

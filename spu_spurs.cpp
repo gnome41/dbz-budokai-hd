@@ -59,6 +59,8 @@ extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src);
 static spu_ctx_t  g_wl_ctx;          /* reused for each workload dispatch */
 static int        g_wl_ctx_valid = 0;/* 1 after successful spu_load_elf */
 
+extern "C" void spurs_render_sphere_tick(void);  /* defined after spurs_run_workload */
+
 static void spurs_run_workload(int slot_idx) {
     /* Only load the ELF on the first dispatch (slot 0).
      * The game has two workload ELFs; start with workload 1 for all slots. */
@@ -259,86 +261,6 @@ static void spurs_run_workload(int slot_idx) {
                     }
                 }
 
-                /* Generate animated sphere into LS[0x134..0x134+16KB).
-                 * Rotates around Y-axis each dispatch cycle (frame counter). */
-                if (slot_idx == 0) {
-                    static uint32_t sphere_frame = 0;
-                    sphere_frame++;
-
-                    auto be_f32_ls = [&](uint32_t off, float v) {
-                        union { float f; uint32_t u; } x; x.f = v;
-                        g_wl_ctx.ls[off+0]=(uint8_t)(x.u>>24); g_wl_ctx.ls[off+1]=(uint8_t)(x.u>>16);
-                        g_wl_ctx.ls[off+2]=(uint8_t)(x.u>> 8); g_wl_ctx.ls[off+3]=(uint8_t)(x.u);
-                    };
-                    const float PI = 3.14159265f, R = 0.72f;
-                    const int NLAT = 14, NLON = 14;
-                    const uint32_t MAX_VERTS = 0x4000 / 16;
-                    uint32_t vcount = 0;
-                    uint32_t vbase = 0x134u;
-
-                    /* Y-axis rotation: ~2 degrees per dispatch cycle */
-                    float angle = sphere_frame * (PI / 90.0f);
-                    float ca = cosf(angle), sa = sinf(angle);
-
-                    auto add_vert = [&](float x, float y, float z) {
-                        if (vcount >= MAX_VERTS) return;
-                        /* Apply Y-axis rotation */
-                        float rx = x*ca - z*sa;
-                        float rz = x*sa + z*ca;
-                        uint32_t off = vbase + vcount * 16;
-                        be_f32_ls(off, rx); be_f32_ls(off+4, y);
-                        be_f32_ls(off+8, rz); be_f32_ls(off+12, 1.0f);
-                        vcount++;
-                    };
-                    for (int i = 0; i < NLAT && vcount + 6 < MAX_VERTS; i++) {
-                        float t0 = PI*i/NLAT, t1 = PI*(i+1)/NLAT;
-                        float st0=sinf(t0),ct0=cosf(t0),st1=sinf(t1),ct1=cosf(t1);
-                        for (int j = 0; j < NLON && vcount + 3 < MAX_VERTS; j++) {
-                            float p0=2*PI*j/NLON, p1=2*PI*(j+1)/NLON;
-                            float cp0=cosf(p0),sp0=sinf(p0),cp1=cosf(p1),sp1=sinf(p1);
-                            float x00=R*st0*cp0,y00=R*ct0,z00=R*st0*sp0;
-                            float x01=R*st0*cp1,y01=R*ct0,z01=R*st0*sp1;
-                            float x10=R*st1*cp0,y10=R*ct1,z10=R*st1*sp0;
-                            float x11=R*st1*cp1,y11=R*ct1,z11=R*st1*sp1;
-                            if (i == 0) {
-                                add_vert(0,R,0); add_vert(x11,y11,z11); add_vert(x10,y10,z10);
-                            } else if (i == NLAT-1) {
-                                add_vert(0,-R,0); add_vert(x00,y00,z00); add_vert(x01,y01,z01);
-                            } else {
-                                add_vert(x00,y00,z00); add_vert(x11,y11,z11); add_vert(x10,y10,z10);
-                                if (vcount + 3 <= MAX_VERTS) {
-                                    add_vert(x00,y00,z00); add_vert(x01,y01,z01); add_vert(x11,y11,z11);
-                                }
-                            }
-                        }
-                    }
-                    if (sphere_frame == 1)
-                        fprintf(stderr, "[WL] slot %d: sphere mesh %u verts (%u tris) animated\n",
-                                slot_idx, vcount, vcount/3);
-                }
-
-                /* Passthrough: copy sphere vertices to EDGE output buffer and
-                 * commit directly to guest RSX memory, then trigger rendering.
-                 * The FP transform ops (op11=0x1E4/1E5/1F8 etc.) are UNIMPL so
-                 * EDGE's own vertex stores leave garbage and the DMA PUT fires
-                 * with size=0.  We bypass this by doing the copy+render here. */
-                if (slot_idx == 0) {
-                    uint32_t verts = 0u;
-                    /* Count non-zero float4 vertices in our sphere buffer */
-                    for (uint32_t i = 0; i < 1024u; i++) {
-                        uint32_t off = 0x134u + i*16u;
-                        if (g_wl_ctx.ls[off+0]||g_wl_ctx.ls[off+1]||
-                            g_wl_ctx.ls[off+2]||g_wl_ctx.ls[off+3]) verts = i+1;
-                    }
-                    if (verts < 3) verts = 3;
-                    /* Copy to both EDGE LS output buf and guest RSX IO region */
-                    memcpy(g_wl_ctx.ls + 0xBC80u, g_wl_ctx.ls + 0x134u, verts*16u);
-                    if (vm_base) {
-                        memcpy(vm_base + 0xD0100000u, g_wl_ctx.ls + 0x134u, verts*16u);
-                        rsx_on_edge_write(0xD0100000u + verts*16u, 0xBC80u);
-                    }
-                }
-
                 /* Redirect to geometry processor entry */
                 g_wl_ctx.gpr[3].u32[0]  = desc_ls;
                 g_wl_ctx.gpr[87].u32[0] = desc_ls;  /* ori r87, r3, 0 at 0x310C */
@@ -372,6 +294,64 @@ static void spurs_run_workload(int slot_idx) {
 /* ---- SPURS kernel thread ------------------------------------------------ */
 static uint32_t g_spurs_entry_pc = 0;  /* saved entry PC for background restarts */
 
+/* Render one animated sphere frame directly to RSX IO memory.
+ * Called from both the SPURS kernel idle path (continuous ~30fps render loop)
+ * and the EDGE stop-0x3FFF passthrough (on-demand EDGE dispatch). */
+extern "C" void spurs_render_sphere_tick(void) {
+    if (!vm_base) return;
+    static uint32_t frame = 0;
+    frame++;
+
+    const float PI = 3.14159265f, R = 0.42f;
+    const int NLAT = 14, NLON = 14;
+    const uint32_t MAX_VERTS = 0x4000u / 16u;
+    const float OX = 0.25f, OY = 0.05f;
+    float angle = frame * (PI / 120.0f);
+    float ca = cosf(angle), sa = sinf(angle);
+
+    uint8_t* buf = vm_base + 0xD0180000u;  /* dedicated render-thread vertex buffer */
+    uint32_t vcount = 0;
+
+    auto be_f = [](uint8_t* p, float v) {
+        union { float f; uint32_t u; } x; x.f = v;
+        p[0]=(uint8_t)(x.u>>24); p[1]=(uint8_t)(x.u>>16);
+        p[2]=(uint8_t)(x.u>>8);  p[3]=(uint8_t)x.u;
+    };
+    auto add_vert = [&](float x, float y, float z) {
+        if (vcount >= MAX_VERTS) return;
+        float rx = x*ca - z*sa + OX;
+        float ry = y + OY;
+        float rz = x*sa + z*ca;
+        uint8_t* p = buf + vcount * 16;
+        be_f(p+0, rx); be_f(p+4, ry); be_f(p+8, rz); be_f(p+12, 1.0f);
+        vcount++;
+    };
+    for (int i = 0; i < NLAT && vcount + 6 < MAX_VERTS; i++) {
+        float t0=PI*i/NLAT, t1=PI*(i+1)/NLAT;
+        float st0=sinf(t0),ct0=cosf(t0),st1=sinf(t1),ct1=cosf(t1);
+        for (int j = 0; j < NLON && vcount + 3 < MAX_VERTS; j++) {
+            float p0=2*PI*j/NLON, p1=2*PI*(j+1)/NLON;
+            float cp0=cosf(p0),sp0=sinf(p0),cp1=cosf(p1),sp1=sinf(p1);
+            float x00=R*st0*cp0,y00=R*ct0,z00=R*st0*sp0;
+            float x01=R*st0*cp1,y01=R*ct0,z01=R*st0*sp1;
+            float x10=R*st1*cp0,y10=R*ct1,z10=R*st1*sp0;
+            float x11=R*st1*cp1,y11=R*ct1,z11=R*st1*sp1;
+            if (i == 0) {
+                add_vert(0,R,0); add_vert(x11,y11,z11); add_vert(x10,y10,z10);
+            } else if (i == NLAT-1) {
+                add_vert(0,-R,0); add_vert(x00,y00,z00); add_vert(x01,y01,z01);
+            } else {
+                add_vert(x00,y00,z00); add_vert(x11,y11,z11); add_vert(x10,y10,z10);
+                if (vcount + 3 <= MAX_VERTS) {
+                    add_vert(x00,y00,z00); add_vert(x01,y01,z01); add_vert(x11,y11,z11);
+                }
+            }
+        }
+    }
+    if (vcount >= 3)
+        rsx_on_edge_write(0xD0180000u + vcount * 16u, 0xBC80u);
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID) {
     /* Continuously dispatch SPURS workloads.  Handles:
      * stop-0 at LS[0x04..0x3C] = dispatch signal → run workload
@@ -390,7 +370,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID) {
                     spurs_run_workload(slot);
                     g_spurs_ctx.running = 1;
                 } else if (pc >= 0x20000u || code == 0x100) {
-                    /* BSS idle or return: restart from entry for next cycle */
+                    /* BSS idle or kernel return: restart from entry. */
                     if (g_spurs_entry_pc) {
                         g_spurs_ctx.pc = g_spurs_entry_pc;
                         g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
@@ -401,14 +381,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID) {
                         memcpy(g_spurs_ctx.ls + 0x40, s, 4);
                     }
                     g_spurs_ctx.running = 1;
-                    /* Throttle: ~60 dispatch cycles per second */
-                    Sleep(1);
                 } else {
                     /* Dispatch path stop or intermediate yield */
                     g_spurs_ctx.running = 1;
                 }
             } else if (code == 0x100) {
-                /* Kernel returned → restart */
+                /* Kernel returned → restart from entry */
                 if (g_spurs_entry_pc) {
                     g_spurs_ctx.pc = g_spurs_entry_pc;
                     g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
