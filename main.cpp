@@ -416,8 +416,11 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     /* setjmp target for sys_process_exit — longjmp(g_process_exit_jmpbuf,1) unwinds here. */
     if (setjmp(g_process_exit_jmpbuf) != 0) {
-        printf("Process exited normally (code=%d). Initialization complete.\n",
+        printf("Process exited normally (code=%d). Holding window...\n",
                g_process_exit_code);
+        Sleep(5000);  /* Hold rendered frame visible before shutdown */
+        g_threads_should_exit = true;
+        thread_runtime_join_all();
         vm_shutdown();
         return 0;
     }

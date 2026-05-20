@@ -527,46 +527,165 @@ static uint32_t g_frame_no = 0;
 static uint8_t* g_bg_pixels = nullptr;
 static int      g_bg_w = 0, g_bg_h = 0;
 
-extern "C" void rsx_load_launch_background(const char* afs_path) {
+/* Overlay textures: entries 12 and 13 (512×512 A8R8G8B8, game logo/title art). */
+static uint8_t* g_overlay1_pixels = nullptr;
+static int      g_overlay1_w = 0, g_overlay1_h = 0;
+static uint8_t* g_overlay2_pixels = nullptr;
+static int      g_overlay2_w = 0, g_overlay2_h = 0;
+
+/* Morton-code helpers for de-swizzling PS3 "SZ" (non-linear) textures.
+ * GCM format bytes WITHOUT bit 0x20 (the LN flag) store pixels in Z-order:
+ * x bits in even positions, y bits in odd positions. */
+static uint32_t morton_spread(uint32_t v) {
+    v = (v | (v << 8)) & 0x00FF00FFu;
+    v = (v | (v << 4)) & 0x0F0F0F0Fu;
+    v = (v | (v << 2)) & 0x33333333u;
+    v = (v | (v << 1)) & 0x55555555u;
+    return v;
+}
+static uint32_t morton2d(uint32_t x, uint32_t y) {
+    return morton_spread(x) | (morton_spread(y) << 1);
+}
+
+/* Generic #A3T entry loader: reads any AFS entry, auto-detects R5G6B5/A8R8G8B8,
+ * handles linear (LN flag 0x20 set) and swizzled (Morton Z-order, LN clear) storage,
+ * and converts to host BGRA8. Returns true on success. */
+static bool load_a3t_entry(const char* afs_path, int entry_idx,
+                            uint8_t** out_pixels, int* out_w, int* out_h) {
     FILE* f = fopen(afs_path, "rb");
-    if (!f) {
-        fprintf(stderr, "[BG] cannot open '%s' (background skipped)\n", afs_path);
-        fflush(stderr);
-        return;
-    }
+    if (!f) return false;
+
     char magic[4]; fread(magic, 1, 4, f);
-    if (magic[0]!='A'||magic[1]!='F'||magic[2]!='S') {
-        fprintf(stderr, "[BG] bad magic in '%s'\n", afs_path);
-        fclose(f); return;
-    }
-    /* Entry 15: AFS directory at offset 8 + 15*8 = 128 bytes. */
-    fseek(f, 8 + 15*8, SEEK_SET);
+    if (magic[0]!='A'||magic[1]!='F'||magic[2]!='S') { fclose(f); return false; }
+
+    fseek(f, 8 + entry_idx * 8, SEEK_SET);
     uint32_t entry_off = 0, entry_sz = 0;
     fread(&entry_off, 4, 1, f);
     fread(&entry_sz,  4, 1, f);
 
-    /* Entry 15 layout: 0xE0-byte #A3T header, then 2048×1024 BGRA8 pixel data. */
-    const uint32_t HDR_SZ = 0xE0u;
-    const int TEX_W = 2048, TEX_H = 1024;
-    if (entry_sz <= HDR_SZ) {
-        fprintf(stderr, "[BG] entry 15 too small (%u)\n", entry_sz);
-        fclose(f); return;
+    fseek(f, (long)entry_off, SEEK_SET);
+    uint8_t hdr[0xE0];
+    if (fread(hdr, 1, 0xE0, f) != 0xE0) { fclose(f); return false; }
+    if (hdr[0]!='#'||hdr[1]!='A'||hdr[2]!='3'||hdr[3]!='T') { fclose(f); return false; }
+
+    /* Scan header for CellGcmTexture struct (format + mipmap + dim=2 + power-of-2 dims). */
+    static const uint8_t VALID_FMT[] = {0x84, 0x85, 0xA4, 0xA5};
+    int gcm_off = -1;
+    uint8_t fmt_byte = 0;
+    int tex_w = 0, tex_h = 0;
+    for (int i = 0x18; i <= 0xC0; i++) {
+        uint8_t fmt = hdr[i];
+        bool ok = false;
+        for (uint8_t v : VALID_FMT) if (fmt == v) { ok = true; break; }
+        if (!ok) continue;
+        if (hdr[i+2] != 0x02) continue;
+        if (hdr[i+1] < 1 || hdr[i+1] > 12) continue;
+        int tw = (hdr[i+8]<<8)|hdr[i+9];
+        int th = (hdr[i+10]<<8)|hdr[i+11];
+        if (tw < 64 || tw > 4096 || (tw & (tw-1)) != 0) continue;
+        if (th < 64 || th > 4096 || (th & (th-1)) != 0) continue;
+        gcm_off = i; fmt_byte = fmt; tex_w = tw; tex_h = th;
+        break;
     }
-    uint32_t pixel_sz = entry_sz - HDR_SZ;
-    uint8_t* pix = new uint8_t[pixel_sz];
-    fseek(f, (long)(entry_off + HDR_SZ), SEEK_SET);
-    size_t got = fread(pix, 1, pixel_sz, f);
+    if (gcm_off < 0) { fclose(f); return false; }
+
+    /* Pixel data always starts 0x68 bytes after the GCM struct. */
+    fseek(f, (long)entry_off + gcm_off + 0x68, SEEK_SET);
+
+    bool linear = (fmt_byte & 0x20u) != 0;   /* LN flag: 0x20 set = linear, clear = swizzled */
+    int n = tex_w * tex_h;
+    uint8_t* out = new uint8_t[n * 4];
+
+    if ((fmt_byte & 0x1Fu) == 0x04) {
+        /* R5G6B5 big-endian → BGRA8 (all R5G6B5 entries observed are linear) */
+        uint8_t* src = new uint8_t[n * 2];
+        fread(src, 2, n, f);
+        for (int y = 0; y < tex_h; y++) {
+            for (int x = 0; x < tex_w; x++) {
+                int si = linear ? (y * tex_w + x) : (int)morton2d(x, y);
+                uint16_t px = ((uint16_t)src[si*2] << 8) | src[si*2+1];
+                int di = y * tex_w + x;
+                int r5 = (px >> 11) & 0x1F;
+                int g6 = (px >> 5) & 0x3F;
+                int b5 = px & 0x1F;
+                out[di*4+0] = (uint8_t)((b5 << 3) | (b5 >> 2));
+                out[di*4+1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+                out[di*4+2] = (uint8_t)((r5 << 3) | (r5 >> 2));
+                out[di*4+3] = 0xFF;
+            }
+        }
+        delete[] src;
+    } else {
+        /* A8R8G8B8 big-endian → BGRA8, with Morton de-swizzle for non-linear format */
+        uint8_t* src = new uint8_t[n * 4];
+        fread(src, 4, n, f);
+        for (int y = 0; y < tex_h; y++) {
+            for (int x = 0; x < tex_w; x++) {
+                int si = linear ? (y * tex_w + x) : (int)morton2d(x, y);
+                int di = y * tex_w + x;
+                out[di*4+0] = src[si*4+3];
+                out[di*4+1] = src[si*4+2];
+                out[di*4+2] = src[si*4+1];
+                out[di*4+3] = src[si*4+0];
+            }
+        }
+        delete[] src;
+    }
     fclose(f);
-    if (got != pixel_sz) {
-        fprintf(stderr, "[BG] short read %zu/%u\n", got, pixel_sz);
-        delete[] pix; return;
+    *out_pixels = out; *out_w = tex_w; *out_h = tex_h;
+    return true;
+}
+
+extern "C" void rsx_load_launch_background(const char* afs_path) {
+    /* Entry 15: 2048×1024 A8R8G8B8 — the DBZ launcher menu panel. */
+    if (load_a3t_entry(afs_path, 15, &g_bg_pixels, &g_bg_w, &g_bg_h)) {
+        fprintf(stderr, "[BG] loaded entry 15 %dx%d BGRA8 from '%s'\n",
+                g_bg_w, g_bg_h, afs_path);
+    } else {
+        fprintf(stderr, "[BG] cannot load entry 15 from '%s' (background skipped)\n", afs_path);
     }
-    delete[] g_bg_pixels;
-    g_bg_pixels = pix;
-    g_bg_w = TEX_W; g_bg_h = TEX_H;
-    fprintf(stderr, "[BG] loaded LAUNCH background %dx%d BGRA8 (%u bytes) from '%s'\n",
-            TEX_W, TEX_H, pixel_sz, afs_path);
+    /* Entries 12 & 13: 512×512 A8R8G8B8 — game title/logo art with alpha. */
+    if (load_a3t_entry(afs_path, 12, &g_overlay1_pixels, &g_overlay1_w, &g_overlay1_h)) {
+        fprintf(stderr, "[BG] loaded entry 12 %dx%d BGRA8 overlay\n",
+                g_overlay1_w, g_overlay1_h);
+    }
+    if (load_a3t_entry(afs_path, 13, &g_overlay2_pixels, &g_overlay2_w, &g_overlay2_h)) {
+        fprintf(stderr, "[BG] loaded entry 13 %dx%d BGRA8 overlay\n",
+                g_overlay2_w, g_overlay2_h);
+    }
     fflush(stderr);
+}
+
+/* Draw src BGRA8 texture into framebuffer with alpha-blending at screen position (ox,oy).
+ * dst_w/dst_h = size to render on screen (nearest-neighbour scaled from src_w×src_h). */
+static void blit_overlay(uint32_t* fb, int fb_w, int fb_h,
+                          const uint8_t* src, int src_w, int src_h,
+                          int ox, int oy, int dst_w, int dst_h) {
+    for (int dy = 0; dy < dst_h; dy++) {
+        int sy = dy * src_h / dst_h;
+        int screen_y = oy + dy;
+        if (screen_y < 0 || screen_y >= fb_h) continue;
+        const uint8_t* srow = src + sy * src_w * 4;
+        uint32_t* drow = fb + screen_y * fb_w;
+        for (int dx = 0; dx < dst_w; dx++) {
+            int sx = dx * src_w / dst_w;
+            int screen_x = ox + dx;
+            if (screen_x < 0 || screen_x >= fb_w) continue;
+            const uint8_t* s = srow + sx * 4;
+            uint8_t sa = s[3];
+            if (sa == 0) continue;
+            if (sa == 255) {
+                drow[screen_x] = 0xFF000000u | ((uint32_t)s[2]<<16) | ((uint32_t)s[1]<<8) | s[0];
+            } else {
+                uint32_t dst = drow[screen_x];
+                uint32_t db = dst & 0xFF, dg = (dst>>8)&0xFF, dr = (dst>>16)&0xFF;
+                uint32_t nb = db + ((s[0]-db)*sa>>8);
+                uint32_t ng = dg + ((s[1]-dg)*sa>>8);
+                uint32_t nr = dr + ((s[2]-dr)*sa>>8);
+                drow[screen_x] = 0xFF000000u | (nr<<16) | (ng<<8) | nb;
+            }
+        }
+    }
 }
 
 static void frame_begin(int W, int H) {
@@ -593,6 +712,14 @@ static void frame_begin(int W, int H) {
         uint32_t bg = 0xFF080810u;
         for (int i = 0; i < n; i++) fb[i] = bg;
     }
+    /* Overlay entries 12 & 13 (512×512 game logo art) in bottom corners, 256×256 display size. */
+    const int OVL_SIZE = 256;
+    if (g_overlay1_pixels && g_overlay1_w > 0)
+        blit_overlay(fb, W, H, g_overlay1_pixels, g_overlay1_w, g_overlay1_h,
+                     0, H - OVL_SIZE, OVL_SIZE, OVL_SIZE);
+    if (g_overlay2_pixels && g_overlay2_w > 0)
+        blit_overlay(fb, W, H, g_overlay2_pixels, g_overlay2_w, g_overlay2_h,
+                     W - OVL_SIZE, H - OVL_SIZE, OVL_SIZE, OVL_SIZE);
     for (int i = 0; i < n; i++) g_z_buf[i] = 2.0f;
 }
 
