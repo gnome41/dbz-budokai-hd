@@ -94,23 +94,24 @@ If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\
 | **EDGE MFC DMA pipeline** | ✅ Working — LS→LS GET + PUT to RSX IO region wired end-to-end |
 | **Software rasterizer** | ✅ Working — depth-buffered, flat-shaded with Phong specular |
 | **Animated sphere** | ✅ Rendering — UV sphere (341 triangles) rotating via Y-axis animation |
-| **Game background textures** | ✅ Loaded — `LAUNCH/data.afs` entry 15: 2048×1024 BGRA8 DBZ UI panel |
-| Win32 display window (1280×720 DIB-backed) | ✅ Working — shows background + sphere during 3-second hold |
+| **Game background textures** | ✅ Loaded — generic `#A3T` decoder; entry 15: 2048×1024 stage background; entries 12+13: 512×512 character art overlays |
+| **SPU FP/conversion opcodes** | ✅ Complete — cuflt/csflt/cfltu/cflts, fesd/frds, rotqbyi, hbrr/hbrp; zero UNIMPL messages |
+| Win32 display window (1280×720 DIB-backed) | ✅ Working — shows background + sphere + overlays; 5-second hold after game exit |
 | UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub |
 | C++ destructor walker, clean process exit | ✅ Working |
 | **Game loop** | 🔲 Not yet — game main is pure init; actual loop is SPURS/SPU-driven |
 | Real game geometry (characters, stages) | 🔲 Next — needs SPURS mailbox signalling + real EDGE task descriptors |
-| DXT5 texture decoder | 🔲 Next — would unlock title screen / character portraits from disc |
-| EDGE FP opcodes (0x1E4/0x1E5/0x1F8 etc.) | 🔲 Needed for correct EDGE vertex transforms (passthrough workaround active) |
+| SPURS mailbox / `cellSpursAddWorkload` HLE | 🔲 Next — key to dispatching real game workloads |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
 
 ### What you see when you run it
 
-A 1280×720 window opens and displays for about 3 seconds:
+A 1280×720 window opens and holds for 5 seconds:
 
-- **Background**: a real DBZ Budokai menu UI panel (purple gradient, decorative Japanese-style corner frames) loaded from `LAUNCH/data.afs` on the original disc
-- **Foreground**: a UV sphere (341 triangles) rotating around the Y-axis, flat-shaded with diffuse + Phong specular in warm gold tones, depth-buffered
+- **Background**: a real DBZ Budokai tournament stage (golden temple columns, blue sky) decoded from `LAUNCH/data.afs` entry 15 on the original disc
+- **Bottom corners**: DBZ character group portrait art (entries 12 and 13, 512×512 de-swizzled BGRA8) alpha-blended as overlays
+- **Centre**: a UV sphere (341 triangles) rotating around the Y-axis, flat-shaded with diffuse + Phong specular, depth-buffered
 
 The sphere represents EDGE geometry output — the same pipeline the game itself uses for character and stage rendering. Each frame goes through: SPURS kernel dispatch → EDGE SPU geometry library → MFC DMA PUT → software rasterizer → Win32 DIB blit.
 
@@ -144,7 +145,14 @@ PPU (main.cpp)
 
 ### Game asset loading (runtime_glue.cpp)
 
-`rsx_load_launch_background()` opens `LAUNCH/data.afs` at startup, seeks to entry 15 (offset/size from the 8-byte directory at position 8 + 15×8 = 128), skips the 0xE0-byte `#A3T` header, and loads 8,388,608 bytes (2048×1024 × 4 bytes/pixel) of BGRA8 pixel data. The 15 other entries in the file are DXT5-compressed textures (title screens, character portraits) — not yet decoded.
+`load_a3t_entry()` is a generic `#A3T` texture decoder: it scans each entry's header for the embedded `CellGcmTexture` struct (located at `gcm_off + 0x68` bytes from the entry start), reads the format byte to determine R5G6B5 (0xA4/0x84) or A8R8G8B8 (0xA5/0x85), and converts to host BGRA8. Textures with bit 5 of the format byte clear (no LN flag) are stored in Z-order (Morton swizzle) and are de-swizzled using a bit-spread interleave before display.
+
+`rsx_load_launch_background()` loads three textures on startup:
+- **Entry 15** (2048×1024, A8R8G8B8-LN): the DBZ Budokai tournament stage — used as fullscreen background
+- **Entry 12** (512×512, A8R8G8B8 swizzled): DBZ character group portrait — displayed as 256×256 overlay in the bottom-left corner
+- **Entry 13** (512×512, A8R8G8B8 swizzled): second character group portrait — displayed in the bottom-right corner
+
+The 16 entries in `LAUNCH/data.afs`: entry 0 is a `nusc` scene config; entries 1–14 are `#A3T` textures in R5G6B5 or A8R8G8B8 (not DXT5 as previously assumed); entry 15 is A8R8G8B8 BGRA8.
 
 ### SPURS/SPU kernel
 
@@ -187,13 +195,11 @@ See `CLAUDE.md` for full diagnostic recipes.
 
 ## What's next
 
-1. **EDGE FP opcodes** — implement `op11=0x1F8` (likely `hbr` branch hint), `0x1E4/0x1E5/0x1E7` (single-precision fma/fnms/fms variants), `0x1EB–0x1EF` (double-precision ops). Currently bypassed by a passthrough that copies sphere vertices directly to the RSX buffer.
+1. **SPURS mailbox signalling** — remove the lnop bypass patches at `LS[0x03BC]`/`[0x03C0]` and implement proper PPU→SPU mailbox: when the kernel hits `stop 0` at `LS[0x298E0]`, restart it from entry `0xD0` with `r79`/`r77` populated with workload availability data. This lets the kernel dispatch real game workloads instead of the synthetic forced-dispatch path.
 
-2. **DXT5 texture decoder** — all 15 entries in `LAUNCH/data.afs` except entry 15 are DXT5-compressed. Decoding them would give access to the title screen (entry 1 at 15 MB) and six character/scene backgrounds (entries 2–7 at 5 MB each).
+2. **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors and signal the kernel via the inbound mailbox. This is the key to dispatching real EDGE tasks with actual character and stage geometry.
 
-3. **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors and signal the kernel via r79/r77 entry arguments. This is the key to dispatching real game EDGE tasks with actual character geometry.
-
-4. **SPURS mailbox signalling** — remove the lnop bypass patches and implement proper PPU→SPU mailbox signalling so the kernel dispatches real workloads from the management area instead of the synthetic forced-dispatch path.
+3. **More game textures** — `LAUNCH/data.afs` has 16 entries: entries 2–7 are 2048×1024 R5G6B5 (likely character-select stage art, ~5 MB each); entries 8–14 are various smaller BGRA8 UI elements. All are decodable with the existing `load_a3t_entry()` — just need to display them.
 
 ---
 

@@ -158,7 +158,7 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 **src_ea must be outside ELF BSS (0x10000–0x10010000):**
 `src_ea = 0x70C000` (SPURS synthetic area). Previously 0xA07000 was corrupting ELF BSS data, causing SDU threads to exit immediately (regression introduced when workload dispatch first fired).
 
-**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 big-endian vertices from 0xD0100000, projects to screen, flat-shades with orange-gold diffuse lighting, writes BGRA8 to framebuffer. Only fires for LS source 0xBC80 (primary vertex output, tag=0). Win32 window holds 3 seconds after game main returns so the rendered image is visible.
+**Software rasterizer** in `rsx_on_edge_write()` (`runtime_glue.cpp`): reads float4 big-endian vertices from 0xD0100000, projects to screen, flat-shades with orange-gold diffuse lighting, writes BGRA8 to framebuffer. Only fires for LS source 0xBC80 (primary vertex output, tag=0). Win32 window holds **5 seconds** after `sys_process_exit` fires (via `setjmp` catch in `main.cpp` — the old `Sleep(3000)` at line 454 was unreachable because `longjmp` bypassed it).
 
 **Current test geometry**: UV sphere (NLAT=14, NLON=14) generated in spu_spurs.cpp stop 0x3FFF handler — 1023 vertices (341 triangles) written to LS[0x134..0x5133] (16 KB). EDGE processes all 16 KB passthrough → PUT to 0xD0100000. Rasterizer draws 341 flat-shaded triangles. Visual: shaded sphere centred at screen mid-point (~640×360 area), warm gold-orange tones.
 
@@ -168,7 +168,14 @@ EDGE geometry processor outputs **raw float4 vertex data** (not NV4097 commands)
 
 **SPURS mailbox mechanism**: The SPURS kernel idles at LS[0x298E0] (stop-0 in BSS) waiting for LV2 to restart it. On real PS3, LV2 detects the stop, checks the workload queue, updates kernel registers, and restarts from entry 0xD0. The kernel does NOT DMA the management area at 0x70A000 in our run — our lnop bypass at LS[0x03C0] forces dispatch without real workload data (r79=0 → sort loop sees no workloads → dispatch via stop-signal chain is hollow). To dispatch real game workloads: remove lnop patch, implement PPU→SPU mailbox signaling (populate `g_spurs_ctx.gpr` with workload data and restart from 0xD0 with r79≠0).
 
-**AFS game data**: LAUNCH/data.afs has 16 entries: entry 0 = `nusc` scene config (camera angles, placement); entries 1-15 = `#A3T` textures. No polygon mesh data in the launcher pack. Game geometry is in DBZ1/data_en.afs (~350MB) and DBZ3/data_cmn.afs (~325MB), only accessible when the game loop loads assets via cellFs.
+**AFS game data**: LAUNCH/data.afs has 16 entries: entry 0 = `nusc` scene config; entries 1-15 = `#A3T` textures. Texture formats (NOT DXT5 as previously assumed):
+- Entry 15: A8R8G8B8-LN (0xA5), 2048×1024, linear — tournament stage background, loaded as main BG
+- Entries 2–7: R5G6B5-LN (0xA4), 2048×1024, linear — character-select stage art
+- Entries 8,9,10,14: A8R8G8B8-LN (0xA5), various sizes — UI elements
+- Entries 12,13: A8R8G8B8 swizzled (0x85), 512×512 — character group portraits, Morton Z-order; loaded as corner overlays
+- Entry 1: A8R8G8B8-LN (0xA5), 2048×1024, extended header at +0x118
+
+`load_a3t_entry()` in `runtime_glue.cpp`: generic decoder — scans for `CellGcmTexture` struct (format byte scan 0x18..0xC0), pixel data at `gcm_off + 0x68`. Swizzled textures (format byte bit 5 clear) de-swizzled with Morton-code bit-spread. No polygon mesh data in this AFS; game geometry is in DBZ1/data_en.afs and DBZ3/data_cmn.afs, only accessible from the game loop via cellFs.
 
 **NID stubs all return 0**: func_00012420's full call tree has no cellSpursAddWorkload or cellEdgeGeomAddJob calls — the game's SPURS workload registration only happens via the SPURS state machine (func_000379BC, states 2→21). Real game EDGE tasks are submitted from the game loop (not the init path we run).
 
@@ -289,16 +296,32 @@ The dispatch path (LS[0x0280]–LS[0x03C0]) executes in three phases:
 | `0x1F630..0x1F64F` | Shift-mask table (0xFFFF, 0x7FFF, ..., 0x0001) |
 | `0x0C41C..0x0C45B` | Sorted dispatch table built by sort loop (64 workload slots) |
 
-### All UNIMPL instructions resolved (SPURS dispatch + EDGE geometry)
+### All UNIMPL instructions resolved (SPURS dispatch + EDGE geometry + FP/conversion)
 | op11 | Instruction | Notes |
 |------|-------------|-------|
 | `0x1D4` | `rotqbii` (RI7, immediate bit count) | SPURS workload init loop |
+| `0x1D6` | `rotqbyi` (RI7, rotate quad left by I7&15 bytes) | EDGE geometry processor |
 | `0x1DD` | `shlqbi` (RR, shift-left quad by RB[2:0] bits) | SPURS dispatch code 0x0560 |
 | `0x1DF` | `shlqbybi` (RR, shift-left quad by (RB>>3)&15 bytes) | SPURS dispatch code 0x0574 |
+| `0x1E0` | `cuflt` (RI7, unsigned int → float, scale 2^-I7) | EDGE vertex pack |
+| `0x1E1` | `csflt` variant (RI7, signed int → float) | EDGE vertex pack |
+| `0x1E2` | `csflt` (RI7, signed int → float, scale 2^-I7) | EDGE vertex pack |
+| `0x1E4` | `cfltu` (RI7, float → unsigned int, scale 2^I7) | EDGE vertex unpack |
+| `0x1E5` | `cflts` (RI7, float → signed int, scale 2^I7) | EDGE vertex unpack |
+| `0x1E7` | `cflts` variant (RI7) | EDGE vertex unpack |
+| `0x1EB` | `fesd` variant (f32 pair → f64, odd elements) | EDGE double-precision |
+| `0x1EC` | `frds` variant (f64 pair → f32, into odd positions) | EDGE double-precision |
+| `0x1ED` | `fesd` (float extend single to double, even elements) | EDGE double-precision |
+| `0x1EE` | `frds` (float round double to single) | EDGE double-precision |
+| `0x1EF` | `dfceq` (double float compare equal) | EDGE double-precision |
+| `0x1F8` | `hbrr` (hint for branch relative — nop) | EDGE branch hint |
+| `0x1F9` | `hbrp` (hint for branch program — nop) | EDGE branch hint |
 | `0x1FD` | `lqx` variant (load quad indexed: `LS[(RA+RB)&~15] → RT`) | EDGE geometry processor — loads task descriptor; key fix for DMA |
 | `0x3F8` | `orx` variant (OR across 4 words of RA into RT.u32[0]) | EDGE geometry processor result accumulation |
 | `0x2AE` | `xswd` (extend sign word to doubleword) | Already implemented |
 | `0x2B6` | `fscrrd` (returns 0 for RT) | Already implemented |
+
+**Zero UNIMPL messages** on full game run (all opcodes hit by SPURS kernel + EDGE geometry processor are now implemented).
 
 ### SPURS kernel dispatch: current verified flow (2980 instructions)
 
