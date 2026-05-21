@@ -97,6 +97,7 @@ extern "C" void rsx_present_frame() {
 #endif /* _WIN32 */
 
 #include "recompiled/ppu_recomp.h"
+#include "../../include/ps3emu/guest_call.h"
 
 extern "C" uint8_t* vm_base;
 
@@ -111,11 +112,45 @@ extern "C" void spurs_verbose_off(void);
 extern "C" void spurs_test_edge_geometry(void);
 extern "C" void rsx_load_launch_background(const char* afs_path);
 extern "C" void spurs_render_sphere_tick(void);
+extern "C" void cellGcmTickVBlank(void);
+extern "C" void cellGcmTickFlip(void);
+extern "C" uint32_t vm_read32(uint64_t addr);
+extern "C" void (*ppu_resolve_addr(uint64_t addr))(ppu_context*);
+extern "C" void (*ppu_resolve_extra(uint64_t addr))(ppu_context*);
 
-/* Dedicated render thread: drives sphere animation at ~30fps independent of SPURS dispatch rate. */
+/* Called by HLE libs (cellGcmSys, cellSysutil) to invoke guest flip/vblank callbacks.
+ * Resolves the guest OPD, sets up a minimal ppu_context, and dispatches synchronously. */
+static void ps3_guest_call_impl(uint32_t opd_addr, uint64_t arg0, uint64_t arg1,
+                                uint64_t arg2, uint64_t arg3) {
+    if (!opd_addr) return;
+    uint32_t code = vm_read32(opd_addr);
+    uint32_t toc  = vm_read32(opd_addr + 4);
+    if (!code) return;
+    auto fn = ppu_resolve_addr((uint64_t)code);
+    if (!fn) fn = ppu_resolve_extra((uint64_t)code);
+    if (!fn) {
+        fprintf(stderr, "[GCALL] unresolved opd=0x%08X code=0x%08X\n", opd_addr, code);
+        fflush(stderr);
+        return;
+    }
+    ppu_context ctx = {};
+    ctx.gpr[1] = 0x00900FF0u;  /* callback stack in unused main-RAM area */
+    ctx.gpr[2] = toc;
+    ctx.gpr[3] = (uint32_t)arg0;
+    ctx.gpr[4] = (uint32_t)arg1;
+    ctx.gpr[5] = (uint32_t)arg2;
+    ctx.gpr[6] = (uint32_t)arg3;
+    ctx.pc     = code;
+    fn(&ctx);
+    /* Flip callbacks typically just post to a semaphore — no trampolines expected. */
+}
+
+/* Dedicated render thread: drives sphere animation at ~30fps + fires GCM flip/vblank callbacks. */
 static DWORD WINAPI render_thread_proc(LPVOID) {
     while (!g_threads_should_exit) {
         spurs_render_sphere_tick();
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
         Sleep(33);
     }
     return 0;
@@ -258,6 +293,7 @@ int main(int argc, char* argv[]) {
     thread_runtime_init();
     if (!vm_init()) return 1;
     printf("Guest memory initialized\n");
+    g_ps3_guest_caller = ps3_guest_call_impl;  /* enable flip/vblank callbacks into guest code */
 
     printf("Loading ELF: %s\n", elf_path);
     if (!elf_load(elf_path)) return 1;

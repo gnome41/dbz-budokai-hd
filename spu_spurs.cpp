@@ -272,7 +272,8 @@ static void spurs_run_workload(int slot_idx) {
                 if (slot_idx == 0 && edge_first_dispatch) {
                     edge_first_dispatch = false;
                     g_wl_ctx.verbose     = 1;   /* log first geometry pass */
-                    g_wl_ctx.trace_limit = 0;
+                    g_wl_ctx.trace_limit = 0;   /* descriptor format traced: run quietly */
+                    g_wl_ctx.trace_count = 0;
                     fprintf(stderr, "[WL] slot %d: EDGE svc 0x3FFF (sched PC=0x%X)"
                             " → geometry proc desc_ls=0x%X src_ea=0x%X out_ea=0x%X\n",
                             slot_idx, cur_pc, desc_ls, src_ea, out_ea);

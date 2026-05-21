@@ -742,9 +742,9 @@ static void frame_begin(int W, int H) {
     }
     uint32_t* fb = rsx_framebuf();
 
-    /* Cycle backgrounds every 5 EDGE frames (matches ~3-5 s at actual dispatch rate). */
+    /* Cycle backgrounds every 120 render frames (~4 s at 30 fps). */
     if (g_bg_count > 1)
-        g_bg_current = (int)((g_frame_no / 5) % (uint32_t)g_bg_count);
+        g_bg_current = (int)((g_frame_no / 120) % (uint32_t)g_bg_count);
 
     const uint8_t* bg = bg_pixels();
     int bw = bg_w(), bh = bg_h();
