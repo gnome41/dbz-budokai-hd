@@ -863,13 +863,16 @@ extern "C" void rsx_dump_edge_output(void) {
     if (dumped) return;
     dumped = true;
 
+    /* Scan up to 1KB for any non-zero word — EDGE may write commands past word 32. */
     const uint32_t BASE = 0xD0100000u;
-    fprintf(stderr, "[EDGE-RSX] first 32 NV4097 words at 0x%08X:\n", BASE);
-    for (int i = 0; i < 32; i++) {
+    fprintf(stderr, "[EDGE-RSX] first non-zero NV4097 words at 0x%08X (1KB scan):\n", BASE);
+    bool any = false;
+    for (int i = 0; i < 256; i++) {
         uint32_t ea = BASE + (uint32_t)(i * 4);
         uint32_t w = ((uint32_t)vm_base[ea]<<24)|((uint32_t)vm_base[ea+1]<<16)
                     |((uint32_t)vm_base[ea+2]<<8)|vm_base[ea+3];
         if (w == 0) continue;
+        any = true;
         uint32_t count  = (w >> 18) & 0x7FFu;
         uint32_t method = w & 0x3FFFFu;
         /* Identify known NV4097 method ranges */
@@ -880,9 +883,10 @@ extern "C" void rsx_dump_edge_output(void) {
         else if (method == 0x1D94) name = " CLEAR_SURFACE";
         else if (method >= 0x1680 && method < 0x16C0) name = " VTX_ARRAY_OFFSET";
         else if (method >= 0x1740 && method < 0x1780) name = " VTX_ARRAY_FORMAT";
-        fprintf(stderr, "[EDGE-RSX]  [%02X]: 0x%08X (count=%u method=0x%04X%s)\n",
+        fprintf(stderr, "[EDGE-RSX]  [%03X]: 0x%08X (count=%u method=0x%04X%s)\n",
                 i*4, w, count, method, name);
     }
+    if (!any) fprintf(stderr, "[EDGE-RSX]  (all zeros — no RSX commands written)\n");
     fflush(stderr);
 }
 

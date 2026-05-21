@@ -250,16 +250,69 @@ static void spurs_run_workload(int slot_idx) {
                 le32(desc_ls+ 8, out_ea);   /* output buffer EA (LE) */
                 be32(desc_ls+12, 0u);
 
-                /* Fill stream descriptor at src_ea with sentinel so the geometry
-                 * processor's AND-check passes (bit 5 at offset 0x63). */
+                /* Fill stream descriptor at src_ea.
+                 * Bytes 0x00-0x3F: cycling sentinel (AND-check passes at bit5 of 0x63).
+                 * Descriptor offset 0x3144 (identified by fingerprint run): vertex data EA
+                 * stored in LE byte order.  Point at 0x70D000 where we pre-generate
+                 * sphere vertices so EDGE has real geometry to transform. */
                 if (vm_base && slot_idx == 0) {
                     uint8_t *p = vm_base + src_ea;
                     memset(p, 0, 0x4000);
-                    p[0x63] = 0x20;  /* count field: bit 5 set → AND check passes */
+                    /* Sentinel fill bytes 0x00-0x3F are required: EDGE uses them as RSX
+                     * command templates.  Without them, EDGE produces no RSX output at all
+                     * even when vertex data is valid.  Keep the sentinel intact. */
                     for (int f = 0; f < 0x40/4; f++) {
                         uint8_t b = (uint8_t)(0x30 + f);
                         p[f*4+0] = b; p[f*4+1] = b; p[f*4+2] = b; p[f*4+3] = b;
                     }
+                    p[0x63] = 0x20;  /* count/AND-check: bit 5 set → EDGE proceeds */
+
+                    /* Vertex data EA at descriptor offset 0x3144 (LE).
+                     * Buffer must be past the 16KB descriptor (0x70C000..0x70FFFF). */
+                    const uint32_t VTXBUF_EA = 0x710000u;
+                    p[0x3144] = (uint8_t)(VTXBUF_EA);
+                    p[0x3145] = (uint8_t)(VTXBUF_EA >> 8);
+                    p[0x3146] = (uint8_t)(VTXBUF_EA >> 16);
+                    p[0x3147] = (uint8_t)(VTXBUF_EA >> 24);
+
+                    /* Generate sphere vertices at VTXBUF_EA: float4 XYZW BE, 16 bytes/vertex.
+                     * Matches the same geometry as spurs_render_sphere_tick so EDGE sees
+                     * real 3D positions to transform and output as RSX commands. */
+                    uint8_t* vbuf = vm_base + VTXBUF_EA;  /* 0x710000: past 16KB descriptor end (0x70FFFF) */
+                    memset(vbuf, 0, 0x4000);
+                    const float PI = 3.14159265f, R = 0.42f;
+                    const int NLAT = 12, NLON = 12;
+                    uint32_t nverts = 0;
+                    auto be_fv = [&](float x, float y, float z) {
+                        if (nverts*16 + 16 > 0x4000) return;
+                        uint8_t* q = vbuf + nverts*16;
+                        auto bef = [](uint8_t* pp, float v) {
+                            union { float f; uint32_t u; } xu; xu.f = v;
+                            pp[0]=(uint8_t)(xu.u>>24); pp[1]=(uint8_t)(xu.u>>16);
+                            pp[2]=(uint8_t)(xu.u>>8);  pp[3]=(uint8_t)xu.u;
+                        };
+                        bef(q+0, x); bef(q+4, y); bef(q+8, z); bef(q+12, 1.0f);
+                        nverts++;
+                    };
+                    for (int i = 0; i < NLAT; i++) {
+                        float t0=PI*i/NLAT, t1=PI*(i+1)/NLAT;
+                        float st0=sinf(t0),ct0=cosf(t0),st1=sinf(t1),ct1=cosf(t1);
+                        for (int j = 0; j < NLON; j++) {
+                            float p0=2*PI*j/NLON, p1=2*PI*(j+1)/NLON;
+                            float cp0=cosf(p0),sp0=sinf(p0),cp1=cosf(p1),sp1=sinf(p1);
+                            float x00=R*st0*cp0,y00=R*ct0,z00=R*st0*sp0;
+                            float x01=R*st0*cp1,y01=R*ct0,z01=R*st0*sp1;
+                            float x10=R*st1*cp0,y10=R*ct1,z10=R*st1*sp0;
+                            float x11=R*st1*cp1,y11=R*ct1,z11=R*st1*sp1;
+                            if (i == 0)        { be_fv(0,R,0); be_fv(x11,y11,z11); be_fv(x10,y10,z10); }
+                            else if (i==NLAT-1){ be_fv(0,-R,0); be_fv(x00,y00,z00); be_fv(x01,y01,z01); }
+                            else { be_fv(x00,y00,z00); be_fv(x11,y11,z11); be_fv(x10,y10,z10);
+                                   be_fv(x00,y00,z00); be_fv(x01,y01,z01); be_fv(x11,y11,z11); }
+                        }
+                    }
+                    fprintf(stderr, "[EDGE] vertex buffer: %u verts at 0x%X, EA at desc+0x3144\n",
+                            nverts, VTXBUF_EA);
+                    fflush(stderr);
                 }
 
                 /* Redirect to geometry processor entry */
