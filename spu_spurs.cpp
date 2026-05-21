@@ -50,8 +50,9 @@ extern "C" volatile bool g_threads_should_exit;
 static spu_ctx_t g_spurs_ctx;
 static int       g_spurs_started = 0;
 
-/* Forward declaration for RSX edge-write callback (runtime_glue.cpp) */
+/* Forward declarations for RSX callbacks (runtime_glue.cpp) */
 extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src);
+extern "C" void rsx_dump_edge_output(void);
 
 /* ---- Game workload runner ------------------------------------------------ */
 /* Loaded lazily on first dispatch.  One shared context reused per slot since
@@ -635,6 +636,10 @@ extern "C" void spurs_start(void) {
 
     /* Disable verbose to avoid log flood during the game's main execution */
     g_spurs_ctx.verbose = 0;
+
+    /* Diagnostic: dump the first NV4097 words EDGE wrote to the RSX command buffer.
+     * Runs once synchronously before the render thread can race on the framebuffer. */
+    rsx_dump_edge_output();
 
     /* If the kernel stopped (blocking rdch — waiting for PPU mailbox), continue
        running it in a background thread so it processes events as they arrive. */

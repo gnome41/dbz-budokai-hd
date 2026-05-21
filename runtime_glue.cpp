@@ -450,14 +450,41 @@ static void rsx_handle(uint32_t method, uint32_t arg) {
             fprintf(stderr, "[RSX] DRAW_ARRAYS arg=0x%08X\n", arg); fflush(stderr);
             break;
 
-        default:
-            /* Log NV4097 vertex array setup methods emitted by the EDGE geometry processor */
-            if ((method & 0xFFFFu) >= 0x1680u && (method & 0xFFFFu) < 0x1800u) {
-                fprintf(stderr, "[RSX] EDGE vertex method 0x%04X arg=0x%08X\n",
-                        method & 0xFFFF, arg);
+        default: {
+            uint32_t m = method & 0xFFFFu;
+            /* NV4097_SET_VERTEX_DATA_ARRAY_OFFSET — one entry per vertex attribute (16 attrs) */
+            if (m >= 0x1680u && m < 0x16C0u) {
+                int attr = (int)((m - 0x1680u) / 4u);
+                fprintf(stderr, "[RSX] VTX_OFFSET attr=%d io_off=0x%08X\n", attr, arg);
+                fflush(stderr);
+            }
+            /* NV4097_SET_VERTEX_DATA_ARRAY_FORMAT — type, elements, stride per attribute */
+            else if (m >= 0x1740u && m < 0x1780u) {
+                int attr = (int)((m - 0x1740u) / 4u);
+                uint32_t type    = (arg >> 28) & 0xFu;
+                uint32_t elems   = (arg >> 24) & 0xFu;
+                uint32_t stride  = (arg >>  8) & 0xFFFFu;
+                uint32_t freq    = arg & 0xFFu;
+                static const char* type_names[] = {
+                    "disabled","s16","f32","s32k","u8","s16n","?6","cmp16",
+                    "?8","u16","?10","?11","?12","?13","?14","?15"
+                };
+                fprintf(stderr, "[RSX] VTX_FORMAT attr=%d type=%s(%u) elems=%u stride=%u freq=%u\n",
+                        attr, type < 16 ? type_names[type] : "?", type, elems, stride, freq);
+                fflush(stderr);
+            }
+            /* SET_BEGIN_END (0x17FC) — primitive topology */
+            else if (m == 0x17FCu) {
+                static const char* prim_names[] = {
+                    "END","POINTS","LINES","LINE_LOOP","LINE_STRIP",
+                    "TRIS","TRI_STRIP","TRI_FAN","QUADS","QUAD_STRIP","POLYGON"
+                };
+                fprintf(stderr, "[RSX] SET_BEGIN_END primitive=%s(%u)\n",
+                        arg <= 10 ? prim_names[arg] : "?", arg);
                 fflush(stderr);
             }
             break;
+        }
     }
 }
 
@@ -523,8 +550,8 @@ static float* g_z_buf    = nullptr;
 static int    g_z_buf_sz = 0;
 static uint32_t g_frame_no = 0;
 
-/* Background textures — up to 8 loaded, cycled on a 4-second timer. */
-static const int    BG_SLOTS = 8;
+/* Background textures — up to 12 loaded, cycled on a timer. */
+static const int    BG_SLOTS = 12;
 static uint8_t*     g_bg_pool[BG_SLOTS] = {};
 static int          g_bg_pool_w[BG_SLOTS] = {};
 static int          g_bg_pool_h[BG_SLOTS] = {};
@@ -650,8 +677,8 @@ static bool load_a3t_entry(const char* afs_path, int entry_idx,
 
 extern "C" void rsx_load_launch_background(const char* afs_path) {
     /* Load background pool: entry 15 (tournament stage), entry 1 (title art),
-     * entries 2-4 (character stage backgrounds). Cycle through them every 4 s. */
-    static const int BG_ENTRIES[] = {15, 1, 2, 3, 4};
+     * entries 2-7 (character/stage art). Cycle through all loaded entries. */
+    static const int BG_ENTRIES[] = {15, 1, 2, 3, 4, 5, 6, 7};
     g_bg_count = 0;
     for (int i = 0; i < (int)(sizeof(BG_ENTRIES)/sizeof(BG_ENTRIES[0])); i++) {
         if (g_bg_count >= BG_SLOTS) break;
@@ -825,6 +852,38 @@ static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count) 
             }
         }
     }
+}
+
+/* One-shot diagnostic: dump the first 32 NV4097 words written to the EDGE
+ * RSX command buffer at 0xD0100000.  Call this after the SPURS burst to see
+ * what method codes the EDGE geometry processor actually emits. */
+extern "C" void rsx_dump_edge_output(void) {
+    if (!vm_base) return;
+    static bool dumped = false;
+    if (dumped) return;
+    dumped = true;
+
+    const uint32_t BASE = 0xD0100000u;
+    fprintf(stderr, "[EDGE-RSX] first 32 NV4097 words at 0x%08X:\n", BASE);
+    for (int i = 0; i < 32; i++) {
+        uint32_t ea = BASE + (uint32_t)(i * 4);
+        uint32_t w = ((uint32_t)vm_base[ea]<<24)|((uint32_t)vm_base[ea+1]<<16)
+                    |((uint32_t)vm_base[ea+2]<<8)|vm_base[ea+3];
+        if (w == 0) continue;
+        uint32_t count  = (w >> 18) & 0x7FFu;
+        uint32_t method = w & 0x3FFFFu;
+        /* Identify known NV4097 method ranges */
+        const char* name = "";
+        if (method == 0x1808) name = " DRAW_ARRAYS";
+        else if (method == 0x17FC) name = " SET_BEGIN_END";
+        else if (method == 0x1820) name = " SET_COLOR_CLEAR_VALUE";
+        else if (method == 0x1D94) name = " CLEAR_SURFACE";
+        else if (method >= 0x1680 && method < 0x16C0) name = " VTX_ARRAY_OFFSET";
+        else if (method >= 0x1740 && method < 0x1780) name = " VTX_ARRAY_FORMAT";
+        fprintf(stderr, "[EDGE-RSX]  [%02X]: 0x%08X (count=%u method=0x%04X%s)\n",
+                i*4, w, count, method, name);
+    }
+    fflush(stderr);
 }
 
 /* Called by the SPU interpreter when EDGE geometry processor MFC_PUTs into the
