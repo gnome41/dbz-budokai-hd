@@ -409,6 +409,18 @@ static uint32_t g_rsx_get_ea    = 0x0u; /* RSX IO GET position = 0 initially */
 static uint32_t g_rsx_clr_color = 0u;          /* last NV4097_SET_COLOR_CLEAR_VALUE */
 static uint32_t g_rsx_surf_ea   = 0u;          /* color surface EA (from SET_SURFACE_COLOR_AOFFSET) */
 
+/* Vertex array state set by EDGE-injected NV4097 commands.
+ * Only attribute 0 (position) is tracked — sufficient for the sphere geometry. */
+static uint32_t g_vtx_io_offset[16] = {};  /* per-attr RSX IO offset from SET_VERTEX_DATA_ARRAY_OFFSET */
+static uint32_t g_vtx_format[16]    = {};  /* per-attr format word from SET_VERTEX_DATA_ARRAY_FORMAT */
+static uint32_t g_draw_vtx_start    = ~0u; /* first vertex index from DRAW_ARRAYS accumulator */
+static uint32_t g_draw_vtx_total    = 0u;  /* total vertex count across all DRAW_ARRAYS args */
+
+/* Forward declarations — defined later in this file. */
+static uint32_t rsx_io_to_ea(uint32_t io_off);
+static void frame_begin(int W, int H);
+static void edge_rasterize_triangles(uint32_t vertex_ea, uint32_t vertex_count);
+
 static inline uint32_t rsx_r32(uint32_t ea) {
     return ((uint32_t)vm_base[ea]<<24)|((uint32_t)vm_base[ea+1]<<16)
           |((uint32_t)vm_base[ea+2]<<8)|vm_base[ea+3];
@@ -421,13 +433,12 @@ static void rsx_handle(uint32_t method, uint32_t arg) {
             break;
 
         case 0x0200: /* NV4097_SET_SURFACE_COLOR_AOFFSET — color buffer A offset in RSX IO */
-            g_rsx_surf_ea = 0xD0000000u + arg;  /* RSX IO base + offset */
+            g_rsx_surf_ea = 0xD0000000u + arg;
             break;
 
         case 0x1D94: { /* NV4097_CLEAR_SURFACE — bits[7:4]=RGBA, bits[1:0]=depth/stencil */
             bool clr_color = (arg & 0xF0u) != 0;
             if (clr_color) {
-                /* Convert RSX RGBA8 → Windows DIB BGRA8 */
                 uint8_t r = (g_rsx_clr_color >> 24) & 0xFF;
                 uint8_t g = (g_rsx_clr_color >> 16) & 0xFF;
                 uint8_t b = (g_rsx_clr_color >>  8) & 0xFF;
@@ -446,41 +457,68 @@ static void rsx_handle(uint32_t method, uint32_t arg) {
             break;
         }
 
-        case 0x1808: /* NV4097_DRAW_ARRAYS — just log for now */
-            fprintf(stderr, "[RSX] DRAW_ARRAYS arg=0x%08X\n", arg); fflush(stderr);
+        case 0x17FC: { /* NV4097_SET_BEGIN_END — open or close a primitive batch */
+            static const char* prim_names[] = {
+                "END","POINTS","LINES","LINE_LOOP","LINE_STRIP",
+                "TRIS","TRI_STRIP","TRI_FAN","QUADS","QUAD_STRIP","POLYGON"
+            };
+            fprintf(stderr, "[RSX] SET_BEGIN_END %s(%u)\n",
+                    arg <= 10 ? prim_names[arg] : "?", arg);
+            fflush(stderr);
+            if (arg != 0u) {
+                /* Begin: reset draw accumulator for this primitive batch */
+                g_draw_vtx_start = ~0u;
+                g_draw_vtx_total = 0u;
+            } else {
+                /* End: render accumulated geometry if we have valid vertex state */
+                if (g_draw_vtx_total >= 3u && g_vtx_io_offset[0] != 0u) {
+                    uint32_t io_off = g_vtx_io_offset[0];
+                    uint32_t vtx_ea = (io_off < 0x1000000u ? 0xD0100000u + io_off : io_off)
+                                    + g_draw_vtx_start * 16u;
+                    fprintf(stderr, "[RSX] DRAW %u verts at EA=0x%08X (io_off=0x%X start=%u)\n",
+                            g_draw_vtx_total, vtx_ea, io_off, g_draw_vtx_start);
+                    fflush(stderr);
+                    frame_begin(rsx_fb_width(), rsx_fb_height());
+                    edge_rasterize_triangles(vtx_ea, g_draw_vtx_total);
+                    rsx_present_frame();
+                }
+                g_draw_vtx_start = ~0u;
+                g_draw_vtx_total = 0u;
+            }
             break;
+        }
+
+        case 0x1808: { /* NV4097_DRAW_ARRAYS — accumulate vertex ranges for current batch */
+            uint32_t first = arg & 0x00FFFFFFu;
+            uint32_t cnt   = ((arg >> 24) & 0xFFu) + 1u;
+            if (g_draw_vtx_start == ~0u) g_draw_vtx_start = first;
+            g_draw_vtx_total += cnt;
+            break;
+        }
 
         default: {
             uint32_t m = method & 0xFFFFu;
-            /* NV4097_SET_VERTEX_DATA_ARRAY_OFFSET — one entry per vertex attribute (16 attrs) */
+            /* NV4097_SET_VERTEX_DATA_ARRAY_OFFSET (16 attrs, 4 bytes each, base 0x1680) */
             if (m >= 0x1680u && m < 0x16C0u) {
                 int attr = (int)((m - 0x1680u) / 4u);
+                g_vtx_io_offset[attr] = arg;
                 fprintf(stderr, "[RSX] VTX_OFFSET attr=%d io_off=0x%08X\n", attr, arg);
                 fflush(stderr);
             }
-            /* NV4097_SET_VERTEX_DATA_ARRAY_FORMAT — type, elements, stride per attribute */
+            /* NV4097_SET_VERTEX_DATA_ARRAY_FORMAT (16 attrs, 4 bytes each, base 0x1740) */
             else if (m >= 0x1740u && m < 0x1780u) {
                 int attr = (int)((m - 0x1740u) / 4u);
-                uint32_t type    = (arg >> 28) & 0xFu;
-                uint32_t elems   = (arg >> 24) & 0xFu;
-                uint32_t stride  = (arg >>  8) & 0xFFFFu;
-                uint32_t freq    = arg & 0xFFu;
+                g_vtx_format[attr] = arg;
+                uint32_t type   = (arg >> 28) & 0xFu;
+                uint32_t elems  = (arg >> 24) & 0xFu;
+                uint32_t stride = (arg >>  8) & 0xFFFFu;
+                uint32_t freq   = arg & 0xFFu;
                 static const char* type_names[] = {
                     "disabled","s16","f32","s32k","u8","s16n","?6","cmp16",
                     "?8","u16","?10","?11","?12","?13","?14","?15"
                 };
                 fprintf(stderr, "[RSX] VTX_FORMAT attr=%d type=%s(%u) elems=%u stride=%u freq=%u\n",
                         attr, type < 16 ? type_names[type] : "?", type, elems, stride, freq);
-                fflush(stderr);
-            }
-            /* SET_BEGIN_END (0x17FC) — primitive topology */
-            else if (m == 0x17FCu) {
-                static const char* prim_names[] = {
-                    "END","POINTS","LINES","LINE_LOOP","LINE_STRIP",
-                    "TRIS","TRI_STRIP","TRI_FAN","QUADS","QUAD_STRIP","POLYGON"
-                };
-                fprintf(stderr, "[RSX] SET_BEGIN_END primitive=%s(%u)\n",
-                        arg <= 10 ? prim_names[arg] : "?", arg);
                 fflush(stderr);
             }
             break;
@@ -890,8 +928,24 @@ extern "C" void rsx_dump_edge_output(void) {
     fflush(stderr);
 }
 
-/* Called by the SPU interpreter when EDGE geometry processor MFC_PUTs into the
- * RSX IO-mapped region.  Only process the primary vertex output (LS src 0xBC80). */
+/* Called after the SPURS EDGE burst completes.  EDGE only copies 4 words from
+ * the stream descriptor template (bytes 0x10-0x1F) to RSX[0x04C-0x05B], giving
+ * VTX_FORMAT + VTX_OFFSET but no draw command.  EDGE also reads LS[0x134] FP
+ * constants rather than DMA-GETting our 0x710000 vertex buffer.
+ *
+ * Bypass: render the pre-generated sphere at 0x710000 directly.
+ * Format: float4 BE XYZW, 16 bytes/vert, 792 verts (NLAT=12, NLON=12). */
+extern "C" void rsx_process_edge(void) {
+    if (!vm_base) return;
+
+    const uint32_t VTXBUF_EA = 0x710000u;
+    const uint32_t VTX_COUNT = 792u;
+
+    frame_begin(rsx_fb_width(), rsx_fb_height());
+    edge_rasterize_triangles(VTXBUF_EA, VTX_COUNT);
+    rsx_present_frame();
+}
+
 extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src) {
     /* Render-thread sphere vertex buffer lives at 0xD0180000 (separate from EDGE's 0xD0100000) */
     if (put_end_ea <= 0xD0180000u || put_end_ea > 0xD0200000u) return;

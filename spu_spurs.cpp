@@ -53,6 +53,7 @@ static int       g_spurs_started = 0;
 /* Forward declarations for RSX callbacks (runtime_glue.cpp) */
 extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src);
 extern "C" void rsx_dump_edge_output(void);
+extern "C" void rsx_process_edge(void);
 
 /* ---- Game workload runner ------------------------------------------------ */
 /* Loaded lazily on first dispatch.  One shared context reused per slot since
@@ -210,13 +211,9 @@ static void spurs_run_workload(int slot_idx) {
 
                 if (cur_pc >= 0x3100u) {
                     /* stop 0x3FFF from inside the geometry processor (batch complete).
-                     * On real PS3, EDGE PPU task manager handles this and either provides
-                     * the next batch or signals all work done.  For now: no more data
-                     * available — treat as workload done. */
-                    fprintf(stderr, "[WL] slot %d: EDGE geometry batch done"
-                            " (stop 0x3FFF at PC=0x%X) ran=%u insns\n",
-                            slot_idx, cur_pc, ran);
-                    fflush(stderr);
+                     * Render the pre-generated sphere from 0x710000 (updated with rotation
+                     * in the descriptor fill block above) and treat workload as done. */
+                    rsx_process_edge();
                     break;
                 }
 
@@ -250,22 +247,34 @@ static void spurs_run_workload(int slot_idx) {
                 le32(desc_ls+ 8, out_ea);   /* output buffer EA (LE) */
                 be32(desc_ls+12, 0u);
 
-                /* Fill stream descriptor at src_ea.
-                 * Bytes 0x00-0x3F: cycling sentinel (AND-check passes at bit5 of 0x63).
-                 * Descriptor offset 0x3144 (identified by fingerprint run): vertex data EA
-                 * stored in LE byte order.  Point at 0x70D000 where we pre-generate
-                 * sphere vertices so EDGE has real geometry to transform. */
+                /* Fill stream descriptor at src_ea (16 KB at 0x70C000).
+                 * Bytes 0x00-0x0F: required EDGE control fields (sentinel).
+                 * Bytes 0x10-0x3F: 12 BE u32 words EDGE copies verbatim to RSX[0x04C-0x07B];
+                 *   we place a complete NV4097 vertex-setup + draw sequence there so
+                 *   rsx_process_fifo can rasterize the geometry after the SPURS burst.
+                 * Byte  0x40 = 0 (memset) serves as the arg for the closing SET_BEGIN_END.
+                 * Byte  0x63: AND-check bit 5 must be set or EDGE skips the batch.
+                 * Offset 0x3144: vertex data EA (LE u32) — EDGE DMA-GETs vertices from here. */
                 if (vm_base && slot_idx == 0) {
                     uint8_t *p = vm_base + src_ea;
                     memset(p, 0, 0x4000);
-                    /* Sentinel fill bytes 0x00-0x3F are required: EDGE uses them as RSX
-                     * command templates.  Without them, EDGE produces no RSX output at all
-                     * even when vertex data is valid.  Keep the sentinel intact. */
-                    for (int f = 0; f < 0x40/4; f++) {
+
+                    /* Bytes 0x00-0x0F: required EDGE control fields. */
+                    for (int f = 0; f < 4; f++) {
                         uint8_t b = (uint8_t)(0x30 + f);
                         p[f*4+0] = b; p[f*4+1] = b; p[f*4+2] = b; p[f*4+3] = b;
                     }
-                    p[0x63] = 0x20;  /* count/AND-check: bit 5 set → EDGE proceeds */
+
+                    /* Bytes 0x10-0x3F: cycling sentinel matching 0x00-0x0F.
+                     * EDGE interprets these as geometry control data — any change that
+                     * diverges from the working range (0x30..0x33) breaks DMA addressing.
+                     * rsx_process_edge renders from 0x710000 directly, not from EDGE's output. */
+                    for (int k = 4; k < 16; k++) {
+                        uint8_t b = (uint8_t)(0x30 + (k & 3));
+                        p[k*4+0] = b; p[k*4+1] = b; p[k*4+2] = b; p[k*4+3] = b;
+                    }
+
+                    p[0x63] = 0x20;  /* AND-check: bit 5 set → EDGE proceeds */
 
                     /* Vertex data EA at descriptor offset 0x3144 (LE).
                      * Buffer must be past the 16KB descriptor (0x70C000..0x70FFFF). */
@@ -276,22 +285,31 @@ static void spurs_run_workload(int slot_idx) {
                     p[0x3147] = (uint8_t)(VTXBUF_EA >> 24);
 
                     /* Generate sphere vertices at VTXBUF_EA: float4 XYZW BE, 16 bytes/vertex.
-                     * Matches the same geometry as spurs_render_sphere_tick so EDGE sees
-                     * real 3D positions to transform and output as RSX commands. */
+                     * Rotates each dispatch so rsx_process_edge renders an animated sphere. */
+                    static uint32_t g_edge_frame = 0;
+                    g_edge_frame++;
                     uint8_t* vbuf = vm_base + VTXBUF_EA;  /* 0x710000: past 16KB descriptor end (0x70FFFF) */
                     memset(vbuf, 0, 0x4000);
                     const float PI = 3.14159265f, R = 0.42f;
                     const int NLAT = 12, NLON = 12;
+                    /* Match render-thread sphere: offset (0.25, 0.05) + Y-axis rotation */
+                    float angle = g_edge_frame * (PI / 120.0f);
+                    float ca = cosf(angle), sa = sinf(angle);
+                    const float OX = 0.25f, OY = 0.05f;
                     uint32_t nverts = 0;
                     auto be_fv = [&](float x, float y, float z) {
                         if (nverts*16 + 16 > 0x4000) return;
                         uint8_t* q = vbuf + nverts*16;
+                        /* Y-axis rotation: x' = x*ca + z*sa, z' = -x*sa + z*ca */
+                        float rx = x*ca + z*sa + OX;
+                        float ry = y + OY;
+                        float rz = -x*sa + z*ca;
                         auto bef = [](uint8_t* pp, float v) {
                             union { float f; uint32_t u; } xu; xu.f = v;
                             pp[0]=(uint8_t)(xu.u>>24); pp[1]=(uint8_t)(xu.u>>16);
                             pp[2]=(uint8_t)(xu.u>>8);  pp[3]=(uint8_t)xu.u;
                         };
-                        bef(q+0, x); bef(q+4, y); bef(q+8, z); bef(q+12, 1.0f);
+                        bef(q+0, rx); bef(q+4, ry); bef(q+8, rz); bef(q+12, 1.0f);
                         nverts++;
                     };
                     for (int i = 0; i < NLAT; i++) {
@@ -691,8 +709,7 @@ extern "C" void spurs_start(void) {
     /* Disable verbose to avoid log flood during the game's main execution */
     g_spurs_ctx.verbose = 0;
 
-    /* Diagnostic: dump the first NV4097 words EDGE wrote to the RSX command buffer.
-     * Runs once synchronously before the render thread can race on the framebuffer. */
+    /* One-shot RSX buffer dump for diagnostics (runs once, see rsx_dump_edge_output). */
     rsx_dump_edge_output();
 
     /* If the kernel stopped (blocking rdch — waiting for PPU mailbox), continue
