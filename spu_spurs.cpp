@@ -276,13 +276,17 @@ static void spurs_run_workload(int slot_idx) {
 
                     p[0x63] = 0x20;  /* AND-check: bit 5 set → EDGE proceeds */
 
-                    /* Vertex data EA at descriptor offset 0x3144 (LE).
-                     * Buffer must be past the 16KB descriptor (0x70C000..0x70FFFF). */
+                    /* Vertex EA table at descriptor offset 0x3140-0x315F (LE u32 entries).
+                     * EDGE iterates through this table issuing one DMA GET per entry.
+                     * Setting all slots to VTXBUF_EA so every GET pulls from our sphere
+                     * buffer instead of NULL (which causes garbage reads from EA=0). */
                     const uint32_t VTXBUF_EA = 0x710000u;
-                    p[0x3144] = (uint8_t)(VTXBUF_EA);
-                    p[0x3145] = (uint8_t)(VTXBUF_EA >> 8);
-                    p[0x3146] = (uint8_t)(VTXBUF_EA >> 16);
-                    p[0x3147] = (uint8_t)(VTXBUF_EA >> 24);
+                    for (int slot = 0x3140; slot < 0x3160; slot += 4) {
+                        p[slot+0] = (uint8_t)(VTXBUF_EA);
+                        p[slot+1] = (uint8_t)(VTXBUF_EA >> 8);
+                        p[slot+2] = (uint8_t)(VTXBUF_EA >> 16);
+                        p[slot+3] = (uint8_t)(VTXBUF_EA >> 24);
+                    }
 
                     /* Generate sphere vertices at VTXBUF_EA: float4 XYZW BE, 16 bytes/vertex.
                      * Rotates each dispatch so rsx_process_edge renders an animated sphere. */
