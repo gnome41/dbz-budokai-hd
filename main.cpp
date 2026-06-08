@@ -7,6 +7,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbghelp.h>
 #endif
 
 /* ---- Win32 display window ------------------------------------------------ */
@@ -286,9 +287,36 @@ static bool elf_load(const char* path) {
     return loaded > 0;
 }
 
+/* Vectored exception handler: on the first AV, capture a live backtrace (before
+ * SEH stack unwind) to identify the recompiled caller of a faulting memcpy/memset. */
+static LONG WINAPI veh_backtrace(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static LONG s_done = 0;
+    if (InterlockedExchange(&s_done, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+    HANDLE hProc = GetCurrentProcess();
+    SymInitialize(hProc, nullptr, TRUE);
+    void* stk[48] = {};
+    USHORT frames = CaptureStackBackTrace(0, 48, stk, nullptr);
+    char buf[sizeof(SYMBOL_INFO) + 256] = {};
+    SYMBOL_INFO* sym = (SYMBOL_INFO*)buf;
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 255;
+    fprintf(stderr, "[VEH] AV backtrace (%u frames):\n", frames);
+    for (USHORT i = 0; i < frames && i < 24; i++) {
+        DWORD64 d = 0;
+        if (SymFromAddr(hProc, (DWORD64)stk[i], &d, sym))
+            fprintf(stderr, "  [%u] %s+0x%llX\n", i, sym->Name, (unsigned long long)d);
+        else
+            fprintf(stderr, "  [%u] %p\n", i, stk[i]);
+    }
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;  /* let the __except handler still run */
+}
+
 int main(int argc, char* argv[]) {
     const char* elf_path = (argc > 1) ? argv[1] : "EBOOT.ELF";
     printf("=== ps3recomp: dbz-budokai-hd ===\n");
+    AddVectoredExceptionHandler(1, veh_backtrace);
 
     thread_runtime_init();
     if (!vm_init()) return 1;
@@ -493,6 +521,23 @@ int main(int argc, char* argv[]) {
                 is_write ? "write" : "read", (void*)fault_host, fault_guest);
         fprintf(stderr, "gpr[1]=0x%08llX gpr[2]=0x%08llX\n",
                 (unsigned long long)ctx.gpr[1], (unsigned long long)ctx.gpr[2]);
+        /* Symbolize the faulting host instruction (RIP) to name the recompiled function. */
+        {
+            HANDLE hProc = GetCurrentProcess();
+            SymInitialize(hProc, nullptr, TRUE);
+            DWORD64 rip = (DWORD64)g_ep->ContextRecord->Rip;
+            char symBuf[sizeof(SYMBOL_INFO) + 256] = {};
+            SYMBOL_INFO* sym = (SYMBOL_INFO*)symBuf;
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            if (SymFromAddr(hProc, rip, &disp, sym))
+                fprintf(stderr, "faulting function: %s+0x%llX (rip=0x%llX)\n",
+                        sym->Name, (unsigned long long)disp, (unsigned long long)rip);
+            else
+                fprintf(stderr, "faulting rip=0x%llX (no symbol)\n", (unsigned long long)rip);
+            fflush(stderr);
+        }
         return 1;
     }
 #else

@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
+#include <dbghelp.h>
 #endif
 
 #include "recompiled/ppu_recomp.h"
@@ -1014,6 +1015,52 @@ void func_000D3020(ppu_context* ctx) {
     ctx->gpr[3] = 0;
 }
 
+/* func_00051204: C++ global-init vtable method (object passed in r4), reached after
+ * the real func_000510E4 bnusCore init runs.  EBOOT.elf @ 0x51204:
+ *   or r3,r4,r4 ; bl 0x4B94C ; blr   = tail-call func_0004B94C(r4). */
+void func_00051204(ppu_context* ctx) {
+    /* bnusCore callback dispatch re-enters itself on object 0x300E88 forever
+     * (func_00051204 → func_0004B94C → func_00064C7C → func_000579E4 → func_00057A3C
+     * → func_00051204 ...).  Objects 0xFBD00/0xFAB68 terminate normally; 0x300E88
+     * does not because a deeper constructor dependency is stubbed.  Re-entrancy
+     * guard: on a recursive call for the SAME object, short-circuit so the cycle
+     * unwinds instead of overflowing the host stack. */
+    static __declspec(thread) uint32_t s_active_obj = 0;
+    uint32_t obj = (uint32_t)ctx->gpr[4];
+    if (obj != 0 && obj == s_active_obj) {
+        ctx->gpr[3] = 0;
+        return;
+    }
+    uint32_t prev = s_active_obj;
+    s_active_obj = obj;
+    ctx->gpr[3] = ctx->gpr[4];
+    func_0004B94C(ctx);
+    DRAIN_TRAMPOLINE(ctx);
+    s_active_obj = prev;
+}
+
+/* bnusCore accessor vtable methods — small getters/setters the lifter missed
+ * (reached only via runtime-populated OPDs).  Decoded from EBOOT.elf.
+ * Stubbed (→0) they cause writes to the 0x10010000 main-RAM ceiling. */
+void func_0005AA3C(ppu_context* ctx) {            /* lwz r3,-0x79C0(r2); blr */
+    ctx->gpr[3] = vm_read32((uint32_t)ctx->gpr[2] - 0x79C0u);
+}
+void func_0005AA4C(ppu_context* ctx) {            /* r9=[toc-0x79BC]; [r9+0x408]=r4; [r9+0x404]=r3 */
+    uint32_t r9 = vm_read32((uint32_t)ctx->gpr[2] - 0x79BCu);
+    vm_write32(r9 + 0x408u, (uint32_t)ctx->gpr[4]);
+    vm_write32(r9 + 0x404u, (uint32_t)ctx->gpr[3]);
+}
+void func_00059FF8(ppu_context* ctx) {            /* [[toc-0x7A04]]=[toc-0x7A00]; r3=[toc-0x79FC] */
+    uint32_t toc = (uint32_t)ctx->gpr[2];
+    vm_write32(vm_read32(toc - 0x7A04u), vm_read32(toc - 0x7A00u));
+    ctx->gpr[3] = vm_read32(toc - 0x79FCu);
+}
+void func_0005A0CC(ppu_context* ctx) {            /* r9=[toc-0x7A04]; [r9+8]=r4; [r9+4]=r3 */
+    uint32_t r9 = vm_read32((uint32_t)ctx->gpr[2] - 0x7A04u);
+    vm_write32(r9 + 0x8u, (uint32_t)ctx->gpr[4]);
+    vm_write32(r9 + 0x4u, (uint32_t)ctx->gpr[3]);
+}
+
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
 static const extra_entry extra_table[] = {
     { 0x00000030ULL, lv2_gate },          /* LV2 syscall gate (bctrl CTR=0x30) */
@@ -1042,6 +1089,11 @@ static const extra_entry extra_table[] = {
     { 0x000EFD18ULL, func_000EFD18 },   /* sdu_yah_size_check thread entry: missing stwu wrapper */
     { 0x000EFACCULL, func_000EFACC },   /* sdu_yah_all_list_delete thread entry: missing stdu wrapper */
     { 0x00057A38ULL, func_00057A3C },    /* OPD entry 4 bytes before func_00057A3C; body includes stwu */
+    { 0x00051204ULL, func_00051204 },    /* C++ global-init vtable method → func_0004B94C */
+    { 0x0005AA3CULL, func_0005AA3C },    /* getter → global [toc-0x79C0] */
+    { 0x0005AA4CULL, func_0005AA4C },    /* setter → [toc-0x79BC]+0x404/0x408 */
+    { 0x00059FF8ULL, func_00059FF8 },    /* getter/setter → [toc-0x7A04]/[toc-0x79FC] */
+    { 0x0005A0CCULL, func_0005A0CC },    /* setter → [toc-0x7A04]+0x4/0x8 */
     { 0x000EFE30ULL, func_000EFE30 },   /* sdu_yah_size_check worker A (spawned by func_000F10FC) */
     { 0x000EFEA4ULL, func_000EFEA4 },   /* sdu_yah_size_check worker B */
     { 0x000EFBE8ULL, func_000EFBE8 },   /* sdu_yah_all_list_delete worker A */
