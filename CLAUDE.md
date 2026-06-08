@@ -105,19 +105,19 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 1. `func_0003B328`: SPURS init + global ctors; state machine advances 2→3→4→6→7→8→9→12→13→14→15→21
 2. Four SDU threads spawn sub-workers, join, exit
 3. `func_0003B244` → `func_000F205C` → game main `func_00012420`:
-   - Loads sysmodules, force-succeeds GCM init, allocates display buffers, returns (pure init, no game loop)
-   - `func_000510E4`: pre-patches OPD at `[TOC[-0x6158]]=0x27BBF8` → (0xD3020, 0x16A0F8), spawns UpdateThread via syscall 44
-4. `func_000D3020` (UpdateThread): 16 ms idle loop on `g_threads_should_exit`
-5. C++ destructor walker fires; program exits cleanly after 5-second window hold
+   - Loads sysmodules, force-succeeds GCM init, allocates display buffers, returns 0 (pure init, no game loop)
+   - `func_000510E4` = the **real bnusCore (audio engine) init** (default ON via `BNUSCORE_REAL_INIT`);
+     runs its 9-call subsystem-init sequence to clean completion (see "Game loop architecture" below)
+4. C++ destructor walker fires; program exits cleanly after 5-second window hold
 
 **Game main is pure init** (`func_00012420`): no game loop. Real rendering is SPURS/SPU-driven. NID stubs return 0; no cellSpursAddWorkload calls in the init path. Real EDGE tasks come from the game loop (unreachable currently).
 
-**Game loop architecture** (event-driven, not reachable yet):
-- No single "game loop" function. The game is entirely event-driven via SPURS callbacks + sys_event_queue
-- Thread 4 "Terminate Thread" (func_00039E24 @ 0x39E20): processes a linked list at [0x28B08C]; exits immediately because BSS=0 (no pending callbacks queued)
-- func_000129B0 (@ 0x129B0): in OPD table but never started in our run; likely a game subsystem initializer
-- func_000510E4: was supposed to connect event port (func_000B8790 → syscall 130 → func_000B89BC → func_000D2F90 chain) so UpdateThread receives VSYNC-driven events. We bypass this and create UpdateThread directly.
-- **Root cause**: without the event port infrastructure + real cellGcm VSYNC, the game has no mechanism to submit rendering work or advance game state.
+**Game loop architecture** (event-driven — STRUCTURAL WALL, confirmed from six angles):
+- The CRT makes exactly ONE main call: `_start → func_000CE578 → func_0003B244 → func_000F205C (import hijack) → func_00012420`, which returns. No loop anywhere; dtors run; process exits.
+- `func_00012420` has NO static `bl` caller, NO data ref, NO `lis+addi` materialization; EBOOT is statically linked (no `.rela.dyn`). It and the menu thread are reached only via runtime-computed OPD dispatch.
+- **bnusCore = the AUDIO middleware** (nuSound2 / CRI ADX). `func_000510E4`'s real init is audio-engine setup, NOT the menu driver. (The old "0xD3020 UpdateThread" and "func_000B8790 → syscall 130" notes were WRONG guesses — discarded.)
+- Real `func_000510E4` reactivation required: a re-entrancy guard in `func_00051204` (breaks an infinite ctor recursion on object 0x300E88), four hand-lifted bnusCore accessors (`func_0005AA3C/0005AA4C/00059FF8/0005A0CC` in `extra_funcs.cpp`), and a `vm_write32` guard discarding the zero-write to `[0x279B08]` (the Terminate Thread `func_00039E24` was nulling the bnusCore root object → `func_0004BA74` path-string strcat overrun).
+- **Root cause of "no menu"**: after init, NO event queue is created (no syscall 125), NO VBlank/Flip handler is registered, NO RSX FIFO command is written, `cellSpursAddWorkload` is never called. The whole event-driven cycle (queues, handlers, menu/render thread) is built in subsystem-init code that is never reached. Thread names defined-but-unspawned: "Initialize Thread"/"Regist Context Thread"/"Unlock Thread" (0xF3200/0xF3214/0xF322C). The "Terminate Thread" we do spawn comes from `func_0003AAC8` (its only thread spawn). Reaching the menu needs a deliberate event-cycle build-out — see `docs/EVENT_CYCLE_PLAN.md` and `memory/project-game-loop-architecture`.
 
 **Rendering** (dedicated thread at ~30fps):
 - `render_thread_proc` in `main.cpp`: calls `spurs_render_sphere_tick()` + Sleep(33); started after background load
@@ -138,10 +138,11 @@ Cross-fragment tail calls set `g_trampoline_fn` (TLS). Always drain with `DRAIN_
 - GCM context at 0x70E000 (TOC[-0x7FA0] = 0x162158)
 
 **Outstanding next steps:**
+- **Event-cycle build-out** (THE blocker for the menu — see `docs/EVENT_CYCLE_PLAN.md`): synthesize a VSYNC/flip event source, stand up the event-queue infrastructure, and get the gated subsystem inits to run so the consumer/menu thread is spawned and the game registers its handlers. This is a coordinated, project-scale effort, not incremental unstubbing.
 - **SPURS mailbox signaling**: lnop at LS[0x03BC] is permanent (r36 always non-zero). For real dispatch: need r79 format that sets r33.high=0 without breaking selb r42 computation. Both lnop patches must stay.
-- **Event port infrastructure** (high impact): implement sys_event_port_connect_local + event queue properly so func_000510E4's real callback chain fires. This would allow the game's VSYNC-driven update loop to run.
-- **cellSpursAddWorkload HLE**: needed to register real game workloads; only callable from the game loop (unreachable without event port).
-- `func_000D3020`: implement real bnusCore audio loop (currently 16 ms sleep stub)
+- **cellSpursAddWorkload HLE**: needed to register real game workloads; only callable from the game loop (unreachable until the event cycle runs).
+
+**Debug tooling added this phase** (all in repo): `vm_write32` OPD-build trace (`g_opd_trace`, default off); a vectored-exception backtrace handler + faulting-RIP symbolizer in `main.cpp`; and ELF-analysis scripts `_disasm_d3020.py` / `_readptr.py` / `_scan.py` / `_scanbl.py` / `_scanconst.py` / `_relas.py` / `_strings.py`.
 
 ### RSX / EDGE rendering infrastructure (`runtime_glue.cpp`)
 - `rsx_process_fifo`: PPU RSX FIFO parser on PUT register writes (guest addr 0x10). Handles NV4097_SET_COLOR_CLEAR_VALUE (0x1820), NV4097_CLEAR_SURFACE (0x1D94), NV4097_DRAW_ARRAYS (0x1808).

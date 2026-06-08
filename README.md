@@ -98,11 +98,10 @@ If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\
 | **Game background textures** | ✅ Loaded — generic `#A3T` decoder; entry 15: 2048×1024 stage background; entries 12+13: 512×512 character art overlays |
 | **SPU FP/conversion opcodes** | ✅ Complete — cuflt/csflt/cfltu/cflts, fesd/frds, rotqbyi, hbrr/hbrp; zero UNIMPL messages |
 | Win32 display window (1280×720 DIB-backed) | ✅ Working — animated sphere + cycling backgrounds + overlays; 5-second hold after game exit |
-| UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub |
+| **Real bnusCore (audio engine) init** | ✅ Working — `func_000510E4` real 9-call init now the default; runs to clean completion (see notes below) |
 | C++ destructor walker, clean process exit | ✅ Working |
-| **Game loop** | 🔲 Not yet — orchestration entry located (real `func_000510E4` bnusCore init → C++ global construction); blocked in an unstubbing cascade, see *What's next* |
-| Real game geometry (characters, stages) | 🔲 Next — needs SPURS mailbox signalling + real EDGE task descriptors |
-| SPURS mailbox / `cellSpursAddWorkload` HLE | 🔲 Next — key to dispatching real game workloads |
+| **Game loop / main menu** | 🔲 Not reached — structurally blocked; the entire event-driven cycle (queues, handlers, menu thread) lives in code never reached after init. See *What's next* |
+| Real game geometry (characters, stages) | 🔲 Blocked on the event cycle — no `cellSpursAddWorkload` is ever called |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
 
@@ -206,23 +205,23 @@ See `CLAUDE.md` for full diagnostic recipes.
 
 ## What's next
 
-### Reaching the game loop / main menu (the orchestration cascade)
+### Reaching the game loop / main menu — the structural wall
 
-Investigation (2026-06) established that the game is **purely event-driven with no PPU game loop**: `func_00012420` ("main") is a bootstrap that loads sysmodules, force-inits GCM, allocates display buffers and **returns 0**. Diagnostics confirm the render layer is entirely dormant after it: **no VBlank/Flip handler is ever registered, zero RSX FIFO commands, zero `cellSpursAddWorkload`**.
+A thorough 2026-06 investigation (confirmed from **six independent angles**: static address scans, CRT decode, ELF relocation check, runtime OPD-build trace, thread-spawner backtrace, and an event-infrastructure check) established the shape of the problem definitively:
 
-The orchestration entry has been **located and validated**:
+- The game is **purely event-driven with no PPU game loop**. `_start → func_000CE578` makes exactly **one** `main` call — `func_00012420`, which loads sysmodules, force-inits GCM, allocates display buffers and **returns 0**. Then C++ destructors run and the process exits. There is no loop anywhere in the CRT.
+- `func_00012420` has **no static `bl` caller, no data reference, and no `lis+addi` materialization** of its address; the EBOOT is **statically linked** (no `.rela.dyn`). It (and the menu thread) are reached only via runtime-computed OPD dispatch.
+- After init: **no event queue is created, no VBlank/Flip handler is registered, no RSX FIFO command is written, and `cellSpursAddWorkload` is never called.** The entire event-driven cycle — queues, handlers, and the menu/render thread — is built inside subsystem-init code that is **never reached**.
 
-1. **Reactivate the real `func_000510E4`** (bnusCore subsystem init). The committed version is a *fabrication* (wrong TOC offsets); the real function at `0x510E4` runs a 9-call init sequence (decoded in `extra`/memory notes). Running it **completes cleanly and unlocks the game's C++ global-object construction** — code never reached before.
+**Progress made:** the real `func_000510E4` (the bnusCore **audio engine** init) is now the default and runs to clean completion — the furthest the game's real initialization has ever executed. Reaching it required a recursion guard, four hand-lifted bnusCore accessors, and a `[0x279B08]` zero-write guard (the Terminate Thread was nulling the bnusCore root object). Full map in `memory/project-game-loop-architecture`.
 
-2. **Resolve the unstubbing cascade.** Global construction dispatches vtable methods via indirect calls `0x57A38` (no-op) + `0x51204` (→ real `func_0004B94C`). `0x51204` must be hand-lifted (`r3=r4; func_0004B94C(ctx)`) or it stubs to 0 and AVs at the main-RAM ceiling `0x10010000`. With that fix, objects `0xFBD00`/`0xFAB68` construct, but object **`0x300E88`** enters an error/retry spin because a deeper constructor dependency is still stubbed. **Each fix reveals the next link** — this is the active work front.
+**Conclusion:** the menu is *not* reachable by incremental unstubbing or a single force-spawn — the blocker is structural. The next phase is a deliberate **event-cycle build-out** (see `docs/EVENT_CYCLE_PLAN.md`): synthesize the VSYNC/flip event source, stand up the event-queue infrastructure, and get the gated subsystem inits to run so the consumer thread is spawned and the game registers its handlers.
 
-### Parallel tracks (independent of the cascade)
+### Parallel tracks (independent of the event cycle)
 
-3. **SPURS mailbox signalling** — remove the lnop bypass patches at `LS[0x03BC]`/`[0x03C0]` and implement proper PPU→SPU mailbox: when the kernel hits `stop 0` at `LS[0x298E0]`, restart it from entry `0xD0` with `r79`/`r77` populated with workload availability data.
-
-4. **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors and signal the kernel via the inbound mailbox. Key to dispatching real EDGE tasks with actual character/stage geometry (has no caller until the cascade above runs).
-
-5. **More game textures** — `LAUNCH/data.afs` has 16 entries: entries 2–7 are 2048×1024 R5G6B5 (likely character-select stage art); entries 8–14 are smaller BGRA8 UI elements. All decodable with the existing `load_a3t_entry()`.
+- **SPURS mailbox signalling** — replace the `lnop` bypass patches at `LS[0x03BC]`/`[0x03C0]` with a real PPU→SPU mailbox so the kernel dispatches real workloads.
+- **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors (no caller until the event cycle runs).
+- **More game textures** — `LAUNCH/data.afs` entries 2–14 are decodable with the existing `load_a3t_entry()`.
 
 ---
 
