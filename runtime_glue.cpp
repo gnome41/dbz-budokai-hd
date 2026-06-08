@@ -993,6 +993,17 @@ extern "C" void vm_write32(uint64_t addr, uint32_t val) {
                 val, (val == 0) ? " → redirected to 0x70B000" : ""); fflush(stderr);
         if (val == 0) val = 0x0070B000u;  /* preserve states 11/13/14 struct chain */
     }
+    /* [0x279B08] is the bnusCore root object pointer, initialized to an allocated
+     * object by func_0003AAC8 (loc_0003ADE8) during _start.  The "Terminate Thread"
+     * (func_00039E24, loc_00039F4C) zeros it during a teardown that runs prematurely
+     * in our truncated lifecycle — which later makes func_0004BA74 dereference
+     * 0+0x25804 (code section) as a path string and overrun.  Discard the zero-write
+     * to keep the object pointer alive (mirrors the 0x27F81C/0x27F814 pattern). */
+    if (a == 0x279B08u && val == 0u) {
+        fprintf(stderr, "[MONITOR] vm_write32(0x279B08)=0 discarded (keeping bnusCore root)\n");
+        fflush(stderr);
+        return;
+    }
     /* RSX PUT register: parse queued commands then mirror to GET so the game
      * never stalls.  rsx_process_fifo() advances g_rsx_get_ea to val. */
     if (a == 0x10u) {
