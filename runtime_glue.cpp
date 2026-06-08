@@ -521,6 +521,19 @@ static void rsx_handle(uint32_t method, uint32_t arg) {
                         attr, type < 16 ? type_names[type] : "?", type, elems, stride, freq);
                 fflush(stderr);
             }
+            else {
+                /* Phase-1 diagnostic: log each unhandled NV4097 method once so we can
+                 * see the universe of commands the game issues without flooding stderr. */
+                static std::unordered_map<uint32_t, uint32_t> s_unhandled;
+                auto it = s_unhandled.find(m);
+                if (it == s_unhandled.end()) {
+                    s_unhandled.emplace(m, 1u);
+                    fprintf(stderr, "[RSX] UNHANDLED method=0x%04X arg=0x%08X\n", m, arg);
+                    fflush(stderr);
+                } else {
+                    it->second++;
+                }
+            }
             break;
         }
     }

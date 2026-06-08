@@ -100,7 +100,7 @@ If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\
 | Win32 display window (1280×720 DIB-backed) | ✅ Working — animated sphere + cycling backgrounds + overlays; 5-second hold after game exit |
 | UpdateThread (bnusCore audio management) | ✅ Running — 16 ms idle stub |
 | C++ destructor walker, clean process exit | ✅ Working |
-| **Game loop** | 🔲 Not yet — game main is pure init; actual loop is SPURS/SPU-driven |
+| **Game loop** | 🔲 Not yet — orchestration entry located (real `func_000510E4` bnusCore init → C++ global construction); blocked in an unstubbing cascade, see *What's next* |
 | Real game geometry (characters, stages) | 🔲 Next — needs SPURS mailbox signalling + real EDGE task descriptors |
 | SPURS mailbox / `cellSpursAddWorkload` HLE | 🔲 Next — key to dispatching real game workloads |
 | Audio (cellAudio) | 🔲 Stubbed |
@@ -206,11 +206,23 @@ See `CLAUDE.md` for full diagnostic recipes.
 
 ## What's next
 
-1. **SPURS mailbox signalling** — remove the lnop bypass patches at `LS[0x03BC]`/`[0x03C0]` and implement proper PPU→SPU mailbox: when the kernel hits `stop 0` at `LS[0x298E0]`, restart it from entry `0xD0` with `r79`/`r77` populated with workload availability data. This lets the kernel dispatch real game workloads instead of the synthetic forced-dispatch path.
+### Reaching the game loop / main menu (the orchestration cascade)
 
-2. **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors and signal the kernel via the inbound mailbox. This is the key to dispatching real EDGE tasks with actual character and stage geometry.
+Investigation (2026-06) established that the game is **purely event-driven with no PPU game loop**: `func_00012420` ("main") is a bootstrap that loads sysmodules, force-inits GCM, allocates display buffers and **returns 0**. Diagnostics confirm the render layer is entirely dormant after it: **no VBlank/Flip handler is ever registered, zero RSX FIFO commands, zero `cellSpursAddWorkload`**.
 
-3. **More game textures** — `LAUNCH/data.afs` has 16 entries: entries 2–7 are 2048×1024 R5G6B5 (likely character-select stage art, ~5 MB each); entries 8–14 are various smaller BGRA8 UI elements. All are decodable with the existing `load_a3t_entry()` — just need to display them.
+The orchestration entry has been **located and validated**:
+
+1. **Reactivate the real `func_000510E4`** (bnusCore subsystem init). The committed version is a *fabrication* (wrong TOC offsets); the real function at `0x510E4` runs a 9-call init sequence (decoded in `extra`/memory notes). Running it **completes cleanly and unlocks the game's C++ global-object construction** — code never reached before.
+
+2. **Resolve the unstubbing cascade.** Global construction dispatches vtable methods via indirect calls `0x57A38` (no-op) + `0x51204` (→ real `func_0004B94C`). `0x51204` must be hand-lifted (`r3=r4; func_0004B94C(ctx)`) or it stubs to 0 and AVs at the main-RAM ceiling `0x10010000`. With that fix, objects `0xFBD00`/`0xFAB68` construct, but object **`0x300E88`** enters an error/retry spin because a deeper constructor dependency is still stubbed. **Each fix reveals the next link** — this is the active work front.
+
+### Parallel tracks (independent of the cascade)
+
+3. **SPURS mailbox signalling** — remove the lnop bypass patches at `LS[0x03BC]`/`[0x03C0]` and implement proper PPU→SPU mailbox: when the kernel hits `stop 0` at `LS[0x298E0]`, restart it from entry `0xD0` with `r79`/`r77` populated with workload availability data.
+
+4. **`cellSpursAddWorkload` HLE** — populate the SPURS management area at `0x70A000` with real workload descriptors and signal the kernel via the inbound mailbox. Key to dispatching real EDGE tasks with actual character/stage geometry (has no caller until the cascade above runs).
+
+5. **More game textures** — `LAUNCH/data.afs` has 16 entries: entries 2–7 are 2048×1024 R5G6B5 (likely character-select stage art); entries 8–14 are smaller BGRA8 UI elements. All decodable with the existing `load_a3t_entry()`.
 
 ---
 
