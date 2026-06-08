@@ -62,6 +62,31 @@ direct path:
 `[ctx+0x48]` (written `[ctx+0x18]`), plus the error-code paths (`0x80310003`/`0x80310006`). Decode
 the full struct before un-stubbing.
 
+### Phase C progress (WIP — gated behind `GCM_REAL_INIT`, default OFF)
+
+The real cellGcmInit now **runs** against our synthetic context and makes real progress:
+
+1. **`func_0004370C` un-force-succeeded** (`#ifndef GCM_REAL_INIT` guard in ppu_recomp.cpp).
+2. **GCM context fix**: set `main.cpp [0x70E000+0x18]=0` (and `+0x1C=0`). With `+0x18` non-zero the
+   real init bailed `0x80310006` ("already initialized"); with 0 it proceeds. (Default build keeps
+   `+0x18=0x200000` for the force-success path — flip to 0 only with `GCM_REAL_INIT`.)
+3. **Memory allocators implemented**: `func_000F1F7C` / `func_000F20FC` were stubs returning 0;
+   now bump-allocate from a committed pool at `0x0A000000` (`sysmem_alloc`). Verified called by the
+   real init: `func_000F20FC(0x110000)=0x0A000000`, `func_000F1F7C(0x1080)=0x0A110000`,
+   `func_000F1F7C(0x1C8)=0x0A112000`.
+
+**Result so far:** the real cellGcmInit does **~150+ real RSX control-register writes** (guest
+`0x0`/`0x8`/`0xFDC`/`0xFF0`, IO-mapping table `0x1B4..0x208`) and completes its first allocations,
+but still returns **`0x80310005`** at a **deeper requirement** — the next blocker is most likely
+`func_000F1EFC` (a `sys_*` mutex/sync-create import, called at func_00043778 +~0xBC/+~0xDC) returning
+error. The init also calls `func_000424E8` (an internal helper) and reads globals `[TOC-0x7F30]`,
+`[TOC-0x7F2C]`, `[TOC-0x7F28]`, `[TOC-0x7F24]`.
+
+**Next steps to keep going:** enable `GCM_REAL_INIT` + `[0x70E000+0x18]=0`, then implement
+`func_000F1EFC` (lwmutex/event create → valid handle) and any further imports `func_00043778` needs,
+iterating until cellGcmInit returns 0. Once it succeeds, trace whether it registers the flip/vblank
+mechanism and sets up the display buffers — then wire the render tick to that real path (Phase B).
+
 ## Phase A (continued) — Map the divergence (instrumentation)
 
 Goal: find the exact function(s) that, on real hardware, would (1) create the event queue, (2)

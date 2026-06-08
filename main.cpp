@@ -459,6 +459,9 @@ int main(int argc, char* argv[]) {
         vm_write32(GCM_CTX + 0x10u, CMD_BUF + CMD_SIZE - 4u); /* end */
         vm_write32(GCM_CTX + 0x18u, 0x200000u);  /* IO size = 2 MB */
         vm_write32(GCM_CTX + 0x1Cu, 1u);         /* flags = 1 (initialized) */
+        /* NOTE: for the GCM_REAL_INIT experiment (ppu_recomp.cpp func_0004370C),
+         * set +0x18 and +0x1C to 0 instead — the real cellGcmInit treats a
+         * non-zero [ctx+0x18] as "already initialized" and bails (0x80310006). */
     }
 
     ppu_context ctx = {};
