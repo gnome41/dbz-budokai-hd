@@ -210,9 +210,6 @@ static void spurs_run_workload(int slot_idx) {
                 uint32_t cur_pc = g_wl_ctx.pc;
 
                 if (cur_pc >= 0x3100u) {
-                    /* stop 0x3FFF from inside the geometry processor (batch complete).
-                     * Render the pre-generated sphere from 0x710000 (updated with rotation
-                     * in the descriptor fill block above) and treat workload as done. */
                     rsx_process_edge();
                     break;
                 }
@@ -276,17 +273,17 @@ static void spurs_run_workload(int slot_idx) {
 
                     p[0x63] = 0x20;  /* AND-check: bit 5 set → EDGE proceeds */
 
-                    /* Vertex EA table at descriptor offset 0x3140-0x315F (LE u32 entries).
-                     * EDGE iterates through this table issuing one DMA GET per entry.
-                     * Setting all slots to VTXBUF_EA so every GET pulls from our sphere
-                     * buffer instead of NULL (which causes garbage reads from EA=0). */
+                    /* Vertex data EA at descriptor offset 0x3144 (LE u32).
+                     * EDGE stream slot 1 (LS[0x13030], stride 0x10000) reads its GET EA
+                     * from bytes[4..7] = descriptor[0x3144..0x3147].  Only slot 1 is
+                     * populated; slots 0 (LS[0x134] FP constants) and 2-3 (null) keep
+                     * their ELF-initialised values so the 2-round termination loop fires.
+                     * Buffer must be past the 16KB descriptor end (0x70FFFF). */
                     const uint32_t VTXBUF_EA = 0x710000u;
-                    for (int slot = 0x3140; slot < 0x3160; slot += 4) {
-                        p[slot+0] = (uint8_t)(VTXBUF_EA);
-                        p[slot+1] = (uint8_t)(VTXBUF_EA >> 8);
-                        p[slot+2] = (uint8_t)(VTXBUF_EA >> 16);
-                        p[slot+3] = (uint8_t)(VTXBUF_EA >> 24);
-                    }
+                    p[0x3144] = (uint8_t)(VTXBUF_EA);
+                    p[0x3145] = (uint8_t)(VTXBUF_EA >> 8);
+                    p[0x3146] = (uint8_t)(VTXBUF_EA >> 16);
+                    p[0x3147] = (uint8_t)(VTXBUF_EA >> 24);
 
                     /* Generate sphere vertices at VTXBUF_EA: float4 XYZW BE, 16 bytes/vertex.
                      * Rotates each dispatch so rsx_process_edge renders an animated sphere. */
@@ -366,6 +363,12 @@ static void spurs_run_workload(int slot_idx) {
     fprintf(stderr, "[WL] slot %d: done ran=%u insns stop=0x%X pc=0x%X\n",
             slot_idx, ran, g_wl_ctx.stop_code, g_wl_ctx.pc);
     fflush(stderr);
+
+    /* Render sphere from 0x710000 once per slot-0 dispatch.
+     * The geometry proc's stop 0x3FFF is not reached within 20×50K insns
+     * (PUT hook causes a round-2+ infinite loop); render unconditionally instead. */
+    if (slot_idx == 0)
+        rsx_process_edge();
 }
 
 /* ---- SPURS kernel thread ------------------------------------------------ */
