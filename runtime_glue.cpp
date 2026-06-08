@@ -977,6 +977,25 @@ extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src) {
 
 extern "C" int g_opd_trace = 0;   /* set to 1 to log dynamically-built OPDs */
 
+/* Reusable host backtrace helper — symbolizes the recompiled call chain.
+ * Used to pinpoint where a stubbed GCM helper (func_000430B0) is invoked. */
+extern "C" void ps3_debug_backtrace(const char* tag) {
+    HANDLE hP = GetCurrentProcess();
+    SymInitialize(hP, nullptr, TRUE);
+    void* stk[24] = {};
+    USHORT fr = CaptureStackBackTrace(0, 24, stk, nullptr);
+    char sbuf[sizeof(SYMBOL_INFO) + 256] = {};
+    SYMBOL_INFO* sy = (SYMBOL_INFO*)sbuf;
+    sy->SizeOfStruct = sizeof(SYMBOL_INFO); sy->MaxNameLen = 255;
+    fprintf(stderr, "[BT %s] (%u frames):\n", tag, fr);
+    for (USHORT i = 0; i < fr && i < 12; i++) {
+        DWORD64 d = 0;
+        if (SymFromAddr(hP, (DWORD64)stk[i], &d, sy))
+            fprintf(stderr, "  [%u] %s+0x%llX\n", i, sy->Name, (unsigned long long)d);
+    }
+    fflush(stderr);
+}
+
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE32] guest addr=0x%08X val=0x%08X\n", a, val); fflush(stderr); }

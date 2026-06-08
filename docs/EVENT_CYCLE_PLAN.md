@@ -87,6 +87,26 @@ error. The init also calls `func_000424E8` (an internal helper) and reads global
 iterating until cellGcmInit returns 0. Once it succeeds, trace whether it registers the flip/vblank
 mechanism and sets up the display buffers — then wire the render tick to that real path (Phase B).
 
+### Phase C progress (update 2): the flip/vblank thread + the current blocker
+
+**Major find:** `func_00043778` (real cellGcmInit) **spawns a thread** via `func_000F1EBC`
+(`sys_ppu_thread_create`) at its `loc_0004396C` path — args: `opd=[TOC-0x7F24]`, `name=[TOC-0x7F20]`,
+`stack=0x8000`. This is almost certainly the **GCM flip/vblank thread = the event source** we need.
+Getting init to reach and pass this spawn is the immediate goal.
+
+**Current blocker (pinpointed via `ps3_debug_backtrace` from `func_000430B0`):** the error fires at
+`func_00043778+0x164D` — **before** the flip-thread create — returning `0x80310005`. The real init
+gets through: size computation (`func_00042CEC/D18/D40`), 3 allocations (`func_000F20FC(0x110000)`,
+`func_000F1F7C(0x1080)`, and `func_000424E8`'s internal `func_000F1F7C(0x1C8)`), buffer init
+(`func_000424E8`→`func_000424EC`), and the lwmutex setup — then a check fails. The most likely cause:
+`func_000F1EFC` (called 2–3× with `r3 = ctx+0x508 / ctx+0x4E0 / ctx+0x30`) is a **stub returning 0
+without initializing the lwmutex struct at `r3`**, so a subsequent handle/state check fails.
+
+**Immediate next task:** implement `func_000F1EFC` as a real `sys_lwmutex_create` — initialize the
+lwmutex struct at `r3` (zero it + valid sentinel/handle) and return 0. Then re-enable `GCM_REAL_INIT`
+and re-run; the error should advance past `+0x164D` toward the `func_000F1EBC` flip-thread create.
+Reusable tool: `ps3_debug_backtrace("tag")` in runtime_glue.cpp names the recompiled call chain.
+
 ## Phase A (continued) — Map the divergence (instrumentation)
 
 Goal: find the exact function(s) that, on real hardware, would (1) create the event queue, (2)
