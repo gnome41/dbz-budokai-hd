@@ -31,7 +31,38 @@ So this is not an incremental-unstub problem. It needs a coordinated build-out o
   draw commands or EDGE workloads, there is a path to the screen.
 - Real bnusCore (audio) init runs to completion (`BNUSCORE_REAL_INIT`).
 
-## Phase A — Map the divergence (instrumentation)
+## Phase A — FINDING: the root divergence is the stubbed GCM/RSX context
+
+(2026-06) Located the root cause of the dormant event cycle:
+
+- The game does **not** use the cellGcmSys HLE imports at all (zero `[cellGcmSys]` HLE calls in a
+  full run). It drives GCM through its **own internal wrappers** — `func_0004370C` (cellGcmInit),
+  `func_00040C0C` (GetContextSize), `func_00040BD4` (GetMemorySize) — which we **force-succeed with
+  early returns**.
+- The real `func_0004370C → func_00043778` reads the RSX/GCM context pointer at `[TOC-0x7FA0]`
+  (= guest `0x162158`, our synthetic context `0x70E000`) and dereferences its fields
+  (`[ctx+0x18]`, `[ctx+0x1C]`, `[ctx+0x48]`, etc.). Because `0x70E000` is a **stub without the real
+  fields**, the real init fails/crashes — hence the force-success.
+- **Consequence:** force-succeeding GCM init skips the game's entire real display setup — creating
+  display buffers, the flip queue, and registering the **vblank/flip mechanism that is the source of
+  the event cycle**. So there are no events to deliver and no handler to receive them. The cycle is
+  dead at its source.
+
+**Revised priority:** the event-cycle build-out is really a **GCM-completion** task. The most
+direct path:
+1. Build a functional-enough GCM context object at `0x70E000` (decode the field layout the real
+   `func_0004370C`/`func_00043778`/`func_00040C0C`/`func_00040BD4` read and write).
+2. Un-force-succeed those wrappers (one at a time) and let the real GCM init run.
+3. Trace what it sets up — display buffers, flip queue, and crucially the vblank/flip registration —
+   then wire our 30fps render tick to drive that real flip/vblank path (Phase B).
+4. With real vblank events flowing, the game's consumer/menu thread should be spawned and its
+   handlers fire (Phase C/D).
+
+`func_00043778` field reads to satisfy: `[ctx+0x18]` (checked != 0), `[ctx+0x1C]` (written 0),
+`[ctx+0x48]` (written `[ctx+0x18]`), plus the error-code paths (`0x80310003`/`0x80310006`). Decode
+the full struct before un-stubbing.
+
+## Phase A (continued) — Map the divergence (instrumentation)
 
 Goal: find the exact function(s) that, on real hardware, would (1) create the event queue, (2)
 register the VBlank/flip handler, and (3) spawn the menu/consumer thread — and find why our run
