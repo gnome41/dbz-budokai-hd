@@ -975,9 +975,26 @@ extern "C" void rsx_on_edge_write(uint32_t put_end_ea, uint32_t ls_src) {
     rsx_present_frame();
 }
 
+extern "C" int g_opd_trace = 0;   /* set to 1 to log dynamically-built OPDs */
+
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE32] guest addr=0x%08X val=0x%08X\n", a, val); fflush(stderr); }
+    /* OPD-build trace: an OPD is {code_ptr, toc}.  When the standard module TOC
+       (0x0016A0F8) is written, the preceding word [a-4] is a code entry being
+       registered.  Logs each unique (opd,code) once — reveals thread/callback
+       entry points the game builds at runtime, even if it never spawns them. */
+    if (g_opd_trace && val == 0x0016A0F8u && a >= 0x10004u) {
+        uint32_t code = ((uint32_t)vm_base[a-4]<<24)|((uint32_t)vm_base[a-3]<<16)
+                       |((uint32_t)vm_base[a-2]<<8)|vm_base[a-1];
+        if (code >= 0x10000u && code < 0x155000u) {
+            static std::unordered_map<uint32_t,uint32_t> s_seen;
+            if (s_seen.emplace(a-4, code).second) {
+                fprintf(stderr, "[OPD-BUILD] opd=0x%08X code=0x%08X\n", a-4, code);
+                fflush(stderr);
+            }
+        }
+    }
     /* The SPURS init code (func_000CE77C) zeros [0x27F81C] (workload list head)
        as part of its own initialization.  Since we have no real SPU runtime,
        we intercept that zero-write and keep our synthetic dispatch chain in place.
