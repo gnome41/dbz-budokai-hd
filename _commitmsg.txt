@@ -1,22 +1,21 @@
-Fix systematic float-compare NaN handling (fcmp/fcmpu) - 1435 sites
+Fix stfd-as-stfs mislift in number formatter (func_000E2594) - clears dtoa hang
 
-The lifter emitted every floating compare as
-  cr_val = (a < b) ? 8 : (a > b) ? 4 : 2
-i.e. FL(<)=8, FG(>)=4, else FE(=)=2. For a NaN operand a<b and a>b are both
-false, so it fell through to 2 (EQUAL) - but PPC fcmpu/fcmpo set FU (unordered)
-= 1 for NaN, not equal. Result: every NaN-detection branch in the game was
-defeated (a value compared with itself is unordered iff NaN; the game uses this
-idiom after sqrt/div to call its NaN handlers).
+func_000E2594 (the float-format entry, body behind off-by-4 func_000E2590)
+stored its value to the [sp+0xD0] slot with a 32-bit float store (stfs) but that
+slot is an 8-byte double: the classifier func_000E1934 reads it as a double
+(halfwords +0/+2/+4/+6, checks exp==0x7FF0) and func_000E25F0 reads it via
+vm_read64. Big-endian, the truncated float landed in the double's high half with
+a zero low half, turning an Inf/NaN (e.g. from a div-by-zero in the geometry
+func_00068998) into a FINITE ~1.4e306/2.2e307 whose double exponent is not
+0x7FF0 - so the classifier missed it and routed to the dtoa func_000E2A3C, which
+then tried to print ~300 digits one-at-a-time (~10^16 iters = effective hang).
 
-Fix via _apply_fcmp.py: the trailing `: 2;` becomes `: (a == b) ? 2 : 1;` so NaN
-yields FU=1. Non-NaN values are unchanged (a==b is true in the else); integer
-compares use `int64_t a` and are not matched. Baseline-safe: 221102 lines, all
-threads finished (the NaN path is not exercised by the default build).
+Fix: store the full double (stfd). The classifier now detects Inf/NaN and routes
+to the inf/nan handler, so the formatter no longer hangs. With this plus the
+fcmp NaN fix (d85bb7b), GAMEWORLD_REAL_INIT advances past the formatter to the
+next blocker (AV at guest 0xBFFFF380 in C++ unwind with a sign-extended SP
+gpr[1]=0xFFFFFFFFDFFFF730 - likely an SP-sign-extension mislift, next target).
 
-Found while tracing the GAMEWORLD dtoa hang: func_00068998 does `fcmpu f0,f0`
-after a sqrt to detect NaN and call func_000E14E4; the buggy compare reported
-"equal" so the handler was skipped. (This particular hang has a second, separate
-cause - a float-store/double-read mismatch in the number formatter defeating its
-Inf/NaN classifier - still open.)
+Baseline-safe: 221102 lines, all threads finished (2 runs).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
