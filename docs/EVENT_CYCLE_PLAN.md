@@ -255,3 +255,31 @@ Note: every function in this subsystem uses the off-by-4 (`func-4`) OPD/bl entry
 dropped the `stdu` — when `GAMEWORLD_REAL_INIT` is on, expect to add missing-`stdu` wrappers for
 the thread-manager methods too (0x317E8/0x3184C/0x318A0/0x316D4/0x31544, etc.), mirroring the
 sdu-worker wrappers (`func_000EFD18`).
+
+## Phase A bring-up start — the systemic off-by-4 dropped-stdu bug (687 functions)
+
+Working through the game-world bring-up surfaced the root mechanism behind the whole
+"OPD dispatch hits a stub" family. `_scan_offby4.py` finds **687** functions where the lifter
+dropped the leading `stdu/stwu r1,d(r1)` prologue: the OPD/bl points to `func-4`, lifted as a
+one-line `{gpr[3]=0}` stub, with the real body at `func`. Every OPD/virtual/function-pointer/
+direct-bl dispatch therefore hits the stub and returns 0 instead of running the function. This is
+why individual cases were hand-wrapped before (func_000F205C for game main, func_000EFD18 for the
+sdu workers). `_fix_offby4.py` converts all of them (minus game-main 0x1241C) to gated
+missing-stdu wrappers (`#ifdef GAMEWORLD_REAL_INIT`: do the dropped stdu + call func+4; `#else`:
+original stub) so the default baseline is byte-identical.
+
+Progress with `GAMEWORLD_REAL_INIT` ON:
+1. func_00024DE0 wrapper runs the real game-world init func_00024DE4 and forces r3=1 (func_00024DE4
+   still returns 0 = incomplete, but returning 0 made func_0003AAC8 early-exit and skip the bnusCore
+   root init). With r3 forced to 1, [0x279B08] now initialises and the path-string strcat-overrun
+   AV at 0x10010000 is cleared; new threads spawn (cri_dlg x2).
+2. Next AV: garbage read 0x87068D9C in func_0001BAE0 (bnusCore), reached from func_0003AAC8
+   @loc_0003ADE8 via the now-unstubbed func_0001BADC.
+
+**Key learning:** enabling the blanket un-stub wholesale is too broad for the current partial
+emulation — it runs functions in unrelated subsystems (bnusCore) that AV on un-set-up state, and
+func_00024DE4 still doesn't truly succeed. The next step is to **scope** the un-stub to the
+game-world/thread-manager subtree only (func_00024DE4's call-tree + the thread-manager methods
+0x317E8/0x3184C/0x318A0/0x316D4/0x31544), excluding bnusCore, OR to make func_00024DE4 genuinely
+succeed. Tooling + gated fix are committed (default OFF); baseline verified clean (221k lines,
+all game threads finished, no AV).
