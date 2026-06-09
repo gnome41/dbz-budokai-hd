@@ -1078,8 +1078,34 @@ void func_0005A0CC(ppu_context* ctx) {            /* r9=[toc-0x7A04]; [r9+8]=r4;
     vm_write32(r9 + 0x4u, (uint32_t)ctx->gpr[3]);
 }
 
+/* Three indirect-call targets the game-world init (func_00024DE4 path) reaches but our
+ * tables didn't have, so ps3_indirect_call stubbed them to gpr[3]=0.  With the 64-bit add
+ * fix the init runs deep enough to use them; returning 0 made it throw "exception: unknown"
+ * (the C++ terminate handler func_000E8844). Decoded from EBOOT.elf and hand-lifted. */
+void func_000EDCDC(ppu_context* ctx) { ctx->gpr[3] = 1; }  /* `li r3,1; blr` — returns 1 */
+
+/* std::string-style data-pointer accessor (small-buffer optimisation):
+ *   cap=[r3+0x1C]; if (cap < 0x10) return r3+8 (inline) else return [r3+0x8] (heap). */
+void func_000EB214(ppu_context* ctx) {
+    uint32_t obj = (uint32_t)ctx->gpr[3];
+    uint32_t cap = vm_read32(obj + 0x1Cu);
+    ctx->gpr[4] = cap;
+    ctx->gpr[3] = (cap < 0x10u) ? (obj + 8u) : vm_read32(obj + 0x8u);
+}
+
+/* OPD/bl entry 4 bytes before func_000EB2E4 — lifter dropped `stdu r1,-0x70(r1)`
+ * (0xF821FF91 @0xEB2E0; 0xEB2E4=mflr). Missing-stdu wrapper. */
+void func_000EB2E0(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0x70, ctx->gpr[1]); ctx->gpr[1] -= 0x70;
+    func_000EB2E4(ctx);
+    DRAIN_TRAMPOLINE(ctx);
+}
+
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
 static const extra_entry extra_table[] = {
+    { 0x000EDCDCULL, func_000EDCDC },   /* li r3,1; blr — returns 1 (was stubbed to 0) */
+    { 0x000EB214ULL, func_000EB214 },   /* std::string c_str accessor (was null) */
+    { 0x000EB2E0ULL, func_000EB2E0 },   /* off-by-4: stdu -0x70 -> func_000EB2E4 */
     { 0x00000030ULL, lv2_gate },          /* LV2 syscall gate (bctrl CTR=0x30) */
     { 0x000EFEC0ULL, func_000EFEC0 },   /* vtable cleanup callback (Terminate Thread) */
     { 0x000EB354ULL, func_000EB354 },   /* vtable cleanup callback (Terminate Thread) */
