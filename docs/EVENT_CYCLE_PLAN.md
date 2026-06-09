@@ -337,3 +337,99 @@ spin to real game code. Next blockers (the deep game-world bring-up, now on a co
 symbolize the abort caller; resolve the off-by-4 ICALLs (0xEB2E0->func_000EB2E4 etc.); relocate
 slab bump pools off the 0x700000-0x70F000 SPURS area if it proves to matter. The full clean
 re-lift remains scheduled as follow-up (also brings load-with-update + prologue fixes natively).
+
+---
+
+# PHASE 1 (NEXT, concrete) — Establish a correct execution base for the game-world init
+
+## Why this is the real first phase (re-framed by the 2026-06-09 lvlx session)
+
+The M1–M4 event-cycle scaffolding above assumes the game-world init *computes correct values* and
+only lacks an event source. The 2026-06-09 drilling showed that assumption is **not yet true**: with
+`GAMEWORLD_REAL_INIT` on, the init advances through real menu-tree construction (3+ nodes built) but
+then a geometry/math routine (`func_00068998`: int→float scale, `sqrt`, sin/cos) produces a **garbage
+double `1.404447762e+306`**, which the shared float formatter (`func_000E2594`→`func_000E25F0`→
+`func_000E2A3C`) then tries to print digit-by-digit for ~10^16 iterations (effective hang). Guarding
+that (clamp |v|≥1e16→0, baseline-safe, 0 baseline hits) drilled one step further and hit an **AV writing
+unmapped guest `0xBFFFF380`** inside C++ unwind (`_NLG_Return2`), with a **sign-extended stack pointer
+`gpr[1]=0xFFFFFFFFDFFFF730`** (= `(int64_t)(int32_t)0xDFFFF730`).
+
+This session alone added FIVE surgical lifter fixes (subfc 657, stfiwx 422, lvlx 341, lvrx 17, off-by-4
+×3) and **each advanced the bring-up a concrete step**. That pattern, plus the two new blockers both
+having the *signature of lifter bugs* (garbage float, sign-extended SP) rather than uninitialised RAM,
+makes the central question:
+
+> **Is the GAMEWORLD garbage caused by remaining lifter-correctness bugs, or by genuinely
+> out-of-order init reading uninitialised memory?**
+
+The answer decides everything: if lifter, keep fixing the base (cheap, baseline-verifiable, the menu
+becomes reachable WITHOUT heavy event scaffolding); if init-order, build Phases B–D. **Phase 1 is to
+answer that question and act on it.** Do NOT build event scaffolding until the base computes correct
+values — it would be scaffolding on garbage.
+
+## Step 1 — Decide the garbage source (one focused experiment, ~½ day)
+
+1a. **Trace the garbage double to birth.** The value enters the formatter at `func_000E2594(fpr[1])`.
+   Walk UP one frame at a time (its caller computes `fpr[1]`); at each frame log the fpr inputs +
+   the TOC-constant loads (`vm_read64(gpr[2]-0x5Cxx)` are double constants). Stop at the first frame
+   where the value is already absurd vs the frame's *inputs* — that frame contains the bug.
+   Tool: `ps3_debug_backtrace` + a throttled fprintf probe (reverted-clean pattern from this session).
+
+1b. **Check for load-with-update bugs (prime suspect).** Upstream sp00nznet/ps3recomp fixed
+   "load-with-update: base never advances". Grep the recomp for `lfdu`/`lfsu`/`lwzu`/`ldu`/`lhau`
+   emission and verify each writes back the updated base register. A broken `lfdu` in the geometry
+   loop would read constants from the wrong offset → garbage. This is the single most likely cause.
+
+1c. **Get the exact bit pattern of `1.404447762e+306`** (printf `%a` / hex of the u64). Recognisable
+   patterns tell the story: two packed 32-bit floats = a double-vs-float misread; a low-32 guest
+   pointer = type confusion; `0xCCCC…`/`0xBAAD…` = uninitialised. (`0x7F8…` finite-large = a real
+   computation gone wrong → almost certainly 1b.)
+
+**Exit criterion for Step 1:** a one-line verdict — "garbage = lifter bug X" or "garbage =
+uninitialised field Y that init-order-Z should have set."
+
+## Step 2 — Inventory the remaining lifter gaps (parallel, ~½ day)
+
+2a. **`vmx_x265`** (19 sites, lines ~16k/47k) — last remaining `/* TODO */` instruction class.
+   Identify (VMX xo=265) and implement, mirroring the lvlx/subfc transform-script workflow
+   (`_apply_*.py`), verifying baseline stays 221102 after each.
+
+2b. **Audit SP sign-extension.** Stack lives at `0xD0000000–0xE0000000` — every stack address has the
+   high bit set, so any `gpr[1] = (int64_t)(int32_t)(…)` on a stack-pointer update yields
+   `0xFFFFFFFF_Dxxxxxxx`. Reads/writes survive (they truncate to `uint32_t`), but any *full-64-bit*
+   use of SP (address arithmetic that keeps the high word, or a compare) breaks — a candidate for the
+   `0xBFFFF380` AV. Grep SP-update sites; confirm whether the AV's faulting address derives from a
+   sign-extended SP. If so, this is a universal fix (drop the sign-extension on SP, or mask to 32-bit).
+
+2c. **Diff against upstream lifter.** List sp00nznet/ps3recomp lifter commits since our base
+   (add/subf, prologue/off-by-4, load-with-update are known); confirm each is applied surgically or
+   pending. Produce the definitive "remaining lifter fixes" checklist.
+
+## Step 3 — Choose the base strategy and execute (decision)
+
+- **Option A — keep surgical (proven this session).** Apply each remaining lifter fix in-place via
+  a `_apply_*.py` transform, baseline-verify 221102 after each, re-run GAMEWORLD to confirm the
+  bring-up advances. Pro: incremental, low-risk, every step is a checkpoint. Con: manual, finite list.
+- **Option B — finish the re-lift migration** (`relift-migration` branch; builds/links/runs today).
+  Brings ALL upstream lifter fixes natively at once. Pro: durable, future-proof. Con: needs the
+  layered-divergence debugging that stalled it (func_00032CA8 AV from corrected lifting changing
+  global state).
+- **Recommendation:** **Option A now, Option B as the endpoint.** Drive Option A until GAMEWORLD's
+  init reaches either (i) a clean return, or (ii) a blocker that is provably *not* a lifter bug
+  (Step 1's "uninitialised field" verdict). Only THEN does the init-order / event-cycle work
+  (Phases B–D above) become the correct next investment.
+
+## Phase 1 exit / definition of done
+
+- **P1-DONE-a:** verdict in hand — the `1.4e306` garbage and the `0xBFFFF380` AV are each classified
+  (lifter bug → fixed surgically + baseline-verified; or init-order → documented with the exact
+  uninitialised field and which skipped init sets it).
+- **P1-DONE-b:** with the classified fixes applied, `GAMEWORLD_REAL_INIT` advances **past** both the
+  dtoa point and the `0xBFFFF380` AV to a new, deeper blocker — OR reaches a clean game-world-init
+  return (which would unblock the orchestration-thread spawn that Phase A identified, i.e.
+  "Initialize/Regist Context/Unlock Thread").
+- **P1-DONE-c:** baseline still 221102, all probes reverted/gated, fixes committed under gnome41.
+
+Only after P1 do we know whether the menu needs (a) just a correct base + the already-found gate
+(`func_00024DE0`→`func_00024DE4`), or (b) the full event-source scaffolding (Phases B–D). P1 is the
+cheap, decisive bet that prevents building event infrastructure on a miscompiled base.
