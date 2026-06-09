@@ -184,3 +184,38 @@ Once a handler fires on VSYNC (or the consumer thread wakes on a queued event):
 - ELF tools (repo root): `_disasm_d3020.py`, `_readptr.py`, `_scan.py`, `_scanbl.py`,
   `_scanconst.py`, `_relas.py`, `_strings.py`. OPD-build trace: `g_opd_trace` in `runtime_glue.cpp`.
 - Full investigation log: `memory/project-game-loop-architecture`.
+
+## Phase C update — `func_00043778` is the nuSound2 audio init, NOT cellGcmInit (dead-end for the menu)
+
+The `GCM_REAL_INIT` experiment was pursued to completion enough to identify the function
+definitively. Findings:
+
+- With the memory allocators implemented (`func_000F1F7C` size=r5/align=r4, `func_000F1F3C`
+  size=r4, `func_000F20FC`) and `func_000F1EFC` writing a real `sys_lwmutex_t`, the init runs
+  far past the old `0x80310005` wall (the wall was `func_000484B4`→`func_00048520` calling the
+  stubbed `func_000F1F3C`, which returned 0).
+- It then **spawns a chain of audio worker threads whose bodies were never lifted**:
+  `_sys_MixerChStripMain` (entry `0x47F70`, ctx arg `0x0A112000`),
+  `_sys_mixerSurBusReq` (entry `0x41F8C`, arg `0x70E4D0`), and more. Each uses a
+  producer/consumer handshake: the init spawns the thread, then **spin-waits** on a ready flag
+  (`[mixer_ctx+0x90]` for the first one) that the thread is supposed to raise. Because the
+  thread bodies aren't lifted, the runtime stubs them ("UNRESOLVED entry") and the flag never
+  rises → silent CPU spin.
+- Stubbing one thread's ready flag (`func_00047F70` in `extra_funcs.cpp` writes `[arg+0x90]=1`)
+  releases that spin and the init advances to the **next** thread's spin (`func_00042754`). This
+  is an open-ended sequence of audio worker threads.
+
+**Conclusion:** `func_00043778`/`func_0004370C` are the **nuSound2 / MultiStream AUDIO** init
+(the args to `func_0004370C` — `r4=0x190, r5=4, r6=1, r7=2, r8=3` — do not match
+`cellGcmInit(context, cmdSize, ioSize, ioAddress)`). This is **not** the menu path and not the
+flip/vblank event source. Game-main `func_00012420` already completes WITHOUT this init: in the
+default build it fails gracefully with `0x80310005` and the program still reaches clean exit
+(221102 stderr lines, "all game threads finished"). The menu blocker remains the missing event
+cycle (no `sys_event_queue_create`, no VBlank/flip handler registration, no
+`cellSpursAddWorkload`), per M1–M4 above.
+
+**State:** all of the above is kept behind `GCM_REAL_INIT` (default OFF, commented in
+`ppu_recomp.cpp`). The diagnostics added this phase — `GCM_SPIN_DETECT` (a hammered-poll-address
+backtracer in `vm_read32`) and the `[GCM-42C2C]` trace — are likewise gated off. Default build is
+the verified clean baseline. Next real step is Phase A/B above (find/stand up the event cycle),
+not further audio unstubbing.

@@ -1015,6 +1015,23 @@ void func_000D3020(ppu_context* ctx) {
     ctx->gpr[3] = 0;
 }
 
+/* _sys_MixerChStripMain (nuSound2/MultiStream audio mixer thread) at 0x47F70.
+ * The body was never lifted (only reachable via a runtime thread OPD), so the
+ * thread runtime logged "UNRESOLVED entry 0x47F70".  The audio init
+ * (func_000489E8, reached only under GCM_REAL_INIT once func_000F1F3C allocates
+ * real memory) spawns this thread then spin-waits on [mixer_ctx+0x90] until the
+ * mixer signals ready.  Minimal stub: raise the ready flag, then idle until
+ * shutdown so the producer spin is released and the audio init can complete. */
+void func_00047F70(ppu_context* ctx) {
+    uint32_t mctx = (uint32_t)ctx->gpr[3];   /* thread arg = mixer context */
+    fprintf(stderr, "[MixerChStrip] stub started (ctx=0x%08X), raising ready flag [+0x90]\n", mctx);
+    fflush(stderr);
+    vm_write32(mctx + 0x90u, 1u);            /* releases func_000489E8 loc_00048C20 spin */
+    while (!g_threads_should_exit) Sleep(16);
+    fprintf(stderr, "[MixerChStrip] stub exiting\n"); fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
 /* func_00051204: C++ global-init vtable method (object passed in r4), reached after
  * the real func_000510E4 bnusCore init runs.  EBOOT.elf @ 0x51204:
  *   or r3,r4,r4 ; bl 0x4B94C ; blr   = tail-call func_0004B94C(r4). */
@@ -1099,6 +1116,7 @@ static const extra_entry extra_table[] = {
     { 0x000EFBE8ULL, func_000EFBE8 },   /* sdu_yah_all_list_delete worker A */
     { 0x000EFD0CULL, func_000EFD0C },   /* sdu_yah_all_list_delete worker B */
     { 0x000D3020ULL, func_000D3020 },   /* UpdateThread (bnusCore audio) entry — stub */
+    { 0x00047F70ULL, func_00047F70 },   /* _sys_MixerChStripMain audio mixer thread — ready-flag stub */
     { 0, nullptr },
 };
 

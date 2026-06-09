@@ -331,6 +331,10 @@ extern "C" uint16_t vm_read16(uint64_t addr) {
     if (a < 0x1000) { fprintf(stderr, "[LOW-READ16] guest addr=0x%08X val=0x%04X\n", a, v); fflush(stderr); }
     return v;
 }
+/* #define GCM_SPIN_DETECT 1 */   /* WIP diag: dump a backtrace on a hammered guest
+                                     poll address (locates silent spin hangs).  Default
+                                     OFF — adds a per-read branch to vm_read32. */
+extern "C" void ps3_debug_backtrace(const char* tag);   /* fwd decl (defined below) */
 extern "C" uint32_t vm_read32(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) {
@@ -366,6 +370,23 @@ extern "C" uint32_t vm_read32(uint64_t addr) {
         fflush(stderr);
         return v32;
     }
+#ifdef GCM_SPIN_DETECT
+    {
+        /* Spin detector: if the same address is hammered, dump a backtrace once
+         * so we can locate a silent guest poll-loop hang. Reset on address change. */
+        static thread_local uint32_t s_last = 0xFFFFFFFFu;
+        static thread_local uint64_t s_cnt  = 0;
+        static thread_local int      s_dumped = 0;
+        if (a == s_last) {
+            if (++s_cnt == 20000000u && !s_dumped) {
+                s_dumped = 1;
+                fprintf(stderr, "[SPIN] vm_read32 addr=0x%08X hammered %llu times\n",
+                        a, (unsigned long long)s_cnt); fflush(stderr);
+                ps3_debug_backtrace("SPIN");
+            }
+        } else { s_last = a; s_cnt = 0; }
+    }
+#endif
     return ((uint32_t)vm_base[a]     << 24) | ((uint32_t)vm_base[a + 1] << 16) |
            ((uint32_t)vm_base[a + 2] <<  8) |  (uint32_t)vm_base[a + 3];
 }

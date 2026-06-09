@@ -457,11 +457,8 @@ int main(int argc, char* argv[]) {
         vm_write32(GCM_CTX + 0x08u, CMD_BUF);    /* current = command buffer start */
         vm_write32(GCM_CTX + 0x0Cu, CMD_BUF);    /* begin */
         vm_write32(GCM_CTX + 0x10u, CMD_BUF + CMD_SIZE - 4u); /* end */
-        vm_write32(GCM_CTX + 0x18u, 0x200000u);  /* IO size = 2 MB */
-        vm_write32(GCM_CTX + 0x1Cu, 1u);         /* flags = 1 (initialized) */
-        /* NOTE: for the GCM_REAL_INIT experiment (ppu_recomp.cpp), set +0x18 and
-         * +0x1C to 0 — the real cellGcmInit treats non-zero [ctx+0x18] as
-         * "already initialized" and bails (0x80310006). */
+        vm_write32(GCM_CTX + 0x18u, 0x200000u); /* RSX IO size (force-success path) */
+        vm_write32(GCM_CTX + 0x1Cu, 1u);         /* init-done sentinel */
     }
 
     ppu_context ctx = {};
