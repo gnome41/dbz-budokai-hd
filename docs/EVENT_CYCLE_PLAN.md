@@ -310,3 +310,30 @@ only those.  Both are major efforts beyond this phase.
 
 Tooling added: _restub.py (deny-list re-stub), vm_read8 spin detector (gated GCM_SPIN_DETECT).
 All experiments gated OFF; baseline verified clean (221102 lines, all game threads finished).
+
+## Phase A BREAKTHROUGH — the "SPURS wall" was a lifter bug; surgical 64-bit add fix clears it
+
+Diff-checking the upstream SDK (sp00nznet/ps3recomp) revealed the game-world spin and the
+strcat AV were NOT SPURS coupling — they were the upstream-fixed lifter correctness bugs:
+- 0a7c56e: PPC add/subf emitted 32-bit-truncated; the SWAR word-at-a-time strlen never sees
+  the high-word terminator and scans forever. Our generated code had 11687 add + 3374 subf
+  truncated sites.
+- Also: prologue detection (off-by-4) and load-with-update (ldu base never advances).
+
+Rather than a full base-swap (the auto re-lift restructures ~1000 functions; even with
+--functions it leaves ~940 externals), applied the add/subf fix SURGICALLY in place via
+_apply_addfix.py: 11687 add + 3374 subf -> full 64-bit form. Verified the clean baseline is
+unchanged (221102 lines, all threads finished) — the corrected arithmetic is a safe no-regression.
+
+RESULT with GAMEWORLD_REAL_INIT on: the func_000D9470 spin is GONE (the add fix fixed its SWAR
+sub-call func_000D0468, so r26 += r30 now advances). The game-world init runs deeper into REAL
+game logic and hits the game's own abort()/assert (func_000D91E4 = the abort handler, syscall
+988 r3=4). Lead-up: parse pointer r29 advanced to 0x10BC20 (SPURS embedded-data region), slab
+bump alloc 0x10000 -> 0x702000, unresolved ICALLs 0xEDCDC/0xEB2E0(=func_000EB2E4-4)/0xEB214
+returning 0. The failing assertion's caller is in the unsymbolized host stack (LR=0).
+
+This VALIDATES the surgical-fix approach: with correct arithmetic the bring-up advances from a
+spin to real game code. Next blockers (the deep game-world bring-up, now on a correct base):
+symbolize the abort caller; resolve the off-by-4 ICALLs (0xEB2E0->func_000EB2E4 etc.); relocate
+slab bump pools off the 0x700000-0x70F000 SPURS area if it proves to matter. The full clean
+re-lift remains scheduled as follow-up (also brings load-with-update + prologue fixes natively).
