@@ -1,34 +1,22 @@
-Implement lvlx/lvrx (op31_x519/x551) — clears the dtoa formatter spin
+Fix systematic float-compare NaN handling (fcmp/fcmpu) - 1435 sites
 
-The Cell-BE unaligned-vector-load pair was left as `/* TODO */` no-ops by the
-lifter:
-  op31_x519 = lvlx  vrD, rA, rB  (Load Vector Left Indexed)   341 sites
-  op31_x551 = lvrx  vrD, rA, rB  (Load Vector Right Indexed)   17 sites
+The lifter emitted every floating compare as
+  cr_val = (a < b) ? 8 : (a > b) ? 4 : 2
+i.e. FL(<)=8, FG(>)=4, else FE(=)=2. For a NaN operand a<b and a>b are both
+false, so it fell through to 2 (EQUAL) - but PPC fcmpu/fcmpo set FU (unordered)
+= 1 for NaN, not equal. Result: every NaN-detection branch in the game was
+defeated (a value compared with itself is unordered iff NaN; the game uses this
+idiom after sqrt/div to call its NaN handlers).
 
-Together with `vor` these load 16 unaligned bytes (lvlx(p) | lvrx(p+16)), the
-standard Cell idiom used heavily in optimized string/number formatting. As
-no-ops they fed garbage into the vector path, causing the float-to-string
-(dtoa) convergence loop in func_000E2A3C to spin forever in the GAMEWORLD_REAL_INIT
-path.
+Fix via _apply_fcmp.py: the trailing `: 2;` becomes `: (a == b) ? 2 : 1;` so NaN
+yields FU=1. Non-NaN values are unchanged (a==b is true in the else); integer
+compares use `int64_t a` and are not matched. Baseline-safe: 221102 lines, all
+threads finished (the NaN path is not exercised by the default build).
 
-Implemented both via _apply_lvlx.py, matching the existing aligned lvx/stvx
-convention in this file (ctx->vr[N] holds raw guest bytes in big-endian order,
-copied straight from vm_base, no byte swap; rA|0 honored).
-
-Verified baseline-safe: GAMEWORLD off still completes at 221102 lines, all game
-threads finish (the occasional +12-line tail is a pre-existing sporadic
-render-thread race in edge_rasterize, ~1/4 runs, unrelated).
-
-With lvlx/lvrx in place the game-world init advances past the dtoa spin into a
-module dispatch run loop. Resolved three off-by-4 dropped-prologue functions hit
-on that newly-reached path (wrappers in extra_funcs.cpp):
-  func_00063880  stwu r1,-0x80(r1)  -> func_00063884
-  func_0002BAF8  stdu r1,-0x70(r1)  -> func_0002BAFC
-  func_0002E6A0  stdu r1,-0x130(r1) -> func_0002E6A4
-
-New terminal blocker (GAMEWORLD path): func_00057A3C callback dispatcher loops
-forever over 4 static module objects (0xF9D28/0xFE768/0xF9E38/0xFE7C8) — the
-game-world run loop busy-waiting on an external state change (the event-cycle
-wall, now reached from much deeper). GAMEWORLD_REAL_INIT gated back off.
+Found while tracing the GAMEWORLD dtoa hang: func_00068998 does `fcmpu f0,f0`
+after a sqrt to detect NaN and call func_000E14E4; the buggy compare reported
+"equal" so the handler was skipped. (This particular hang has a second, separate
+cause - a float-store/double-read mismatch in the number formatter defeating its
+Inf/NaN classifier - still open.)
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
