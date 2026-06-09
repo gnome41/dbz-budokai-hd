@@ -319,10 +319,27 @@ extern "C" void thread_runtime_join_all() {
  * Guest addresses 0x0000-0xFFFF are valid on real PS3 (PPU local storage).
  * We commit that range in vm_init() (main.cpp).  Log accesses below 0x1000
  * for visibility but always perform the actual read/write — do NOT skip. */
+/* #define GCM_SPIN_DETECT 1 */  /* WIP diag: dump a backtrace on a hammered guest poll
+   address (vm_read8 + vm_read32).  Default OFF — adds a per-read branch. */
+extern "C" void ps3_debug_backtrace(const char* tag);   /* fwd decl (defined below) */
 extern "C" uint8_t vm_read8(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
     uint8_t v = vm_base[a];
     if (a < 0x1000) { fprintf(stderr, "[LOW-READ8]  guest addr=0x%08X val=0x%02X\n", a, v); fflush(stderr); }
+#ifdef GCM_SPIN_DETECT
+    {
+        static thread_local uint32_t s_last = 0xFFFFFFFFu;
+        static thread_local uint64_t s_cnt = 0;
+        static thread_local int s_dumped = 0;
+        if (a == s_last) {
+            if (++s_cnt == 20000000u && !s_dumped) {
+                s_dumped = 1;
+                fprintf(stderr, "[SPIN8] vm_read8 addr=0x%08X hammered %llu times\n", a, (unsigned long long)s_cnt); fflush(stderr);
+                ps3_debug_backtrace("SPIN8");
+            }
+        } else { s_last = a; s_cnt = 0; }
+    }
+#endif
     return v;
 }
 extern "C" uint16_t vm_read16(uint64_t addr) {
@@ -331,10 +348,6 @@ extern "C" uint16_t vm_read16(uint64_t addr) {
     if (a < 0x1000) { fprintf(stderr, "[LOW-READ16] guest addr=0x%08X val=0x%04X\n", a, v); fflush(stderr); }
     return v;
 }
-/* #define GCM_SPIN_DETECT 1 */   /* WIP diag: dump a backtrace on a hammered guest
-                                     poll address (locates silent spin hangs).  Default
-                                     OFF — adds a per-read branch to vm_read32. */
-extern "C" void ps3_debug_backtrace(const char* tag);   /* fwd decl (defined below) */
 extern "C" uint32_t vm_read32(uint64_t addr) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) {

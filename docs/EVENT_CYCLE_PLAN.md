@@ -283,3 +283,30 @@ game-world/thread-manager subtree only (func_00024DE4's call-tree + the thread-m
 0x317E8/0x3184C/0x318A0/0x316D4/0x31544), excluding bnusCore, OR to make func_00024DE4 genuinely
 succeed. Tooling + gated fix are committed (default OFF); baseline verified clean (221k lines,
 all game threads finished, no AV).
+
+## Phase A bring-up — deeper progress and the SPURS-coupling wall
+
+Continuing with the deny-list approach (keep bnusCore funcs that AV stubbed):
+
+1. Re-stubbed func_0001BADC (bnusCore, AV'd reading garbage 0x87068D9C) via _restub.py.
+   With it denied, the game-world init runs MUCH further (reads low-mem structs, does
+   indirect dispatches, slab-allocs; cri_dlg threads spawn) instead of AV'ing.
+2. New blocker: a CPU spin (confirmed ~1.3 cores) in a parser loop func_000D9470 polling
+   byte [0x10BC28] forever, 11 frames deep:
+   func_0003AAC8 -> func_0001D41C -> func_0001CDE0 -> func_000EB670 -> func_000E7870 ->
+   func_000E8844 -> func_000D9470.  The loop re-invokes the REAL SPURS init func_000CE77C
+   (and func_000CE9A0) and only advances when SPURS makes progress — which our
+   partially-faked SPURS (synthetic dispatch chains, lnop LS patches, no real SPU mailbox)
+   does not do.  Also seen: unresolved ICALLs 0xEDCDC (unlifted), 0xEB2E0 (= func_000EB2E4-4,
+   off-by-4 with no stub), 0xEB214; and a null CTR=0 virtual dispatch (uninitialised vtable).
+
+**Assessment:** the game-world init (func_00024DE4 subtree) is tightly coupled to real
+SPURS/SPU execution and inter-thread coordination that we only partially emulate.  Forcing
+it forward yields progressively more-broken state (AV -> re-stub -> spin in faked SPURS).
+This is NOT tractable by incremental force-forward; reaching the menu this way needs either
+(a) real SPU mailbox/dispatch emulation so func_000CE77C-driven loops advance, or (b) a
+principled map of exactly which init steps spawn the orchestration threads, then satisfying
+only those.  Both are major efforts beyond this phase.
+
+Tooling added: _restub.py (deny-list re-stub), vm_read8 spin detector (gated GCM_SPIN_DETECT).
+All experiments gated OFF; baseline verified clean (221102 lines, all game threads finished).
