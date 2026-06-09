@@ -1,21 +1,20 @@
-Fix stfd-as-stfs mislift in number formatter (func_000E2594) - clears dtoa hang
+Fix rA|0 rule for vector indexed loads/stores (lvx/stvx) - 2364 sites
 
-func_000E2594 (the float-format entry, body behind off-by-4 func_000E2590)
-stored its value to the [sp+0xD0] slot with a 32-bit float store (stfs) but that
-slot is an 8-byte double: the classifier func_000E1934 reads it as a double
-(halfwords +0/+2/+4/+6, checks exp==0x7FF0) and func_000E25F0 reads it via
-vm_read64. Big-endian, the truncated float landed in the double's high half with
-a zero low half, turning an Inf/NaN (e.g. from a div-by-zero in the geometry
-func_00068998) into a FINITE ~1.4e306/2.2e307 whose double exponent is not
-0x7FF0 - so the classifier missed it and routed to the dtoa func_000E2A3C, which
-then tried to print ~300 digits one-at-a-time (~10^16 iters = effective hang).
+For X-form indexed ops, rA field == 0 means the LITERAL value 0, not gpr[0]
+(r0 can never be a base register). The lifter emitted the lvx/stvx effective
+address as (gpr[rA] + gpr[rB]) & ~0xF and, when rA==0, wrongly added gpr[0].
+Latent while r0==0 (its common scratch/zero value) but corrupts the address when
+r0 holds a value: func_00017ED4 does `addi r0,r1,0x290` then `stvx v31,0,r0`, and
+the buggy (gpr[0]+gpr[0]) doubled sp+0x290 (~0xDFFFF9C0) to 0xBFFFF380 -> AV in
+the C++ unwind path.
 
-Fix: store the full double (stfd). The classifier now detects Inf/NaN and routes
-to the inf/nan handler, so the formatter no longer hangs. With this plus the
-fcmp NaN fix (d85bb7b), GAMEWORLD_REAL_INIT advances past the formatter to the
-next blocker (AV at guest 0xBFFFF380 in C++ unwind with a sign-extended SP
-gpr[1]=0xFFFFFFFFDFFFF730 - likely an SP-sign-extension mislift, next target).
+Fix via _apply_vecra0.py: drop the bogus gpr[0] addend so EA = gpr[rB] & ~0xF.
+Only the lvx/stvx EA pattern (`& ~0xFULL`) is matched; ordinary loads and
+non-zero-rA forms are untouched. Baseline-safe: 221102 lines, all threads
+finished (2 runs).
 
-Baseline-safe: 221102 lines, all threads finished (2 runs).
+With this + the fcmp (d85bb7b) and formatter-stfd (10b2d38) fixes,
+GAMEWORLD_REAL_INIT advances past the 0xBFFFF380 AV to a new one (vm_write32 to
+0x12F01FC4 in func_000174DC, sign-extended SP again - next target).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
