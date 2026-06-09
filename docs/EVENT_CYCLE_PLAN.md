@@ -219,3 +219,39 @@ cycle (no `sys_event_queue_create`, no VBlank/flip handler registration, no
 backtracer in `vm_read32`) and the `[GCM-42C2C]` trace — are likewise gated off. Default build is
 the verified clean baseline. Next real step is Phase A/B above (find/stand up the event cycle),
 not further audio unstubbing.
+
+## Phase A result — the gate that spawns "Initialize Thread" is the `func_00024DE0` stub
+
+Traced the exact condition that decides whether the orchestration threads ("Initialize
+Thread"/"Regist Context Thread"/"Unlock Thread", name strings @0xF3200/0xF3214/0xF322C) spawn:
+
+- They are spawned by the virtual methods `func_000317EC` / `func_00031850` / `func_000318A4`
+  (each calls `func_000F1EBC` = `sys_ppu_thread_create`). These are vtable slots 3/4/5 of a
+  thread-manager class (vtable @0xF6D18; the vtable's OPDs live at 0x161160..; RTTI text
+  "vector<T> too lo..." at vtable+0x30).
+- That manager is constructed by `func_00031548`, called via `bl 0x31544` (= ctor-4) at 0x2563C
+  inside **`func_00024DE4`** — the game's "full game-world init" (allocates world objects via
+  `func_00033944`, wires sub-objects, then builds the thread-manager).
+- `func_00024DE4` is invoked from the **running** SPURS state machine `func_0003AAC8` at
+  `loc_0003AD94` via `bl 0x24DE0` (= `func_00024DE4 - 4`). The lifter dropped the leading
+  `stdu r1,-0x160(r1)` (raw 0xF821FEA1 @0x24DE0; 0x24DE4 = `mflr`), so the call target 0x24DE0
+  is not a real function entry. A prior fix lifted it as a **stub** `func_00024DE0` returning 1
+  (returning 0 made `func_0003AAC8` take an early-exit branch and skip game-world init), but
+  returning 1 **skips the real body entirely** — so the manager is never constructed and the
+  threads never spawn. THIS is the gate.
+
+**The real-condition fix** (gated `GAMEWORLD_REAL_INIT`, default OFF in `ppu_recomp.cpp`):
+restore the dropped `stdu` and run the real body —
+`vm_write64(r1-0x160, r1); r1 -= 0x160; func_00024DE4(ctx); drain;`. Enabling it makes the
+game-world init actually run, but it is a deep bring-up: it currently **AVs at guest 0x10010000**
+(main-RAM ceiling) in the bnusCore path (`func_00012420 -> func_0004BA74 -> func_0005E2B0 ->
+func_0005E09C -> func_0005D564 -> func_0005D2B0 -> func_000D242C -> vm_write8`) — i.e. the partial
+world init leaves state the later audio path overruns (likely another unlifted accessor returning
+0 used as a buffer base, same shape as the `func_0005AA3C` family fixes). So the gate is found and
+the door is open, but walking through it is the project-scale game-world bring-up, one dependency
+at a time, starting from that AV.
+
+Note: every function in this subsystem uses the off-by-4 (`func-4`) OPD/bl entry where the lifter
+dropped the `stdu` — when `GAMEWORLD_REAL_INIT` is on, expect to add missing-`stdu` wrappers for
+the thread-manager methods too (0x317E8/0x3184C/0x318A0/0x316D4/0x31544, etc.), mirroring the
+sdu-worker wrappers (`func_000EFD18`).
