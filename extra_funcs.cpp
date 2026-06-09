@@ -1101,8 +1101,41 @@ void func_000EB2E0(ppu_context* ctx) {
     DRAIN_TRAMPOLINE(ctx);
 }
 
+/* off-by-4: OPD entry 0x63880 is the dropped `stwu r1,-0x80(r1)` prologue;
+ * the lifter produced the body at func_00063884 (0x63884). Reached via OPD
+ * dispatch from the game-world init loop (CTR=0x63880, r3=object, r4=index).
+ * func_00063884 saves LR at sp+0x90 (caller frame) and restores sp+=0x80,
+ * so the missing prologue is stwu r1,-0x80(r1). */
+void func_00063880(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0x80, ctx->gpr[1]);
+    ctx->gpr[1] -= 0x80;
+    func_00063884(ctx);
+    DRAIN_TRAMPOLINE(ctx);
+}
+
+/* off-by-4: OPD entry 0x2BAF8 = dropped `stdu r1,-0x70(r1)`; body at func_0002BAFC
+ * (LR saved at sp+0x80, epilogue sp+=0x70). Reached via game-world init dispatch. */
+void func_0002BAF8(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0x70, ctx->gpr[1]);
+    ctx->gpr[1] -= 0x70;
+    func_0002BAFC(ctx);
+    DRAIN_TRAMPOLINE(ctx);
+}
+
+/* off-by-4: OPD entry 0x2E6A0 = dropped `stdu r1,-0x130(r1)`; body at func_0002E6A4
+ * (LR saved at sp+0x140, epilogue sp+=0x130). Reached via game-world init dispatch. */
+void func_0002E6A0(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0x130, ctx->gpr[1]);
+    ctx->gpr[1] -= 0x130;
+    func_0002E6A4(ctx);
+    DRAIN_TRAMPOLINE(ctx);
+}
+
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
 static const extra_entry extra_table[] = {
+    { 0x00063880ULL, func_00063880 },   /* off-by-4: stwu -0x80 -> func_00063884 (game-world init loop) */
+    { 0x0002BAF8ULL, func_0002BAF8 },   /* off-by-4: stdu -0x70 -> func_0002BAFC (game-world init) */
+    { 0x0002E6A0ULL, func_0002E6A0 },   /* off-by-4: stdu -0x130 -> func_0002E6A4 (game-world init) */
     { 0x000EDCDCULL, func_000EDCDC },   /* li r3,1; blr — returns 1 (was stubbed to 0) */
     { 0x000EB214ULL, func_000EB214 },   /* std::string c_str accessor (was null) */
     { 0x000EB2E0ULL, func_000EB2E0 },   /* off-by-4: stdu -0x70 -> func_000EB2E4 */

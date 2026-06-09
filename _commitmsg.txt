@@ -1,0 +1,34 @@
+Implement lvlx/lvrx (op31_x519/x551) — clears the dtoa formatter spin
+
+The Cell-BE unaligned-vector-load pair was left as `/* TODO */` no-ops by the
+lifter:
+  op31_x519 = lvlx  vrD, rA, rB  (Load Vector Left Indexed)   341 sites
+  op31_x551 = lvrx  vrD, rA, rB  (Load Vector Right Indexed)   17 sites
+
+Together with `vor` these load 16 unaligned bytes (lvlx(p) | lvrx(p+16)), the
+standard Cell idiom used heavily in optimized string/number formatting. As
+no-ops they fed garbage into the vector path, causing the float-to-string
+(dtoa) convergence loop in func_000E2A3C to spin forever in the GAMEWORLD_REAL_INIT
+path.
+
+Implemented both via _apply_lvlx.py, matching the existing aligned lvx/stvx
+convention in this file (ctx->vr[N] holds raw guest bytes in big-endian order,
+copied straight from vm_base, no byte swap; rA|0 honored).
+
+Verified baseline-safe: GAMEWORLD off still completes at 221102 lines, all game
+threads finish (the occasional +12-line tail is a pre-existing sporadic
+render-thread race in edge_rasterize, ~1/4 runs, unrelated).
+
+With lvlx/lvrx in place the game-world init advances past the dtoa spin into a
+module dispatch run loop. Resolved three off-by-4 dropped-prologue functions hit
+on that newly-reached path (wrappers in extra_funcs.cpp):
+  func_00063880  stwu r1,-0x80(r1)  -> func_00063884
+  func_0002BAF8  stdu r1,-0x70(r1)  -> func_0002BAFC
+  func_0002E6A0  stdu r1,-0x130(r1) -> func_0002E6A4
+
+New terminal blocker (GAMEWORLD path): func_00057A3C callback dispatcher loops
+forever over 4 static module objects (0xF9D28/0xFE768/0xF9E38/0xFE7C8) — the
+game-world run loop busy-waiting on an external state change (the event-cycle
+wall, now reached from much deeper). GAMEWORLD_REAL_INIT gated back off.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
