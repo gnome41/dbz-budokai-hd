@@ -1,23 +1,23 @@
-GAMEWORLD: guard unsynthesized SPURS +0x18 chain in 3 state handlers
+Skip null-slab free in func_000D9108 - clears Terminate-Thread abort
 
-After the game-world init completes, the SPURS state machine func_000379BC
-advances into a family of state handlers (func_000352F8, func_00035390,
-func_000354C4) that follow the struct slot [0x27F7F4+0x18] = [0x27F80C] - a
-SPURS object/workload chain. We synthesize the +0x20/+0x28 chains
-(0x27F814->0x70B000, 0x27F81C->0x70A000) but never the +0x18 one, so it is 0;
-the handlers deref null -> read low memory -> a garbage OPD (0x900A0000) ->
-read AV. These handlers dispatch a workload vtable method (status/reporting);
-with our faked SPURS they can't do real work.
+After the SPURS +0x18 guards, the GAMEWORLD path advanced into the Terminate
+Thread cleanup, which freed the bump-slab block 0x701000 with slab_base==0 (the
+TOC[-0x603C] slab pointer was null on this path). The SLAB-SKIP guard only fired
+for `slab_base != 0 && slab+0x10==0`, so a null slab fell through to the real
+free func_000D5FD0 -> block-header abort (func_000D91E4, syscall 988 r3=4).
 
-Guard (all #ifdef GAMEWORLD_REAL_INIT, so baseline byte-identical): when
-[0x27F80C]==0, undo the off-by-4 wrapper's stdu and return r3=0. With the three
-guards the GAMEWORLD path no longer AVs and runs much further - 15 threads spawn
-(SDU workers, audio cri_adxm_*, Terminate Thread; up from 8) - until the game's
-own assertion handler func_000D91E4 fires (syscall 988 r3=4) and the process
-shuts down cleanly. So the new blocker is a game-side abort, not a crash.
+Fix: skip the free when the slab is unusable - either slab_base==0 (null) OR
+slab+0x10==0 (uninitialized pool). In both cases the block came from our bump
+fallback (no slab header), so the real free would abort. Condition changed from
+`slab_base != 0 && ...` to `slab_base == 0 || ...`.
 
-Baseline-safe: 221102 lines, all threads finished. (Alternative to guarding each
-handler: synthesize a valid [0x27F80C] chain with a no-op OPD so the handlers run
-returning status 0 - may avoid the later assert; deferred.)
+Baseline-safe: 221102 lines, all threads finished (a null-slab free never occurs
+in the default build, so this is inert there).
+
+RESULT: GAMEWORLD no longer aborts and runs far past the baseline - the SPURS/SPU
+render subsystem runs heavily (sphere/EDGE; ~220k SPU-interp lines), 19 threads,
+no AV/abort/hang. The menu event cycle is still not reached: the orchestration
+threads (Initialize/Regist Context/Unlock) are registered but not yet spawned, no
+sys_event_queue_create, no cellSpursAddWorkload - the original event-cycle wall.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
