@@ -1,25 +1,26 @@
-Bump-allocator LIFO reclaim - clears 0x12F01FC4 overflow AV
+Fix load-with-update (ldu/lbzu) in strcmp func_000D26C4 - clears thread-reg hang
 
-The game has a "probe the largest allocatable size" loop (loc_0003A984): it
-calls func_000D9128(size) starting at 0x9400000 (148 MB) and, only if the
-allocator returns 0, reduces by 1024 and retries; on success it frees the test
-block (func_000D90FC) and does the real allocation. The loop relies on the
-allocator FAILING when a size won't fit.
+func_000D26C4 is the C-library strcmp (SWAR word-at-a-time). Its inner loops read
+[r3+8]/[r4+8] (doubleword) and [r3+1]/[r4+1] (byte tail) with FIXED offsets and
+never advance r3/r4 - the original instructions were ldu/lbzu (load-with-update)
+and the lifter dropped the base-register advance. So strcmp of two strings that
+match past the first 8 bytes (no embedded NUL) spins forever.
 
-Our uninitialized-slab fallback bump allocator always succeeds, so the probe
-"succeeds" at 148 MB; the test block was never reclaimed (bump free was a no-op),
-so the subsequent real 148 MB allocation started at 0x9B02000 and its region
-extended to 0x12F02000 - past the committed ceiling 0x10010000 -> AV writing
-0x12F01FC4 in func_000174DC.
+This hung the game-world thread registration: func_0003A4D4 -> func_000103A4 ->
+func_000103A8 (a name->handler hash insert) strcmp's the orchestration-thread
+names ("Initialize Thread"/"Regist Context Thread"/"Unlock Thread", keys
+0xF3C04/0xF3C0C/0xF3C14) and looped on the first long match.
 
-Fix: give the bump allocator LIFO reclaim. func_000D9128 records the start of the
-last allocation; func_000D9108's uninit-slab free path rolls the bump pointer back
-when the most-recent block is freed. Now the probe's free reclaims the space and
-the real allocation reuses 0x702000, so the single 148 MB region fits within
-committed RAM. Verified: both allocs land at 0x702000, no AV.
+Fix: advance the pointers as ldu/lbzu do (r += stride; load [r]). With it, all
+three thread registrations complete and the whole game-world init sequence runs
+to the end (func_00034288 -> 3x func_000103A4 -> func_00019B84 -> func_000356C0),
+returning to the SPURS state machine func_000379BC which advances to a new
+blocker (read AV at 0x900A0004 in func_000352F8).
 
-Baseline-safe: 221102 lines, identical SLAB-BUMP/SKIP counts (1/1), all threads
-finished. GAMEWORLD_REAL_INIT now advances past the AV (busy in the menu-tree
-build / observer-dispatch phase; no AV, no read-spin in 45s).
+NOTE: load-with-update is a SYSTEMATIC lifter bug (upstream-fixed); it cannot be
+regex'd surgically (ldu is indistinguishable from ld in the emitted C), so this
+is a targeted fix of the strcmp that blocks the menu path. The clean global fix
+is the re-lift (EVENT_CYCLE_PLAN Phase 1 Option B). Baseline-safe: 221102 lines,
+all threads finished (2 runs).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
