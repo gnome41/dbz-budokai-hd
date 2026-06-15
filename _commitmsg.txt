@@ -1,23 +1,28 @@
-Skip null-slab free in func_000D9108 - clears Terminate-Thread abort
+Event-cycle Phase C: force-spawn + run the orchestration threads
 
-After the SPURS +0x18 guards, the GAMEWORLD path advanced into the Terminate
-Thread cleanup, which freed the bump-slab block 0x701000 with slab_base==0 (the
-TOC[-0x603C] slab pointer was null on this path). The SLAB-SKIP guard only fired
-for `slab_base != 0 && slab+0x10==0`, so a null slab fell through to the real
-free func_000D5FD0 -> block-header abort (func_000D91E4, syscall 988 r3=4).
+With the game-world init complete, the orchestration threads
+(Initialize/Regist Context) are registered but their spawn (thread-manager
+vtable slots func_000317EC/00031850) is only triggered by the event-driven menu
+startup we don't reach. Two parts:
 
-Fix: skip the free when the slab is unusable - either slab_base==0 (null) OR
-slab+0x10==0 (uninitialized pool). In both cases the block came from our bump
-fallback (no slab header), so the real free would abort. Condition changed from
-`slab_base != 0 && ...` to `slab_base == 0 || ...`.
+1. Force-spawn (GAMEWORLD-gated, in func_00024DE0 after init): capture the
+   thread-manager `this` in its ctor func_00031548 (g_thread_mgr) and invoke
+   func_000317EC/00031850 directly (each with a manual 0x70 stwu for its
+   dropped prologue). This creates "Initialize Thread"(0x31364) and
+   "Regist Context Thread"(0x313AC) via sys_ppu_thread_create.
 
-Baseline-safe: 221102 lines, all threads finished (a null-slab free never occurs
-in the default build, so this is inert there).
+2. Off-by-4 entry wrappers (extra_funcs.cpp + extra_table): the thread entry
+   OPDs point at 0x31364 / 0x313AC whose leading stwu was dropped; bodies are
+   func_00031368 (sp+=0x70) and func_000313B0 (LR@sp+0x90, frame 0x80). Without
+   them the thread proc logged "UNRESOLVED entry" and stubbed the threads.
 
-RESULT: GAMEWORLD no longer aborts and runs far past the baseline - the SPURS/SPU
-render subsystem runs heavily (sphere/EDGE; ~220k SPU-interp lines), 19 threads,
-no AV/abort/hang. The menu event cycle is still not reached: the orchestration
-threads (Initialize/Regist Context/Unlock) are registered but not yet spawned, no
-sys_event_queue_create, no cellSpursAddWorkload - the original event-cycle wall.
+RESULT: both orchestration threads now resolve and RUN to clean exit (no AV) -
+they execute func_00031368/func_000313B0 which call func_000F151C / func_000F14BC
+/ func_000F20DC (sysPrxForUser sync/event). NEXT LAYER: those event functions are
+stubbed, so no event queue is created yet (0 sys_event_queue_create). Making them
+create real queues/handlers is the remaining event-cycle work (Phase D).
+
+Baseline-safe: 221102 lines (force-spawn + ctor capture are GAMEWORLD-gated; the
+entry wrappers are only reached when the threads spawn).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

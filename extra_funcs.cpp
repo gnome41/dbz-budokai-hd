@@ -1131,11 +1131,28 @@ void func_0002E6A0(ppu_context* ctx) {
     DRAIN_TRAMPOLINE(ctx);
 }
 
+/* off-by-4 ORCHESTRATION THREAD ENTRIES (event-cycle build-out): the "Initialize Thread"
+ * and "Regist Context Thread" OPDs (0x161148/0x161150) point at thread entries 0x31364 /
+ * 0x313AC whose leading stwu was dropped; the real bodies are func_00031368 (epilogue sp+=0x70)
+ * and func_000313B0 (LR@sp+0x90 -> frame 0x80).  Without these the thread proc logs
+ * "UNRESOLVED entry" and stubs the thread, so the orchestration threads never run their
+ * event-setup (func_000F151C / func_000F14BC / func_000F20DC = sysPrxForUser sync/event). */
+void func_00031364(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0x70, ctx->gpr[1]); ctx->gpr[1] -= 0x70;
+    func_00031368(ctx); DRAIN_TRAMPOLINE(ctx);
+}
+void func_000313AC(ppu_context* ctx) {
+    vm_write64(ctx->gpr[1] - 0x80, ctx->gpr[1]); ctx->gpr[1] -= 0x80;
+    func_000313B0(ctx); DRAIN_TRAMPOLINE(ctx);
+}
+
 typedef struct { uint64_t addr; void (*func)(ppu_context*); } extra_entry;
 static const extra_entry extra_table[] = {
     { 0x00063880ULL, func_00063880 },   /* off-by-4: stwu -0x80 -> func_00063884 (game-world init loop) */
     { 0x0002BAF8ULL, func_0002BAF8 },   /* off-by-4: stdu -0x70 -> func_0002BAFC (game-world init) */
     { 0x0002E6A0ULL, func_0002E6A0 },   /* off-by-4: stdu -0x130 -> func_0002E6A4 (game-world init) */
+    { 0x00031364ULL, func_00031364 },   /* off-by-4: Initialize Thread entry -> func_00031368 */
+    { 0x000313ACULL, func_000313AC },   /* off-by-4: Regist Context Thread entry -> func_000313B0 */
     { 0x000EDCDCULL, func_000EDCDC },   /* li r3,1; blr — returns 1 (was stubbed to 0) */
     { 0x000EB214ULL, func_000EB214 },   /* std::string c_str accessor (was null) */
     { 0x000EB2E0ULL, func_000EB2E0 },   /* off-by-4: stdu -0x70 -> func_000EB2E4 */
