@@ -440,6 +440,14 @@ extern "C" void      rsx_present_frame(void);
  * We start at 0 and advance with PUT to scan wherever the game wrote commands. */
 static uint32_t g_rsx_get_ea    = 0x0u; /* RSX IO GET position = 0 initially */
 static uint32_t g_rsx_clr_color = 0u;          /* last NV4097_SET_COLOR_CLEAR_VALUE */
+
+/* Event-cycle step 1: handler OPDs the game registers via cellGcm during display
+ * setup (func_0002AF90, reached when GAMEWORLD_REAL_INIT builds the display objects).
+ * cellGcmSetVBlankHandler (func_000F0C1C) / cellGcmSetFlipHandler store their handler
+ * argument here so the render thread can invoke them per-frame (the missing per-frame
+ * menu driver).  0 = not registered. */
+extern "C" uint32_t g_vblank_handler_opd = 0u;
+extern "C" uint32_t g_flip_handler_opd   = 0u;
 static uint32_t g_rsx_surf_ea   = 0u;          /* color surface EA (from SET_SURFACE_COLOR_AOFFSET) */
 
 /* Vertex array state set by EDGE-injected NV4097 commands.
