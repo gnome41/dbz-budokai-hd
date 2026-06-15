@@ -1032,6 +1032,22 @@ extern "C" void ps3_debug_backtrace(const char* tag) {
 extern "C" void vm_write32(uint64_t addr, uint32_t val) {
     uint32_t a = (uint32_t)addr;
     if (a < 0x1000) { fprintf(stderr, "[LOW-WRITE32] guest addr=0x%08X val=0x%08X\n", a, val); fflush(stderr); }
+    /* DISP_WATCH (diagnostic, default off): trace writes to the display-manager
+       state.  Findings (2026-06-15): the display-context object at heap 0x800000
+       (the [0x28B088] singleton) has ONLY +0x34 populated (=0x72C060, by game main
+       func_00012420); its functional sub-managers at +0x0/+0x18/+0x20 are NEVER
+       written by any thread -> their factory is in unreached subsystem-init.  The
+       [0x28B270] display flag is set to 1 by the same game-main pass. */
+#ifdef DISP_WATCH
+    if (a >= 0x800000u && a <= 0x800037u && val != 0u) {
+        fprintf(stderr, "[WATCH-DISPOBJ] [0x800000+0x%02X] = 0x%08X\n", a - 0x800000u, val); fflush(stderr);
+        ps3_debug_backtrace("dispobj-write");
+    }
+    if (a == 0x28B270u) {
+        fprintf(stderr, "[WATCH-28B270] write val=0x%08X\n", val); fflush(stderr);
+        ps3_debug_backtrace("28B270-write");
+    }
+#endif
     /* OPD-build trace: an OPD is {code_ptr, toc}.  When the standard module TOC
        (0x0016A0F8) is written, the preceding word [a-4] is a code entry being
        registered.  Logs each unique (opd,code) once — reveals thread/callback
