@@ -433,3 +433,40 @@ uninitialised field Y that init-order-Z should have set."
 Only after P1 do we know whether the menu needs (a) just a correct base + the already-found gate
 (`func_00024DE0`→`func_00024DE4`), or (b) the full event-source scaffolding (Phases B–D). P1 is the
 cheap, decisive bet that prevents building event infrastructure on a miscompiled base.
+
+---
+
+# PHASE 1 RESULT (2026-06-16) — base is correct; verdict = option (b), event scaffolding needed
+
+P1 is **answered**. The lifter-correctness pass (64-bit add/subf, subfc, stfiwx, lvlx/lvrx, fcmp NaN,
+stfd-as-stfs, vector `rA|0`, ldu/lbzu, off-by-4 stdu) plus two premature-teardown guards
+(GCM flip-drain skip in `func_00042E78`, bnusCore-dtor skip in `func_00039E24`) take
+`GAMEWORLD_REAL_INIT` to a **clean EXIT=0** (~223k lines, no AV). So the garbage/AVs were lifter bugs,
+not init-order — **P1-DONE-a/b/c met**. The base now computes correct values.
+
+**But the menu still does not appear, and Phase-A scanning (GAMEWORLD on) shows every event-cycle
+primitive is STILL absent:**
+- No `sys_event_queue_create` (syscall 125) anywhere.
+- `cellGcmSetVBlankHandler` (`func_000F0C1C`) is called only with **handler = 0** (cleared) — twice.
+  Both calls come from `func_0002AF90` (display setup) reached via the **"Terminate Thread"
+  `func_00039E24` TEARDOWN**, i.e. the *un*-register, not a real registration. (Registration chain:
+  `func_0002AF90 → func_0003C148 → func_0003C0F0/F4 → func_000F0C1C`; `func_0003C0F4` itself also
+  calls `func_000F0C1C` — hence two handler=0 calls.)
+- No `cellSpursAddWorkload`.
+- `func_0003A4D4` (per-frame menu UI handler) runs **once** with a null scene (`r3=0`).
+
+**Why `r3=0`:** `func_0003A4D0`/`A4D4`'s `r3` = `func_0003AAC8`'s arg. `func_0003AAC8` is called from
+`_start` (`func_0003B328` @0x3B4A8) with `r3 = r28 = r31` = the **top-level SPURS/process context**,
+not a menu scene. The active menu scene is created later, in the game's **main flow** — which is only
+entered after the SPURS init dispatch loop (`loc_0003AE74`, states 2→21) completes and the game would
+normally spawn its menu/consumer thread and register the live handler. Our partial SPURS/SPU emulation
+runs the init dispatch loop to completion and the process then tears down (the "Terminate Thread" is
+engine cleanup that runs because nothing keeps the game alive), so the main flow is never entered.
+
+**Verdict: the menu needs option (b) — build/force the event cycle.** A correct base alone is not
+enough; the registration + scene + queue genuinely live in code the partial emulation doesn't reach.
+The decisive next sub-task (Phase C "force-run") is to identify the game's **display/menu setup**
+function that registers a *live* vblank handler + creates the menu scene (distinct from the teardown
+`func_0002AF90` we currently reach), and either fix the gate that skips it or invoke it directly after
+init, then let the existing 30 fps `cellGcmTickVBlank` drive it. `g_vblank_handler_opd` capture
+(`func_000F0C1C`, committed) is already in place to receive a real handler once that path runs.
