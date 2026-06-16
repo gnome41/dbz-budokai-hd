@@ -103,13 +103,14 @@ If the cmake configure cache is stale, delete `build\CMakeCache.txt` and `build\
 | **Lifter-correctness pass** (64-bit add/subf, subfc, stfiwx, lvlx/lvrx, fcmp NaN, stfd-as-stfs, vector rA\|0, ldu/lbzu, off-by-4 stdu) | ✅ Applied — ~15k+ sites corrected; unblocked the full game-world init (see *Lifter bugs fixed*) |
 | **Full game-world init** (`GAMEWORLD_REAL_INIT`, gated off) | ✅ Runs AV-free (EXIT=0) — display-context objects built & populated, `cellGcm` display setup completes, orchestration threads spawn |
 | **Menu dispatch pipeline** (`func_0003AAC8 → func_0003A4D0 → func_0003A4D4 → func_000129B0/12C18/12D84`) | ✅ Mapped & reached (gated) — the launcher menu logic that consumes the manager graph at `0x243AF0–0x243B0C` |
-| **Game main loop** | 🟡 Reachable (gated) — the SPURS dispatch loop `loc_0003AE74` is gated behind `func_0003A4D0` returning non-zero; the default/null-scene path returns 0 → the game spawns the "Terminate Thread" and exits. A probe forcing the non-zero path keeps the game in its main loop (SPU/EDGE render pipeline runs continuously, no AV). See *What's next* |
-| **Main menu (visible)** | 🔲 In progress — `func_0003A4D4` runs with a null scene (`r3=0`); a valid menu-scene object + per-frame driver are the remaining work |
+| **SPURS dispatch loop** (`loc_0003AE74` in `func_0003AAC8`) | ✅ Runs in baseline — `func_0003A4D0` returns 0 → the state-machine dispatch loop runs (states 2→21), then proceeds to teardown and the process exits. It is **not** a persistent per-frame loop |
+| **Persistent main / menu loop** | 🔲 Not established — after the dispatch loop completes nothing keeps the game alive: no live `cellSpursAddWorkload`, no registered VBlank/Flip handler, no menu scene. `func_0003A4D4` runs once with a null scene (`r3=0`). See *What's next* |
+| **Main menu (visible)** | 🔲 In progress — needs a valid menu-scene object + a per-frame event driver |
 | Real game geometry (characters, stages) | 🔲 Blocked on the menu scene + `cellSpursAddWorkload` |
 | Audio (cellAudio) | 🔲 Stubbed |
 | Input (cellPad) | 🔲 Stubbed |
 
-> **Note on gated work:** the game-world init, menu dispatch, and main-loop findings above are behind experimental compile flags (`GAMEWORLD_REAL_INIT`, `MENU_PROBE`, `MENU_STAYALIVE`) that are **OFF by default**. The default build behaves exactly as *What you see when you run it* describes (animated sphere + cycling backgrounds, then exit).
+> **Note on gated work:** the game-world init and menu-dispatch findings above are behind experimental compile flags (`GAMEWORLD_REAL_INIT`, `MENU_PROBE`) that are **OFF by default**. The default build behaves exactly as *What you see when you run it* describes (animated sphere + cycling backgrounds, then exit).
 
 ### What you see when you run it
 
@@ -229,16 +230,15 @@ See `CLAUDE.md` for full diagnostic recipes.
 
 ### Reaching the main menu — current frontier
 
-The earlier "structural wall / no PPU game loop" conclusion has been **superseded** by the 2026-06 lifter-correctness pass and game-world bring-up. The game *does* have a main loop; it was simply gated behind code the recompiled binary couldn't execute correctly until the bugs above were fixed.
+The 2026-06 lifter-correctness pass and game-world bring-up advanced the picture substantially, but the core blocker is still the **event-driven main loop**, not a single missing branch.
 
 What the deeper bring-up established:
 
 - With `GAMEWORLD_REAL_INIT` enabled, the full game-world init now runs **AV-free to a clean exit**. Display-context objects are built and populated, the `cellGcm` display setup completes, and the launcher's menu-dispatch pipeline (`func_0003AAC8 → func_0003A4D0 → func_0003A4D4 → func_000129B0/12C18/12D84`) is reached. The menu logic consumes the manager graph that game main builds at globals `0x243AF0–0x243B0C`.
-- **The terminate trigger is identified.** Inside the SPURS state machine `func_0003AAC8`, the menu UI handler `func_0003A4D0` is called once; if it returns **0**, control branches to `loc_0003B088`, which spawns the **"Terminate Thread"** (`func_00039E20`, OPD `0x1613B8`) — the game tears down its display + bnusCore and the process exits. If it returns **non-zero**, control instead enters the SPURS dispatch loop `loc_0003AE74` — the main processing loop.
-- In the current flow `func_0003A4D0` returns 0 because `func_0003A4D4` runs with a **null menu scene** (`r3=0`). A probe (`MENU_STAYALIVE`) that forces the non-zero path keeps the game in its main loop: the SPU/EDGE render pipeline runs continuously with no AV, instead of terminating after init.
-- Earlier `cellGcmSetVBlankHandler` work confirmed the handler the game registers in *this* (teardown) path is null — the live handler registration happens in the main flow, which only runs once the game stops taking the terminate branch.
+- The SPURS state-machine dispatch loop (`loc_0003AE74` in `func_0003AAC8`) **already runs in the default build**: the menu UI handler `func_0003A4D0` returns 0, control falls through into the dispatch loop, the state machine advances 2→21, and *then* the function proceeds to `loc_0003B088`, spawns the **"Terminate Thread"** (`func_00039E20`, OPD `0x1613B8`), and the process exits once the state machine is done. (Forcing `func_0003A4D0` to return non-zero does the opposite of helping — it *skips* the dispatch loop straight into early teardown.)
+- `func_0003A4D4` (the per-frame menu UI handler) runs once with a **null scene** (`r3=0`) and does nothing useful. `cellGcmSetVBlankHandler` is only ever called with a null handler (the teardown path), confirming the live per-frame handler registration lives in code that is not reached.
 
-**Remaining work to a visible menu:** give `func_0003A4D4` a valid menu-scene object so it returns non-zero *naturally* (rather than via the probe), wire the per-frame driver that ticks the scene, and confirm the menu geometry/text renders through the existing EDGE + rasterizer path. Full running log in `memory/project_display_path_dead_end.md` and `docs/EVENT_CYCLE_PLAN.md`.
+**Conclusion (unchanged from the original analysis):** the menu needs the **event-driven cycle** to be established — a VSYNC/flip event source, an event queue, a live menu scene, and registered handlers — so that the dispatch loop has ongoing work and the game does not simply complete its init and exit. The lifter-correctness pass and the AV-free game-world init are the foundation for that build-out, not a shortcut around it. Full running log in `memory/project_display_path_dead_end.md` and `docs/EVENT_CYCLE_PLAN.md`.
 
 ### Parallel tracks (independent of the event cycle)
 
