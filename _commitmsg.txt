@@ -1,8 +1,0 @@
-Add _imports.py: PS3 import-table NID mapper (elf_parser fails on this EXEC)
-
-Parses the EBOOT program headers manually and maps each import thunk (0xF1xxx)
-to its library + NID via stub_table/nid_table. Used to discover the force-spawned
-"Initialize/Regist Context Thread" are sceNpTrophy threads, not the menu/render
-orchestration.
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

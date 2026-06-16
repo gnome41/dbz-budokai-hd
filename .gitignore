@@ -25,6 +25,8 @@ game/
 # Debug / temp
 stderr.txt
 *.log
+run_*.txt
+_commitmsg.txt
 
 # Editor / OS
 .vs/
