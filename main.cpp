@@ -211,6 +211,16 @@ static bool vm_init() {
         fprintf(stderr, "ERROR: Failed to commit LV2/TLS high region\n");
         VirtualFree(vm_base, 0, MEM_RELEASE); return false;
     }
+    /* Game "0xFEED0000" magic base: the display/event setup (func_0002B6D0 path,
+       GAMEWORLD) builds tables of `0xFEED0000 + idx` entries and dispatches through
+       [obj+0xC] = 0xFEED0000 as an OPD.  Committing it zeroed makes such a dispatch
+       read code-ptr 0 -> ps3_indirect_call(CTR=0) -> the existing no-op stub path
+       (r3=0) instead of an AV — i.e. a clean "no handler" for uninitialised slots.
+       Untouched in the default build (only the GAMEWORLD registration chain uses it). */
+    if (!VirtualAlloc(vm_base + 0xFEED0000u, 0x10000u, MEM_COMMIT, PAGE_READWRITE)) {
+        fprintf(stderr, "ERROR: Failed to commit 0xFEED0000 magic region\n");
+        VirtualFree(vm_base, 0, MEM_RELEASE); return false;
+    }
 #else
     #error "Non-Windows not yet supported"
 #endif
