@@ -1123,6 +1123,32 @@ extern "C" void vm_write64(uint64_t addr, uint64_t val) {
     vm_write32(addr + 4, (uint32_t)(val));
 }
 
+/* ---- cellGcmGetControlRegister backing (NID 0xdead47a5) -------------------
+ * Returns a real RSX control-register block {put@+0, get@+4, ref@+8} (big-endian
+ * in guest memory). The game submits by writing put and flip-syncs by polling ref
+ * (e.g. func_0003C148: `while (ctrl->ref != target) yield`). We advance ref once
+ * per render tick, modelling RSX reaching each reference on the next flip. Block
+ * lives in committed main-RAM well past the heap. */
+static uint32_t g_gcm_ctrl_ea = 0;
+extern "C" uint32_t gcm_get_control_register(void) {
+    if (!g_gcm_ctrl_ea) {
+        g_gcm_ctrl_ea = 0x70E280u;
+        vm_write32(g_gcm_ctrl_ea + 0, 0u);   /* put */
+        vm_write32(g_gcm_ctrl_ea + 4, 0u);   /* get */
+        vm_write32(g_gcm_ctrl_ea + 8, 0u);   /* ref */
+        fprintf(stderr, "[GCM-CTRL] cellGcmGetControlRegister -> 0x%08X\n", g_gcm_ctrl_ea);
+        fflush(stderr);
+    }
+    return g_gcm_ctrl_ea;
+}
+/* Called from the render tick: advance the RSX reference register by one so
+ * flip-sync waits (`ref != target`) complete on the next frame. */
+extern "C" void gcm_ctrl_advance_ref(void) {
+    if (!g_gcm_ctrl_ea) return;
+    uint32_t r = vm_read32(g_gcm_ctrl_ea + 8) + 1u;
+    vm_write32(g_gcm_ctrl_ea + 8, r);
+}
+
 /* LV2 syscall dispatcher */
 extern "C" void lv2_syscall(ppu_context* ctx) {
     uint32_t sysnum = (uint32_t)ctx->gpr[11];

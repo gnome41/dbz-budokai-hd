@@ -147,11 +147,13 @@ static void ps3_guest_call_impl(uint32_t opd_addr, uint64_t arg0, uint64_t arg1,
 }
 
 /* Dedicated render thread: drives sphere animation at ~30fps + fires GCM flip/vblank callbacks. */
+extern "C" void gcm_ctrl_advance_ref(void);  /* advances RSX ref reg (flip sync) */
 static DWORD WINAPI render_thread_proc(LPVOID) {
     while (!g_threads_should_exit) {
         spurs_render_sphere_tick();
         cellGcmTickVBlank();
         cellGcmTickFlip();
+        gcm_ctrl_advance_ref();   /* RSX reference advances one per flip */
         Sleep(33);
     }
     return 0;

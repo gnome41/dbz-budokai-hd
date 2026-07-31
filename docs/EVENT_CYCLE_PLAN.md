@@ -559,3 +559,42 @@ capturing the wrong thing.
 Gated artifacts kept (all OFF by default): `[0x27F868]` force (`EVENTCYCLE_PROBE`, main.cpp);
 `func_0003C148` vsync-wait satisfy (`GAMEWORLD_REAL_INIT`); `SPIN-SYSCALL`/`SPIN-ICALL` detectors
 (`GCM_SPIN_DETECT`). Baseline verified clean (EXIT=0, ~2.5k lines).
+
+## Phase C — func_000F0C1C = cellGcmGetControlRegister; implementing it advances init 5x
+
+**Identification (definitive, via the ELF import table — `_imports2.py`):** `func_000F0C1C` is the
+import thunk for **cellGcmSys::cellGcmGetControlRegister** (NID `0xdead47a5`). BOTH prior IDs were
+wrong — the original session's "cellGcmSetVBlankHandler" (d44fc12) and this session's "object
+allocator" (28d05ba). Notes on the lookup:
+- Import **NIDs are stored little-endian** in the F_NID table (slot at guest `0xa547adde` big-endian
+  = `0xdead47a5` little-endian = cellGcmGetControlRegister).
+- PS3 NIDs use a **salted** SHA-1: `SHA1(name + suffix)[:4]`, canonical suffix
+  `67 59 65 99 04 25 04 90 56 64 27 49 94 89 74 1A`. **`tools/nid_database.py`'s suffix is corrupted
+  at byte 7 (`0x01` should be `0x90`)** — its `compute_nid` gives wrong NIDs; use `_imports2.py`.
+- The whole cellGcmSys 16-func import table (stub@0x160708, fnid@0xf22b8) is decoded in `_imports2.py`
+  output: e.g. `func_000F0B1C`=cellGcmAddressToOffset, `0B5C`=cellGcmBindTile, `0BFC`=cellGcmMapMainMemory,
+  `0C3C`=cellGcmSetTileInfo, `0C5C`=cellGcmGetConfiguration, `0C7C`=cellGcmGetLabelAddress.
+
+So `func_0003C148` is a real **RSX put/ref flip-sync**: `func_0003C0F4` writes put
+(`ctrl[0] = cellGcmAddressToOffset(...)`) and `func_0003C148` polls ref (`while (ctrl[8] != r31)`,
+target r31=1). The null return made `ctrl=0` → poll garbage → spin.
+
+**Fix implemented (real HLE, gated `GAMEWORLD_REAL_INIT`):**
+- `func_000F0C1C` now returns a real control block at guest `0x70E280` (`gcm_get_control_register()`
+  in runtime_glue.cpp; layout `{put@+0,get@+4,ref@+8}` big-endian).
+- The render tick advances `ref` by one per frame (`gcm_ctrl_advance_ref()` from
+  `render_thread_proc`), modelling RSX reaching each reference on the next flip. In the default
+  build `func_000F0C1C` returns 0 as before and `gcm_ctrl_advance_ref` is a no-op (ea stays 0) →
+  **baseline byte-identical, EXIT=0, 2566 lines.**
+
+**Result (GAMEWORLD + EVENTCYCLE_PROBE): init advances 5605 → 25770 stderr lines.** The flip-sync no
+longer spins; the **main init thread** now runs `func_0003AAC8`'s dispatch loop deep into real
+game-world/scene code and hits a NEW, much deeper AV:
+`func_0003AAC8 → func_00014390 → func_0004D454 → func_00068CC0 → func_00064A60 → func_00064974 →
+func_0006485C → func_00057988 → func_000D2D18 → vm_read32` reading **unmapped guest 0xFF79BD3C**
+(with the sign-extended-SP signature `gpr[1]=0xFFFFFFFFDFFFF940`). `func_00068xxx` is the geometry/
+scene math (int→float, sqrt, sin/cos) noted earlier — this looks like real scene construction.
+
+**Next:** classify the `0xFF79BD3C` read in `func_000D2D18` (lifter sign-extension bug vs
+uninitialised pointer — the `0xFF79xxxx` high word + sign-extended SP hint at an arithmetic/lifter
+issue, same family as the earlier surgical fixes), then continue the game-world bring-up from there.
