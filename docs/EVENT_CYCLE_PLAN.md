@@ -515,3 +515,47 @@ is presumably gated behind the orchestration threads completing, which the spin 
 Repro: set `#define GAMEWORLD_REAL_INIT 1` (ppu_recomp.cpp) + `#define EVENTCYCLE_PROBE 1`
 (main.cpp, or `-DEVENTCYCLE_PROBE`) + `#define GCM_SPIN_DETECT 1` (runtime_glue.cpp) to see the
 backtraces. All OFF by default; baseline stays clean (EXIT=0, ~2.5k lines).
+
+## Phase C — the spinner IDed: vblank-sync wait on a NULL object; func_000F0C1C misidentified
+
+Ran down the post-spawn spinner (added `SPIN-SYSCALL`/`SPIN-ICALL` detectors in `ps3_indirect_call`
++ `lv2_syscall`, gated `GCM_SPIN_DETECT`). Of the 21 spawned threads, **20 exit; THREAD 17 = the
+"Terminate Thread" (`func_00039E20`/`E24`) spins**. Exact stack:
+
+```
+func_00039E24 -> func_00026854 -> func_00026858 -> func_0002AF8C -> func_0002AF90 (display setup)
+             -> func_0003C148 -> lv2_syscall(sysnum=141, r3=0x1E)   [spin: syscall-yield loop]
+```
+
+`func_0003C148` is the **vblank-sync wait**: after `func_0003C0F0` (gets an object) + `func_000F0C1C`,
+it loops `while ([obj+0x8] != r31) { syscall 141; }` (r31 = target = 1). It reads `[obj+0x8]` via
+`vm_read32` each iteration but yields, so it never reaches the 80M `vm_read32` threshold — only the
+syscall detector (2M) caught it.
+
+**Root: `func_0003C0F0`→`func_0003C0F4`→`func_000F0C1C` returns obj = NULL.** With obj=0 the loop
+polls low-memory `[0x8]` (garbage bump-pointer from the earlier table build) which never equals 1
+(`[C148-VSYNC] obj=0x00000000 [obj+8]=0x0027F888 target=1`). Satisfying the wait (write `[obj+8]=r31`,
+gated probe in `func_0003C148`) lets the Terminate Thread **finish cleanly** ("all game threads
+finished") but produces **no** live handler and **no** menu — proof this whole chain is teardown
+running on a null object graph.
+
+**KEY CORRECTION — `func_000F0C1C` is NOT `cellGcmSetVBlankHandler`.** The earlier session
+(commit d44fc12) identified it as the vblank-handler setter and stubbed it to `gpr[3]=0`, reading the
+`handler_opd=0 [cleared]` log as "handler unregistered". But `func_0003C0F4` **uses `func_000F0C1C`'s
+return value as an allocated object pointer** (`r28 = r3`; later `[r28+0x0] = ...`; returns `r28`).
+So `func_000F0C1C` is really an **object allocator / getter** in the display-setup path; stubbing it
+to 0 is exactly why the vblank object graph is null. The `g_vblank_handler_opd` capture is therefore
+capturing the wrong thing.
+
+**Next layer (deeper object-graph bring-up):**
+1. Identify `func_000F0C1C`'s real import (NID) — it returns an allocated display/vblank object, not
+   a CELL_OK. Same for `func_000F0B1C` (called right after in `func_0003C0F4`, writes `[obj+0]`).
+2. Make it return a real object (allocate a small struct; populate `[obj+0x8]` as the vblank counter).
+   Then `func_0003C148`'s wait becomes real: drive `[obj+0x8]` from the 30 fps `cellGcmTickVBlank`.
+3. Re-check whether "Regist Context Thread" (`func_000313B0`) then does real work — its imports
+   `func_000F14BC/151C/15FC/20DC` are also one-line `gpr[3]=0` stubs, so it currently no-ops+exits;
+   they likely need real implementations too (the orchestration threads spawn but are hollow).
+
+Gated artifacts kept (all OFF by default): `[0x27F868]` force (`EVENTCYCLE_PROBE`, main.cpp);
+`func_0003C148` vsync-wait satisfy (`GAMEWORLD_REAL_INIT`); `SPIN-SYSCALL`/`SPIN-ICALL` detectors
+(`GCM_SPIN_DETECT`). Baseline verified clean (EXIT=0, ~2.5k lines).

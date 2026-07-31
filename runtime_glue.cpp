@@ -1127,6 +1127,22 @@ extern "C" void vm_write64(uint64_t addr, uint64_t val) {
 extern "C" void lv2_syscall(ppu_context* ctx) {
     uint32_t sysnum = (uint32_t)ctx->gpr[11];
 
+#ifdef GCM_SPIN_DETECT
+    /* Catch a syscall-driven spin (e.g. a yield/usleep wait loop) that makes no
+     * vm_read* or indirect call — invisible to the other detectors. */
+    {
+        static thread_local uint64_t s_sc = 0;
+        static thread_local int s_dumps = 0;
+        if (++s_sc >= 2000000u && s_dumps < 6) {
+            s_sc = 0; s_dumps++;
+            fprintf(stderr, "[SPIN-SYSCALL] burst (dump #%d, sysnum=%u r3=0x%llX) — backtrace:\n",
+                    s_dumps, sysnum, (unsigned long long)ctx->gpr[3]);
+            fflush(stderr);
+            ps3_debug_backtrace("SPIN-SYSCALL");
+        }
+    }
+#endif
+
     switch (sysnum) {
 
     /* ---- Threading -------------------------------------------------------- */
@@ -1734,6 +1750,21 @@ extern "C" void ps3_indirect_call(ppu_context* ctx) {
                 (unsigned long long)ctx->gpr[3],
                 (unsigned long long)ctx->gpr[4]);
     }
+#ifdef GCM_SPIN_DETECT
+    /* Catch a spin loop that dispatches indirectly (e.g. through a null vtable):
+     * such loops make no vm_read* call, so the read-based detectors miss them. */
+    {
+        static thread_local uint64_t s_ic = 0;
+        static thread_local int s_dumps = 0;
+        if (++s_ic >= 5000000u && s_dumps < 6) {
+            s_ic = 0; s_dumps++;
+            fprintf(stderr, "[SPIN-ICALL] burst (dump #%d, CTR=0x%08llX r3=0x%llX) — backtrace:\n",
+                    s_dumps, (unsigned long long)ctx->ctr, (unsigned long long)ctx->gpr[3]);
+            fflush(stderr);
+            ps3_debug_backtrace("SPIN-ICALL");
+        }
+    }
+#endif
     auto fn = ppu_resolve_addr(ctx->ctr);
     if (!fn) fn = ppu_resolve_extra(ctx->ctr);
     if (fn) {
