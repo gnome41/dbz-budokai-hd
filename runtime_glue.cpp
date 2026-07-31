@@ -1790,6 +1790,20 @@ extern "C" void ps3_indirect_call(ppu_context* ctx) {
             ps3_debug_backtrace("SPIN-ICALL");
         }
     }
+    /* TOC-corruption detector: inline indirect calls load gpr[2] = [OPD+4] just
+     * before calling here, so a gpr[2] outside the static-data range means this
+     * call's OPD had a garbage TOC field — the corruption point. */
+    {
+        uint32_t toc = (uint32_t)ctx->gpr[2];
+        static thread_local int s_toc_dumps = 0;
+        if ((toc < 0x10000u || toc >= 0x200000u) && s_toc_dumps < 8) {
+            s_toc_dumps++;
+            fprintf(stderr, "[BAD-TOC] indirect call with gpr[2]=0x%08X CTR=0x%08llX — backtrace:\n",
+                    toc, (unsigned long long)ctx->ctr);
+            fflush(stderr);
+            ps3_debug_backtrace("BAD-TOC");
+        }
+    }
 #endif
     auto fn = ppu_resolve_addr(ctx->ctr);
     if (!fn) fn = ppu_resolve_extra(ctx->ctr);

@@ -598,3 +598,34 @@ scene math (int→float, sqrt, sin/cos) noted earlier — this looks like real s
 **Next:** classify the `0xFF79BD3C` read in `func_000D2D18` (lifter sign-extension bug vs
 uninitialised pointer — the `0xFF79xxxx` high word + sign-extended SP hint at an arithmetic/lifter
 issue, same family as the earlier surgical fixes), then continue the game-world bring-up from there.
+
+## Phase C — the func_000D2D18 AV is TOC CORRUPTION (gpr[2] clobbered to a heap ptr)
+
+Classified. `func_000D2D18` is a SWAR string-copy (`0x7F7F7F7F` terminator detect); it faulted
+reading its source `r4=0xFF79BD3C`. Tracing the source up the chain
+(`func_000D2D18` ← `func_00057988` ← `func_0006485C` ← `func_00064974`): `func_00064974` loads the
+source string from a **TOC-relative global**, `r3 = [gpr[2] - 0x758C]`. The **static** value there
+(with the real TOC `0x16A0F8`) is `0xFD780` → a valid error string
+`"E2005102102 : svm_enterCriticalSection :"`. But the AV register dump shows **`gpr[2]=0x008260F0`**
+— a **heap** pointer, not the TOC. So `[0x8260F0-0x758C]` reads heap garbage `0xFF79BD3C`.
+
+=> The root is **TOC (gpr[2]) corruption**, not a bad data field. Once gpr[2] is wrong, every
+TOC-relative dispatch loads garbage function pointers, derailing control flow into the error-report
+code (the `svm_enterCriticalSection` string is a *symptom* of the derailment, not necessarily a real
+assert). This is the true blocker behind the 25770-line frontier.
+
+**Where the TOC is clobbered — NOT via an indirect call.** Added a `[BAD-TOC]` detector in
+`ps3_indirect_call` (gated `GCM_SPIN_DETECT`): inline indirect calls set `gpr[2]=[OPD+4]` just before
+calling it, so a bad gpr[2] there = a garbage OPD TOC field. It fired only for the benign
+`gpr[2]=0 / CTR=0` null-vtable dispatches — **never** for `0x8260F0`. So gpr[2] is corrupted through a
+**direct-call path** or a **clobbered r2 save/restore slot** (`[sp+0x28]`), not an OPD load. The
+sign-extended SP (`gpr[1]=0xFFFFFFFF_DFFFF940`) is a prime suspect: if any 64-bit SP arithmetic or a
+frame-overlap lands a callee write on the caller's saved-r2 slot, the restored TOC is garbage.
+
+**Next (TOC-clobber hunt):** binary-search the chain
+`func_0003AAC8 → func_00014390 → func_0004D454 → func_00068CC0 → func_00068B7C → func_00064A60 →
+func_00064974` by logging `gpr[2]` at each entry (only when `>= 0x200000`) to localize where it flips
+from `0x16A0F8` to `0x8260F0`; then inspect that function's r2 save/restore (`vm_write64(sp+0x28,r2)` /
+`vm_read64(sp+0x28)`) and its SP handling for the clobber. This is the deep game-world bring-up grind
+the plan predicted (one root at a time). Baseline stays clean (EXIT=0, ~2.5k lines); `[BAD-TOC]`
+detector kept gated under `GCM_SPIN_DETECT`.
