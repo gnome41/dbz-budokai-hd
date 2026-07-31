@@ -18,7 +18,13 @@ extern "C" {
 #define SPU_LS_SIZE     (256 * 1024)   /* 256 KB local store */
 #define SPU_MAX_THREADS 8              /* max concurrent virtual SPUs */
 
-/* ---- 128-bit register ---------------------------------------------------- */
+/* ---- 128-bit register ----------------------------------------------------
+ * STORAGE CONVENTION: registers hold the 16 bytes in SPU (big-endian) order:
+ * u8[0] is SPU byte 0 (the most-significant byte of word element 0, the
+ * "preferred slot").  Loads/stores/DMA are therefore raw byte copies.
+ * Word/halfword ELEMENT values must be accessed through spu_reg_get_w /
+ * spu_reg_set_w (and the _h variants) which byte-swap on little-endian
+ * hosts.  Do NOT read .u32[i] directly for element values.               */
 typedef union {
     uint8_t  u8[16];
     uint16_t u16[8];
@@ -31,6 +37,24 @@ typedef union {
     float    f32[4];
     double   f64[2];
 } spu_reg_t;
+
+/* Element accessors (SPU-logical numbering: word 0 = bytes 0-3, BE) */
+static inline uint32_t spu_reg_get_w(const spu_reg_t *r, int i) {
+    const uint8_t *p = r->u8 + 4*i;
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+static inline void spu_reg_set_w(spu_reg_t *r, int i, uint32_t v) {
+    uint8_t *p = r->u8 + 4*i;
+    p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)v;
+}
+static inline uint16_t spu_reg_get_h(const spu_reg_t *r, int i) {
+    const uint8_t *p = r->u8 + 2*i;
+    return (uint16_t)(((uint16_t)p[0]<<8)|p[1]);
+}
+static inline void spu_reg_set_h(spu_reg_t *r, int i, uint16_t v) {
+    uint8_t *p = r->u8 + 2*i;
+    p[0]=(uint8_t)(v>>8); p[1]=(uint8_t)v;
+}
 
 /* ---- SPU context ---------------------------------------------------------- */
 typedef struct spu_ctx {

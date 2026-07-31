@@ -27,6 +27,11 @@ stderr.txt
 *.log
 run_*.txt
 _commitmsg.txt
+# Ad-hoc diagnostic dumps (disassembly / trace scratch); analysis *scripts* are kept
+_dtrace.txt
+_spin.txt
+_spurs_disasm_*.txt
+_spurs_kernel_ls.bin
 
 # Editor / OS
 .vs/

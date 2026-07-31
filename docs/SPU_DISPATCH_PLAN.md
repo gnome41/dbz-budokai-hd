@@ -74,6 +74,54 @@ until a real path fully replaces it.
   game flow; the real kernel dispatches them. At this point the SPURS-coupled init
   completes naturally and the event cycle / menu path becomes reachable.
 
+## S2 RESULT (landed) — faithful interpreter + real kernel loop
+
+**The interpreter was systematically misdecoding.** Audited against the
+binutils/RPCS3 canonical SPU opcode table, the original `spu_interp.cpp` had a
+wrong opcode map plus three core defects: RRR-format destination/RC fields
+swapped (so `selb`/`shufb`/`fma`/`fms`/`fnms`/`mpya` wrote the wrong register,
+and `selb`↔`shufb` were transposed); `lqd`/`stqd` raw-copied big-endian LS bytes
+while the arithmetic ops read `u32` lanes host-native (every value loaded from LS
+data arrived byte-swapped); and `shufb` control-byte semantics were wrong.
+
+`spu_interp.cpp` was rewritten from that canonical table (register storage now
+documented as raw SPU byte order; element access via `spu_reg_get_w/set_w` etc.
+in `spu_interp.h`). Result: **zero UNIMPL opcodes**, and the SPURS kernel now
+runs its **real** logic instead of the panic spin the misdecode produced.
+
+Findings from the faithful run (all the old CLAUDE.md dispatch notes — `r79`/
+`r33`/`r36`/`selb r42`, the `ilh r2,1` type-check hack, the `LS[0x3BC]/[0x3C0]`
+"brhnz→lnop" patches, the EDGE return-register values — were artifacts of the
+misdecode and are now **obsolete/unreliable**):
+
+- **Management-area EA contract:** kernel main (LS[0x19C28]) validates arg1 with
+  `shlqbyi r4,r3,2; ceqi r2,r4,0x30` — it requires the management-area EA to have
+  the form `0x0030xxxx`. The old `0x70A000` EA failed this and parked the kernel
+  at the panic loop LS[0x19C98]. Arg1 is passed in the register's **preferred
+  doubleword** (r3 bytes 4-7, big-endian), not word 0.
+- With EA = `0x300000` the kernel enters its **authentic dispatch/poll loop**:
+  DMA-GET the management/control block → `rdch MFC_RdTagStat` → `wrch` outbound
+  mailbox (ch 28) + outbound-intr mailbox (ch 30) → `rdch` inbound mailbox
+  (ch 29, blocks) → `rdch SigNotify1` (ch 3) → loop; then `stop 0` (yield to PPU)
+  when no work is present. **No lnop force-march, no fake type field.**
+- The `LS[0x17C]`/`[0x3BC]`/`[0x3C0]` patches are now gated behind
+  `SPURS_LEGACY_LS_PATCHES` (default OFF) — under the faithful decode 0x3BC/0x3C0
+  are `stqr` stores, not branches.
+- The synthetic EDGE dispatch (`spurs_run_workload`, driven by the old fake
+  dispatch stops at LS[0x04..0x3C]) no longer fires. **The sphere render is
+  unaffected** — `spurs_render_sphere_tick()` runs on the independent
+  `render_thread_proc` timer and writes `0xD0180000` directly. No regression.
+
+**Status vs the S2 exit criterion:** the kernel's *own* dispatch logic runs with
+no force-march (criterion largely met), but it does not yet *select a workload*
+because (a) the management block at `0x300000` is zeroed BSS — the DMA-GET reads
+a null control pointer (`ea=0`), and (b) no PPU mailbox signal arrives. Closing
+that is S3/S4: populate a real management/instance block and wire the PPU→SPU
+mailbox (`sys_spu_thread_write_spu_mb`) so `rdch InMbox` unblocks with a real
+command. The hard "is the dispatch math tractable" question is answered **yes** —
+it's a normal DMA + mailbox handshake, not the opaque `selb r42` puzzle the
+misdecode made it look like.
+
 ## Exit criterion for "worth continuing"
 
 After **S2** we'll know if the kernel's real dispatch is tractable to drive (the

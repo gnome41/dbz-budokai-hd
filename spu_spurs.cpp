@@ -47,6 +47,12 @@ extern "C" volatile bool g_threads_should_exit;
  *   byte[2]=0x0A (bits[23:20]=0 ✓), byte[3]=0x70 (bits[15:12]=0 ✓). */
 #define SPURS_CTX_EA   0x70A000u
 
+/* Management-area EA passed to the SPURS kernel (arg1).  The embedded kernel
+ * hard-requires EA>>16 == 0x30 (see spurs_start).  0x300000 is a probe value
+ * inside committed main RAM / game BSS; refine once the real instance address
+ * is identified. */
+#define SPURS_KERNEL_MGMT_EA  0x300000u
+
 static spu_ctx_t g_spurs_ctx;
 static int       g_spurs_started = 0;
 
@@ -149,14 +155,14 @@ static void spurs_run_workload(int slot_idx) {
      *   rotmai r0, r19,  0   → r0 = r19 >> 0    (shift=0, direct copy)
      *   rotmai r0, r114, 56  → r0 = r114 >> 8   (shift=8)
      * For all three to give r0=0x40 (our stop-0x100 sentinel): */
-    g_wl_ctx.gpr[3].u32[0]   = SPURS_CTX_EA;  /* SPURS management area EA */
-    g_wl_ctx.gpr[0].u32[0]   = 0x40;           /* initial r0 (overwritten by rotmai) */
-    g_wl_ctx.gpr[88].u32[0]  = 0x80;   /* r88>>1  = 0x40 */
-    g_wl_ctx.gpr[19].u32[0]  = 0x40;   /* r19>>0  = 0x40 */
-    g_wl_ctx.gpr[114].u32[0] = 0x4000; /* r114>>8 = 0x40 */
+    spu_reg_set_w(&g_wl_ctx.gpr[3],   0, SPURS_CTX_EA);  /* SPURS management area EA */
+    spu_reg_set_w(&g_wl_ctx.gpr[0],   0, 0x40);    /* initial r0 (overwritten by rotmai) */
+    spu_reg_set_w(&g_wl_ctx.gpr[88],  0, 0x80);    /* r88>>1  = 0x40 */
+    spu_reg_set_w(&g_wl_ctx.gpr[19],  0, 0x40);    /* r19>>0  = 0x40 */
+    spu_reg_set_w(&g_wl_ctx.gpr[114], 0, 0x4000);  /* r114>>8 = 0x40 */
     /* Also copy the kernel's return-addr pattern for safety */
-    g_wl_ctx.gpr[86].u32[0] = 0x80;
-    g_wl_ctx.gpr[89].u32[0] = 0x80;
+    spu_reg_set_w(&g_wl_ctx.gpr[86], 0, 0x80);
+    spu_reg_set_w(&g_wl_ctx.gpr[89], 0, 0x80);
 
     /* Mechanism: first pass stores r0=0x40 to stack (stqd r0, 0x10(r1)),
      * then allocates frame (ai r1, r1, -32), issues stop-0x3FFF.
@@ -185,7 +191,7 @@ static void spurs_run_workload(int slot_idx) {
                 /* Yield — restart from current PC */
                 fprintf(stderr, "[WL] slot %d restart %d at PC=0x%X r3=0x%X r4=0x%X\n",
                         slot_idx, wl_restart+1, g_wl_ctx.pc,
-                        g_wl_ctx.gpr[3].u32[0], g_wl_ctx.gpr[4].u32[0]);
+                        spu_reg_get_w(&g_wl_ctx.gpr[3], 0), spu_reg_get_w(&g_wl_ctx.gpr[4], 0));
                 fflush(stderr);
                 if (g_wl_ctx.pc >= 0x20000u) {
                     fprintf(stderr, "[WL] slot %d: BSS idle at 0x%X — done\n",
@@ -218,21 +224,12 @@ static void spurs_run_workload(int slot_idx) {
                  * Write a synthetic task descriptor at LS[r4] and jump to the geometry
                  * processor at LS[0x3108] so it runs during each SPURS dispatch cycle.
                  *
-                 * Descriptor EA fields are stored LITTLE-ENDIAN: the geometry processor
-                 * reads them with LE byte-ordering.  Use le32() so the desired EA is
-                 * preserved exactly. */
-                uint32_t desc_ls = g_wl_ctx.gpr[4].u32[0];  /* = 0xADD0 */
+                 * Descriptor fields are big-endian (the old LE compensation existed
+                 * only because the pre-rewrite interpreter loaded LS data byte-swapped). */
+                uint32_t desc_ls = spu_reg_get_w(&g_wl_ctx.gpr[4], 0);  /* = 0xADD0 */
                 uint32_t src_ea  = 0x70C000u;   /* DMA GET source — synthetic SPURS area (safe, not in ELF BSS) */
                 uint32_t out_ea  = 0xD0100000u; /* RSX IO command buffer — geometry output */
 
-                /* little-endian store helper for descriptor EA fields */
-                auto le32 = [&](uint32_t off, uint32_t v) {
-                    g_wl_ctx.ls[off+0] = (uint8_t)(v);
-                    g_wl_ctx.ls[off+1] = (uint8_t)(v >> 8);
-                    g_wl_ctx.ls[off+2] = (uint8_t)(v >> 16);
-                    g_wl_ctx.ls[off+3] = (uint8_t)(v >> 24);
-                };
-                /* big-endian store for non-EA fields */
                 auto be32 = [&](uint32_t off, uint32_t v) {
                     g_wl_ctx.ls[off+0] = (uint8_t)(v>>24);
                     g_wl_ctx.ls[off+1] = (uint8_t)(v>>16);
@@ -240,8 +237,8 @@ static void spurs_run_workload(int slot_idx) {
                     g_wl_ctx.ls[off+3] = (uint8_t)(v);
                 };
                 be32(desc_ls+ 0, 0u);
-                le32(desc_ls+ 4, src_ea);   /* source geometry EA (LE) */
-                le32(desc_ls+ 8, out_ea);   /* output buffer EA (LE) */
+                be32(desc_ls+ 4, src_ea);   /* source geometry EA */
+                be32(desc_ls+ 8, out_ea);   /* output buffer EA */
                 be32(desc_ls+12, 0u);
 
                 /* Fill stream descriptor at src_ea (16 KB at 0x70C000).
@@ -273,17 +270,18 @@ static void spurs_run_workload(int slot_idx) {
 
                     p[0x63] = 0x20;  /* AND-check: bit 5 set → EDGE proceeds */
 
-                    /* Vertex data EA at descriptor offset 0x3144 (LE u32).
+                    /* Vertex data EA at descriptor offset 0x3144 (big-endian u32; was
+                     * LE only to compensate for the pre-rewrite byte-swapped loads).
                      * EDGE stream slot 1 (LS[0x13030], stride 0x10000) reads its GET EA
                      * from bytes[4..7] = descriptor[0x3144..0x3147].  Only slot 1 is
                      * populated; slots 0 (LS[0x134] FP constants) and 2-3 (null) keep
                      * their ELF-initialised values so the 2-round termination loop fires.
                      * Buffer must be past the 16KB descriptor end (0x70FFFF). */
                     const uint32_t VTXBUF_EA = 0x710000u;
-                    p[0x3144] = (uint8_t)(VTXBUF_EA);
-                    p[0x3145] = (uint8_t)(VTXBUF_EA >> 8);
-                    p[0x3146] = (uint8_t)(VTXBUF_EA >> 16);
-                    p[0x3147] = (uint8_t)(VTXBUF_EA >> 24);
+                    p[0x3144] = (uint8_t)(VTXBUF_EA >> 24);
+                    p[0x3145] = (uint8_t)(VTXBUF_EA >> 16);
+                    p[0x3146] = (uint8_t)(VTXBUF_EA >> 8);
+                    p[0x3147] = (uint8_t)(VTXBUF_EA);
 
                     /* Generate sphere vertices at VTXBUF_EA: float4 XYZW BE, 16 bytes/vertex.
                      * Rotates each dispatch so rsx_process_edge renders an animated sphere. */
@@ -335,8 +333,8 @@ static void spurs_run_workload(int slot_idx) {
                 }
 
                 /* Redirect to geometry processor entry */
-                g_wl_ctx.gpr[3].u32[0]  = desc_ls;
-                g_wl_ctx.gpr[87].u32[0] = desc_ls;  /* ori r87, r3, 0 at 0x310C */
+                spu_reg_set_w(&g_wl_ctx.gpr[3],  0, desc_ls);
+                spu_reg_set_w(&g_wl_ctx.gpr[87], 0, desc_ls);  /* ori r87, r3, 0 at 0x310C */
                 g_wl_ctx.pc      = 0x3108;
                 g_wl_ctx.running = 1;
 
@@ -453,10 +451,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID) {
                     /* BSS idle or kernel return: restart from entry. */
                     if (g_spurs_entry_pc) {
                         g_spurs_ctx.pc = g_spurs_entry_pc;
-                        g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
-                        g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;
-                        g_spurs_ctx.gpr[4].u32[0] = 0;
-                        g_spurs_ctx.gpr[0].u32[0] = 0x40;
+                        memset(&g_spurs_ctx.gpr[3], 0, 16);
+                        spu_reg_set_w(&g_spurs_ctx.gpr[3], 1, SPURS_KERNEL_MGMT_EA);
+                        memset(&g_spurs_ctx.gpr[4], 0, 16);
+                        spu_reg_set_w(&g_spurs_ctx.gpr[0], 0, 0x40);
                         uint8_t s[4] = {0x00, 0x00, 0x01, 0x00};
                         memcpy(g_spurs_ctx.ls + 0x40, s, 4);
                     }
@@ -469,10 +467,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID) {
                 /* Kernel returned → restart from entry */
                 if (g_spurs_entry_pc) {
                     g_spurs_ctx.pc = g_spurs_entry_pc;
-                    g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
-                    g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;
-                    g_spurs_ctx.gpr[4].u32[0] = 0;
-                    g_spurs_ctx.gpr[0].u32[0] = 0x40;
+                    memset(&g_spurs_ctx.gpr[3], 0, 16);
+                    spu_reg_set_w(&g_spurs_ctx.gpr[3], 1, SPURS_KERNEL_MGMT_EA);
+                    memset(&g_spurs_ctx.gpr[4], 0, 16);
+                    spu_reg_set_w(&g_spurs_ctx.gpr[0], 0, 0x40);
                     uint8_t s[4] = {0x00, 0x00, 0x01, 0x00};
                     memcpy(g_spurs_ctx.ls + 0x40, s, 4);
                 }
@@ -542,16 +540,15 @@ extern "C" void spurs_start(void) {
      * (= bi r0) lands on our recognisable sentinel. */
     uint8_t stop100[4] = {0x00, 0x00, 0x01, 0x00};  /* stop 0x100 */
     memcpy(g_spurs_ctx.ls + 0x40, stop100, 4);
-    g_spurs_ctx.gpr[0].u32[0] = 0x40;  /* r0 = return address = LS[0x40] */
+    spu_reg_set_w(&g_spurs_ctx.gpr[0], 0, 0x40);  /* r0 = return address = LS[0x40] */
 
-    /* Patch LS[0x17C]: replace ceqi r2, r4, 8 with ilh r2, 1 to force the
-     * dispatch branch at LS[0x184] (brnz r2, dispatch).
-     *
-     * The ceqi check extracts a type field from the SPURS EA via rothi+rotqbybi.
-     * For it to pass naturally, SPURS_CTX_EA bits[23:20] must be 0 (need
-     * r11.u8[2]=0 after rothi), but 0x70A000 has bits[23:20]=7 — same as
-     * 0x700000.  Option B: ilh r2, 1 (= 0x40000082, op7=0x20 I16=1 RT=2)
-     * sets r2.u32[0]=0x00010001 ≠ 0 → brnz always fires. */
+    /* LEGACY LS instruction patches — calibrated against the PRE-REWRITE
+     * (misdecoding) interpreter.  Under the faithful decode:
+     *   0x17C is ceqi r2, r4, 8 (type check) — the ilh patch force-passes it;
+     *   0x3BC/0x3C0 are stqr r12/r13 stores (NOT branches) — lnop skips them.
+     * Default OFF since the interpreter rewrite; define to re-enable. */
+/* #define SPURS_LEGACY_LS_PATCHES 1 */
+#ifdef SPURS_LEGACY_LS_PATCHES
     {
         uint32_t ilh_r2_1 = 0x40000082u;
         g_spurs_ctx.ls[0x17C] = (uint8_t)(ilh_r2_1 >> 24);
@@ -583,16 +580,23 @@ extern "C" void spurs_start(void) {
         fprintf(stderr, "[SPURS] patched LS[0x03BC] brhnz-r36 → lnop\n");
         fprintf(stderr, "[SPURS] patched LS[0x03C0] brhnz-r33 → lnop (force dispatch)\n");
     }
+#endif /* SPURS_LEGACY_LS_PATCHES */
 
-    /* Set up initial arguments:
-     *   GPR[3] = EA of SPURS management area (low 32 bits)
-     *   GPR[4] = EA high 32 bits (always 0 on PS3)
-     * The SPURS kernel DMA's the management area from this EA into its LS. */
-    g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
-    g_spurs_ctx.gpr[3].u32[1] = 0;
-    g_spurs_ctx.gpr[3].u32[2] = 0;
-    g_spurs_ctx.gpr[3].u32[3] = 0;
-    g_spurs_ctx.gpr[4].u32[0] = 0;  /* EA high = 0 */
+    /* Set up initial arguments (LV2 convention: each 64-bit SPU-thread arg is
+     * placed in the register's preferred doubleword, bytes 0-7 big-endian):
+     *   GPR[3].dword0 = arg1 = EA of the SPURS management area
+     *   GPR[4..6]     = arg2..arg4 (zero until decoded)
+     *
+     * DISCOVERY (faithful-interpreter S2 trace): kernel main at LS[0x19C28]
+     * validates the EA with `shlqbyi r4,r3,2; ceqi r2,r4,0x30` — i.e. it
+     * REQUIRES EA>>16 == 0x30 (management area inside guest 0x300000-0x30FFFF,
+     * game BSS).  The old 0x70A000 EA parked the kernel at the panic loop
+     * LS[0x19C98].  Probe EA below; DMA GETs reveal the expected layout. */
+    memset(&g_spurs_ctx.gpr[3], 0, 16);
+    spu_reg_set_w(&g_spurs_ctx.gpr[3], 1, SPURS_KERNEL_MGMT_EA);
+    memset(&g_spurs_ctx.gpr[4], 0, 16);
+    memset(&g_spurs_ctx.gpr[5], 0, 16);
+    memset(&g_spurs_ctx.gpr[6], 0, 16);
 
     /* The kernel encodes the return address across three rotmai instructions:
      *   LS[0x138]: rotmai r0, r86, 511  → r0 = r86 >> 1   (sh=1)
@@ -614,20 +618,13 @@ extern "C" void spurs_start(void) {
      *
      * Path 2 (LS[0x022C..0x027C], second code region):
      *   LS[0x0254]: rotmi r0, r89, I7=127 → sh=1   → r89=0x40<<1=0x80 */
-    g_spurs_ctx.gpr[86].u32[0] = 0x80;     /* r86 >> 1  = 0x40 (LS[0x138]) */
-    g_spurs_ctx.gpr[70].u32[0] = 0x20000;  /* r70 >> 11 = 0x40 (LS[0x150]) */
-    g_spurs_ctx.gpr[89].u32[0] = 0x80;     /* r89 >> 1  = 0x40 (LS[0x254]) */
-    g_spurs_ctx.gpr[86].u32[1] = 0;
-    g_spurs_ctx.gpr[86].u32[2] = 0;
-    g_spurs_ctx.gpr[86].u32[3] = 0;
+    memset(&g_spurs_ctx.gpr[86], 0, 16);
+    spu_reg_set_w(&g_spurs_ctx.gpr[86], 0, 0x80);     /* r86 >> 1  = 0x40 (LS[0x138]) */
+    spu_reg_set_w(&g_spurs_ctx.gpr[70], 0, 0x20000);  /* r70 >> 11 = 0x40 (LS[0x150]) */
+    spu_reg_set_w(&g_spurs_ctx.gpr[89], 0, 0x80);     /* r89 >> 1  = 0x40 (LS[0x254]) */
 
-    /* SPURS type field encoded in r3 upper word.
-     * The kernel does: r11=rothi(r3,12); r4=rotqbybi(r11,sh=15); ceqi r2,r4,8.
-     * For ceqi to pass, r4.u32[0] must equal 8.
-     * Working backwards: r4.u32[0]=8 requires r11.byte[15]=0x08, which requires
-     * r3.u16[7]=0x8000 (rotate(0x8000,12)→0x0800, high byte=0x08).
-     * r3.u16[7]=0x8000 means r3.u32[3]=0x80000000 in LE host storage. */
-    g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;  /* SPURS type=8 in high word of r3 */
+    /* (The old "SPURS type=8 in r3 word 3" hack was an artifact of the
+     * pre-rewrite misdecode — removed.) */
 
     /* Run synchronously for a diagnostic burst so we can see the first DMA
        operations regardless of thread scheduling latency.  After this burst
@@ -648,8 +645,9 @@ extern "C" void spurs_start(void) {
             if (code == 0) {
                 /* SPURS idle — continue from current PC */
                 fprintf(stderr, "[SPURS] restart %d (idle) at PC=0x%X insns=%u r0=0x%X r4=0x%X\n",
-                        restart+1, g_spurs_ctx.pc, total, g_spurs_ctx.gpr[0].u32[0],
-                        g_spurs_ctx.gpr[4].u32[0]);
+                        restart+1, g_spurs_ctx.pc, total,
+                        spu_reg_get_w(&g_spurs_ctx.gpr[0], 0),
+                        spu_reg_get_w(&g_spurs_ctx.gpr[4], 0));
                 fflush(stderr);
                 /* Dispatch signal: kernel stopped at LS[0x04..0x3C] = "run workload".
                  * These 15 stops are the kernel signalling LV2 to start workload threads. */
@@ -694,10 +692,10 @@ extern "C" void spurs_start(void) {
                 g_spurs_ctx.pc = entry_pc;
                 g_spurs_ctx.running = 1;
                 /* Reset initial arguments for the new dispatch cycle */
-                g_spurs_ctx.gpr[3].u32[0] = SPURS_CTX_EA;
-                g_spurs_ctx.gpr[3].u32[3] = 0x80000000u;  /* preserve type field */
-                g_spurs_ctx.gpr[4].u32[0] = 0;
-                g_spurs_ctx.gpr[0].u32[0] = 0x40;  /* restore return addr */
+                memset(&g_spurs_ctx.gpr[3], 0, 16);
+                spu_reg_set_w(&g_spurs_ctx.gpr[3], 1, SPURS_KERNEL_MGMT_EA);
+                memset(&g_spurs_ctx.gpr[4], 0, 16);
+                spu_reg_set_w(&g_spurs_ctx.gpr[0], 0, 0x40);  /* restore return addr */
                 /* Re-place sentinel (kernel may have overwritten LS[0x40]) */
                 uint8_t s[4] = {0x00, 0x00, 0x01, 0x00};
                 memcpy(g_spurs_ctx.ls + 0x40, s, 4);
@@ -772,17 +770,17 @@ extern "C" void spurs_test_edge_geometry(void) {
     g_wl_ctx.ls[desc_ea+7] = (src_ea)       & 0xFF;
 
     /* r3 = descriptor address; r87 = r3 (saved by ori r87, r3, 0) */
-    g_wl_ctx.gpr[3].u32[0]  = desc_ea;
-    g_wl_ctx.gpr[87].u32[0] = desc_ea;
+    spu_reg_set_w(&g_wl_ctx.gpr[3],  0, desc_ea);
+    spu_reg_set_w(&g_wl_ctx.gpr[87], 0, desc_ea);
 
     /* Stack: r1 = 0x2000 (valid area below code at 0x3000) */
-    g_wl_ctx.gpr[1].u32[0] = 0x2000u;
+    spu_reg_set_w(&g_wl_ctx.gpr[1], 0, 0x2000u);
 
     /* Return: set r0=0x40 (sentinel), use same rotmai pattern */
-    g_wl_ctx.gpr[0].u32[0]   = 0x40;
-    g_wl_ctx.gpr[88].u32[0]  = 0x80;
-    g_wl_ctx.gpr[19].u32[0]  = 0x40;
-    g_wl_ctx.gpr[114].u32[0] = 0x4000;
+    spu_reg_set_w(&g_wl_ctx.gpr[0],   0, 0x40);
+    spu_reg_set_w(&g_wl_ctx.gpr[88],  0, 0x80);
+    spu_reg_set_w(&g_wl_ctx.gpr[19],  0, 0x40);
+    spu_reg_set_w(&g_wl_ctx.gpr[114], 0, 0x4000);
     uint8_t s100[4] = {0x00, 0x00, 0x01, 0x00};
     memcpy(g_wl_ctx.ls + 0x40, s100, 4);
 
