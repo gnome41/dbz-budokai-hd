@@ -470,3 +470,48 @@ function that registers a *live* vblank handler + creates the menu scene (distin
 `func_0002AF90` we currently reach), and either fix the gate that skips it or invoke it directly after
 init, then let the existing 30 fps `cellGcmTickVBlank` drive it. `g_vblank_handler_opd` capture
 (`func_000F0C1C`, committed) is already in place to receive a real handler once that path runs.
+
+---
+
+# Phase C — vblank-registration wall cleared; orchestration threads now spawn (2026-07-31)
+
+After the faithful SPU-interpreter rewrite (S2, commit 8378ea2), re-running with
+`GAMEWORLD_REAL_INIT` on advanced the frontier substantially. Two findings:
+
+**1. The live vblank-registration chain now runs and hits a real handshake wait.** With the
+faithful interpreter, `func_0003AAC8 → func_00027044 (un-stubbed live vblank registration) →
+func_0002B6D0 → func_00027E50 → func_00027D0C` reaches `func_000CCD3C`, which **spin-yields
+waiting for `[0x27F868]` to become non-zero** (backtrace via `GCM_SPIN_DETECT`). `func_000CCD3C`
+is a yield-poll: `r31 = r3 = 0x27F83C` (a fixed global SPURS descriptor = `0x280000-0x7C4`);
+it loops `while ([r31+0x2C] == 0) { syscall 0x8D; }` — i.e. waits for field `+0x2C` (`[0x27F868]`),
+a "ready" flag, which no reached code sets.
+
+**2. Forcing `[0x27F868]=1` spawns the real orchestration threads.** Writing the flag at startup
+(gated `EVENTCYCLE_PROBE` in `main.cpp`, enable with `GAMEWORLD_REAL_INIT`) advances the
+registration past that wait; the existing `[FORCE-SPAWN]` path (thread-mgr `0x8003E0`) then creates
+**"Initialize Thread"** (code `0x31364` → body `func_00031368`) and **"Regist Context Thread"**
+(code `0x313AC` → body `func_000313B0`) — **two of the three Phase-A orchestration threads** that
+were the whole blocker. Thread count jumps 7 → 21; audio middleware threads (`cri_adxm_*`) and the
+SDU workers spawn too. This is the closest the port has come to the live event cycle.
+
+**Current blocker (new frontier):** after spawning, one thread busy-spins at ~100% of a core, but
+**not** through `vm_read8/16/32/64` (the `GCM_SPIN_DETECT` counters never trip) — so it is a
+host-side wait inside a runtime import, not a lifted poll. The orchestration-thread bodies
+themselves are short: `func_00031368` and `func_000313B0` each read the globals `[0x27F880]`/
+`[0x27F884]` (+`[0x254C48]`) and call `sys` imports `func_000F151C`/`14BC`/`15FC`/`20DC` then exit.
+The spinner is inside one of those imports (a lock/cond/join wait). Also: the vblank handler is
+still only ever **cleared** (`cellGcmSetVBlankHandler(handler=0)`) — the *live* handler registration
+is presumably gated behind the orchestration threads completing, which the spin blocks.
+
+**Next steps:**
+1. Identify the spinning import — instrument `func_000F151C`/`func_000F14BC`/`func_000F15FC`
+   (and `func_000F20DC`) with entry/exit logging + which `lv2_syscall` they hit; find the host-side
+   wait that never completes (likely a lwcond/lwmutex/event-queue receive with no producer).
+2. Provide the producer (Phase B event source) or satisfy the wait so "Regist Context Thread"
+   completes and registers a **non-zero** vblank handler (watch `[GCM-VBLANK] handler_opd != 0` +
+   `g_vblank_handler_opd`).
+3. Then wire the 30 fps `cellGcmTickVBlank` to invoke it; iterate toward M2–M4.
+
+Repro: set `#define GAMEWORLD_REAL_INIT 1` (ppu_recomp.cpp) + `#define EVENTCYCLE_PROBE 1`
+(main.cpp, or `-DEVENTCYCLE_PROBE`) + `#define GCM_SPIN_DETECT 1` (runtime_glue.cpp) to see the
+backtraces. All OFF by default; baseline stays clean (EXIT=0, ~2.5k lines).

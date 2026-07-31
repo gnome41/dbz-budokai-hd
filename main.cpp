@@ -417,6 +417,19 @@ int main(int argc, char* argv[]) {
     vm_write32(0x70B148u, 0x70B200u);   /* Q  = [P+0x148] */
     vm_write32(0x70B20Cu, 1u);          /* [Q+0xC] = 1 → func_000355D4 returns 1 (checks ==1) */
 
+    /* [event-cycle route — gated] func_00027D0C (in the live vblank-handler
+     * registration chain func_00027044→func_0002B6D0→func_00027E50) waits at its
+     * top via func_000CCD3C for [0x27F868] (field +0x2C of the global SPURS
+     * descriptor at 0x27F83C) to become non-zero — a "ready" flag no reached code
+     * sets. Forcing it (with GAMEWORLD_REAL_INIT on) advances the registration
+     * chain far enough that the FORCE-SPAWN path creates the real orchestration
+     * threads "Initialize Thread" + "Regist Context Thread". Off by default; enable
+     * together with GAMEWORLD_REAL_INIT to continue the event-cycle bring-up.
+     * See docs/EVENT_CYCLE_PLAN.md "Phase C — vblank-registration wall cleared". */
+#ifdef EVENTCYCLE_PROBE
+    vm_write32(0x27F868u, 1u);
+#endif
+
     /* State 7 (loc_00037D3C): reads [0x289B90+0x5D0]=[0x28A160].
        Code: "if ([0x28A160] != 0) return" — so 0 means PROCEED, 1 means SPIN.
        BSS default is 0, which is correct.  The earlier pre-patch of 1 was wrong

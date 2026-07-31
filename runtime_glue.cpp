@@ -390,11 +390,11 @@ extern "C" uint32_t vm_read32(uint64_t addr) {
          * a huge burst of reads with no other output — catches multi-address poll spins the
          * single-address detector misses. */
         static thread_local uint64_t s_cnt = 0;
-        static thread_local int s_dumped = 0;
-        if (++s_cnt == 80000000u && !s_dumped) {
-            s_dumped = 1;
-            fprintf(stderr, "[SPIN] vm_read32 burst of %llu reads (last addr=0x%08X) — backtrace:\n",
-                    (unsigned long long)s_cnt, a); fflush(stderr);
+        static thread_local int s_dumps = 0;
+        if (++s_cnt >= 80000000u && s_dumps < 6) {
+            s_cnt = 0; s_dumps++;
+            fprintf(stderr, "[SPIN] vm_read32 burst (dump #%d, last addr=0x%08X) — backtrace:\n",
+                    s_dumps, a); fflush(stderr);
             ps3_debug_backtrace("SPIN");
         }
     }
